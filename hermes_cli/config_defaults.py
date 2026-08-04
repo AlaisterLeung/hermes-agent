@@ -283,6 +283,10 @@ DEFAULT_CONFIG = {
 
     "terminal": {
         "backend": "local",
+        # Optional named execution targets. Empty preserves the legacy flat
+        # terminal config and environment-variable behavior.
+        "default_target": "",
+        "targets": {},
         "modal_mode": "auto",
         # Remote-backend graceful degradation: when a connection-class
         # infrastructure failure occurs (SSH host unreachable, Docker daemon
