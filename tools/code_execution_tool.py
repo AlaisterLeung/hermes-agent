@@ -671,10 +671,10 @@ def _inherit_execution_target(
         return tool_args
 
     if execution_target_scope:
-        from tools.execution_targets import resolve_execution_target
+        from tools.execution_targets import resolve_live_execution_target
 
         try:
-            live_resolution = resolve_execution_target(execution_target)
+            live_resolution = resolve_live_execution_target(execution_target)
         except Exception as exc:
             raise ValueError(
                 f"Execution target {execution_target!r} is no longer available: {exc}"

@@ -556,9 +556,19 @@ def resolve_execution_target(
         if key not in {"targets", "default_target"}
     }
     merged.update(dict(raw_targets[selected]))
-    backend = str(
-        merged.get("backend") or merged.get("env_type") or "local"
-    ).strip().lower() or "local"
+    backend_setting = (
+        "backend" if "backend" in merged
+        else "env_type" if "env_type" in merged
+        else None
+    )
+    raw_backend = merged[backend_setting] if backend_setting else "local"
+    if not isinstance(raw_backend, str) or not raw_backend.strip():
+        setting = backend_setting or "backend"
+        raise ExecutionTargetError(
+            f"Execution target {selected!r} setting {setting!r} has an invalid "
+            "shape; expected a non-empty string."
+        )
+    backend = raw_backend.strip().lower()
     if backend not in _NAMED_TARGET_BACKENDS:
         available_backends = ", ".join(sorted(_NAMED_TARGET_BACKENDS))
         raise ExecutionTargetError(

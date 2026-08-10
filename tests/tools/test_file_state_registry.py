@@ -168,6 +168,17 @@ class FileStateRegistryUnitTests(unittest.TestCase):
 
         self.assertEqual(out, {})
 
+    def test_remote_write_does_not_conflict_with_local_display_path(self):
+        path = "/same/path"
+        since = time.time()
+        file_state.note_write(
+            "child", path, namespace="ssh-scope", stat_path=False,
+        )
+
+        out = file_state.writes_since("parent", since, [path])
+
+        self.assertEqual(out, {})
+
 
     def test_kill_switch_env_var(self):
         p = self._mk()

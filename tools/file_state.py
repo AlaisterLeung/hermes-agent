@@ -274,7 +274,12 @@ class FileStateRegistry:
                 if ts < since_ts:
                     continue
                 display_path = self._display_path(state_path)
-                if state_path in paths_set or display_path in paths_set:
+                # A namespaced remote/container path matches only its complete
+                # state identity. Falling back to its display path would make
+                # ``ssh-scope\0/path`` conflict with an unrelated local
+                # ``/path`` read. Unnamespaced local/legacy paths retain their
+                # ordinary display-path behavior because both forms coincide.
+                if state_path in paths_set:
                     out[str(writer_raw)].append(display_path)
         return dict(out)
 

@@ -331,6 +331,54 @@ def test_ssh_paths_stay_remote_relative_and_ignore_host_workspace_override(
     assert "*** Update File: /srv/a/relative.txt" in rewritten
 
 
+def test_fresh_ssh_file_scope_does_not_inherit_shared_environment_cwd(
+    monkeypatch, isolated_target_state,
+):
+    import tools.execution_targets as targets_mod
+    from tools.file_operations import ShellFileOperations
+
+    _, file_mod = isolated_target_state
+    config = {
+        "terminal": {
+            "default_target": "devbox",
+            "targets": {
+                "devbox": {
+                    "backend": "ssh",
+                    "cwd": ".",
+                    "ssh_host": "devbox.example.com",
+                    "ssh_user": "agent",
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(targets_mod, "_load_merged_config", lambda: config)
+    calls = []
+
+    class SharedSshEnvironment:
+        cwd = "/other-session"
+
+        def execute(self, command, cwd=None, **kwargs):
+            calls.append(cwd)
+            return {"output": "", "returncode": 0}
+
+    shared_ops = ShellFileOperations(SharedSshEnvironment())
+    monkeypatch.setattr(file_mod, "_get_file_ops", lambda *args, **kwargs: shared_ops)
+    resolution = targets_mod.resolve_execution_target("devbox")
+
+    fresh_ops = file_mod._file_ops_for_resolution("fresh-session", resolution)
+    fresh_ops._exec("true")
+    terminal_mod, _ = isolated_target_state
+    terminal_mod.record_session_cwd(
+        "recorded-session", "/srv/recorded", target="devbox",
+    )
+    recorded_ops = file_mod._file_ops_for_resolution(
+        "recorded-session", resolution,
+    )
+    recorded_ops._exec("true")
+
+    assert calls == [".", "/srv/recorded"]
+
+
 def test_legacy_ssh_search_preserves_relative_path(monkeypatch, isolated_target_state):
     from tools.file_operations import SearchResult
 
@@ -927,6 +975,46 @@ def test_execute_code_rpc_rejects_alias_repointed_during_run(
             "write_file", {"path": "marker", "content": "x"},
             "alpha", approved_scope,
         )
+
+
+def test_execute_code_rpc_live_recheck_ignores_frozen_dispatch_snapshot(
+    isolated_target_state,
+):
+    import tools.execution_targets as targets_mod
+    from tools import code_execution_tool as code_mod
+
+    approved = {
+        "terminal": {
+            "default_target": "alpha",
+            "targets": {"alpha": {"backend": "local", "cwd": "/old"}},
+        },
+    }
+    live = {
+        "terminal": {
+            "default_target": "alpha",
+            "targets": {
+                "alpha": {
+                    "backend": "ssh",
+                    "ssh_host": "new.example",
+                    "ssh_user": "agent",
+                    "cwd": "/new",
+                },
+            },
+        },
+    }
+    approved_scope = targets_mod.resolve_execution_target(
+        "alpha", config=approved,
+    ).security_scope
+    targets_mod.set_execution_target_config_source(live)
+
+    with targets_mod.execution_target_config_scope(approved):
+        with pytest.raises(
+            ValueError, match="changed while execute_code was running",
+        ):
+            code_mod._inherit_execution_target(
+                "write_file", {"path": "marker", "content": "x"},
+                "alpha", approved_scope,
+            )
 
 
 def test_execute_code_rpc_dispatch_uses_frozen_approved_target_config(

@@ -279,6 +279,33 @@ def test_runtime_lease_releases_when_environment_handle_is_dropped(
     assert container_id not in docker_env._CURRENT_PROCESS_CONTAINER_IDS
 
 
+def test_retracking_environment_replaces_lease_ownership_without_leak(
+    monkeypatch, tmp_path,
+):
+    from tools.environments import base as environment_base
+
+    monkeypatch.setattr(environment_base, "get_sandbox_dir", lambda: tmp_path)
+
+    class Holder:
+        pass
+
+    holder = Holder()
+    holder._lease_root = tmp_path / "leases"
+    ref = weakref.ref(holder)
+    container_id = "retracked-container"
+    lease_key = (str(holder._lease_root.resolve()), container_id)
+
+    docker_env._track_environment_container(holder, container_id)
+    docker_env._track_environment_container(holder, container_id)
+
+    assert docker_env._CONTAINER_LEASES[lease_key][1] == 1
+    del holder
+    gc.collect()
+    assert ref() is None
+    assert lease_key not in docker_env._CONTAINER_LEASES
+    assert container_id not in docker_env._CURRENT_PROCESS_CONTAINER_IDS
+
+
 def test_storage_owner_lock_serializes_runtime_creation(monkeypatch, tmp_path):
     from tools.environments import base as environment_base
 

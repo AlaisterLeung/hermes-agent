@@ -156,6 +156,20 @@ def test_named_target_rejects_unknown_backend():
         resolve_execution_target(config=config)
 
 
+@pytest.mark.parametrize("backend", [None, "", False, 0, [], {}])
+def test_named_target_rejects_falsey_malformed_backend(backend):
+    config = _root({
+        "default_target": "dev",
+        "targets": {"dev": {"backend": backend}},
+    })
+
+    with pytest.raises(
+        ExecutionTargetError,
+        match="setting 'backend'.*expected a non-empty string",
+    ):
+        resolve_execution_target(config=config)
+
+
 def test_named_target_accepts_current_vercel_sandbox_backend():
     resolution = resolve_execution_target(config=_root({
         "default_target": "cloud",

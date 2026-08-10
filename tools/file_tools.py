@@ -1870,9 +1870,29 @@ def _get_file_ops(
 def _file_ops_for_resolution(task_id: str, resolution: Any):
     # Preserve the established one-argument seam in legacy mode.
     if resolution.named:
-        return _get_file_ops(
+        file_ops = _get_file_ops(
             task_id, target=resolution.target, _resolution=resolution,
         )
+        if resolution.backend == "ssh":
+            # Named SSH environments are shared across conversations, so the
+            # environment's mutable cwd belongs to whichever session ran most
+            # recently. Pin every file operation to this session's cwd record,
+            # falling back to the target's configured remote root for a fresh
+            # session. Values such as "." and "~" intentionally remain remote
+            # shell paths and therefore do not inherit another session's cwd.
+            operation_cwd = _authoritative_workspace_root(
+                task_id, resolution.target, _resolution=resolution,
+            )
+            environment = getattr(file_ops, "env", None)
+            if operation_cwd and environment is not None:
+                scoped_ops = ShellFileOperations(
+                    environment,
+                    cwd=operation_cwd,
+                    fixed_cwd=operation_cwd,
+                )
+                scoped_ops._command_cache = file_ops._command_cache
+                return scoped_ops
+        return file_ops
     return _get_file_ops(task_id)
 
 

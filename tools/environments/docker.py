@@ -50,6 +50,7 @@ _PROCESS_INSTANCE_ID = uuid.uuid4().hex
 _CURRENT_PROCESS_CONTAINER_IDS: set[str] = set()
 _CONTAINER_LEASES: dict[tuple[str, str], tuple[TextIO, int]] = {}
 _CONTAINER_LEASES_LOCK = threading.Lock()
+_ENVIRONMENT_LEASE_TRACKING_LOCK = threading.Lock()
 
 
 def _lease_dir(root: Path | None = None) -> Path:
@@ -175,15 +176,19 @@ def _release_runtime_tracking(
 
 
 def _track_environment_container(env, container_id: str) -> None:
-    previous = getattr(env, "_lease_finalizer", None)
-    if previous is not None and previous.alive:
-        previous.detach()
-    lease_root = getattr(env, "_lease_root", None)
-    _hold_container_lease(container_id, lease_root)
-    _CURRENT_PROCESS_CONTAINER_IDS.add(container_id)
-    env._lease_finalizer = weakref.finalize(
-        env, _release_runtime_tracking, container_id, lease_root,
-    )
+    # Re-tracking can happen during concurrent recovery. Retire the previous
+    # finalizer's ownership before taking a new one, and serialize per-process
+    # finalizer replacement so every lease count always has one live releaser.
+    with _ENVIRONMENT_LEASE_TRACKING_LOCK:
+        previous = getattr(env, "_lease_finalizer", None)
+        if previous is not None and previous.alive:
+            previous()
+        lease_root = getattr(env, "_lease_root", None)
+        _hold_container_lease(container_id, lease_root)
+        _CURRENT_PROCESS_CONTAINER_IDS.add(container_id)
+        env._lease_finalizer = weakref.finalize(
+            env, _release_runtime_tracking, container_id, lease_root,
+        )
 
 
 def _acquire_exclusive_container_lease(
@@ -1122,6 +1127,16 @@ class DockerEnvironment(BaseEnvironment):
             weakref.finalize(self, _close_storage_creation_lease, storage_guard)
             if storage_guard is not None else None
         )
+
+        def _release_storage_guard_early() -> None:
+            nonlocal storage_guard
+            if storage_guard is None:
+                return
+            if storage_guard_finalizer is not None:
+                storage_guard_finalizer.detach()
+            _close_storage_creation_lease(storage_guard)
+            storage_guard = None
+
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -1705,6 +1720,14 @@ class DockerEnvironment(BaseEnvironment):
                 actual_mode = None
                 if not network:
                     actual_mode = self._container_network_mode(container_id)
+                    if actual_mode is None:
+                        _release_storage_guard_early()
+                        raise RuntimeError(
+                            f"Could not verify NetworkMode for reusable Docker "
+                            f"runtime {container_id[:12]}; refusing reuse while "
+                            "docker_network=false is configured. Retry after "
+                            "Docker inspection is available."
+                        )
                     mode_mismatch = actual_mode != "none"
                 if mode_mismatch:
                     logger.warning(
@@ -1716,16 +1739,10 @@ class DockerEnvironment(BaseEnvironment):
                         task_label, profile_name,
                     )
                     try:
-                        subprocess.run(
-                            [self._docker_exe, "rm", "-f", container_id],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=30,
-                            check=False,
-                            stdin=subprocess.DEVNULL,
-                        )
-                    except (subprocess.TimeoutExpired, OSError) as e:
-                        logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
+                        self._retire_network_mismatched_container(container_id)
+                    except Exception:
+                        _release_storage_guard_early()
+                        raise
                     existing = None
             if existing is not None:
                 container_id, state = existing
@@ -2180,6 +2197,41 @@ class DockerEnvironment(BaseEnvironment):
             return None
         mode = result.stdout.strip()
         return mode or None
+
+    def _retire_network_mismatched_container(self, container_id: str) -> None:
+        """Remove a confirmed network-mismatched reuse candidate safely."""
+        lease = _acquire_exclusive_container_lease(
+            container_id, self._lease_root,
+        )
+        if lease is None:
+            raise RuntimeError(
+                f"Docker runtime {container_id[:12]} has a network mode that "
+                "conflicts with docker_network=false, but it is still used by "
+                "another environment or Hermes process; refusing removal."
+            )
+        try:
+            try:
+                removed = subprocess.run(
+                    [self._docker_exe, "rm", "-f", container_id],
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=30,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RuntimeError(
+                    f"Failed to remove network-mismatched Docker runtime "
+                    f"{container_id[:12]}: {exc}"
+                ) from exc
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to remove network-mismatched Docker runtime "
+                    f"{container_id[:12]}: "
+                    f"{removed.stderr.strip() or removed.stdout.strip()}"
+                )
+        finally:
+            _close_exclusive_container_lease(lease)
 
     def _remove_superseded_storage_containers(
         self,

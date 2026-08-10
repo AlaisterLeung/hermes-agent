@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from agent.tool_executor import _ensure_file_checkpoint
+from agent.tool_executor import _begin_tool_execution, _ensure_file_checkpoint
 from tools.checkpoint_manager import CheckpointManager
 
 
@@ -107,3 +107,61 @@ def test_remote_target_skips_host_checkpoint(monkeypatch):
         {"path": "remote.txt", "target": "devbox"},
         "gateway-session",
     )
+
+
+def test_destructive_terminal_checkpoint_prefers_explicit_workdir(
+    tmp_path, monkeypatch,
+):
+    import tools.execution_targets as targets_mod
+
+    configured = tmp_path / "configured"
+    actual = tmp_path / "actual"
+    configured.mkdir()
+    actual.mkdir()
+    monkeypatch.setattr(
+        targets_mod,
+        "_load_merged_config",
+        lambda: {
+            "terminal": {
+                "default_target": "local",
+                "targets": {
+                    "local": {"backend": "local", "cwd": str(configured)},
+                },
+            },
+        },
+    )
+    checkpoints = []
+
+    class Manager:
+        enabled = True
+
+        @staticmethod
+        def ensure_checkpoint(cwd, reason):
+            checkpoints.append((cwd, reason))
+
+    agent = SimpleNamespace(
+        quiet_mode=True,
+        tool_progress_mode="off",
+        verbose_logging=False,
+        tool_progress_callback=None,
+        tool_start_callback=None,
+        _checkpoint_mgr=Manager(),
+        _touch_activity=lambda *_args, **_kwargs: None,
+    )
+
+    _begin_tool_execution(
+        agent,
+        function_name="terminal",
+        function_args={
+            "command": "rm -f marker",
+            "workdir": str(actual),
+            "target": "local",
+        },
+        effective_task_id="gateway-session",
+        tool_call_id="call-1",
+        display_index=None,
+    )
+
+    assert checkpoints == [
+        (str(actual), "before terminal: rm -f marker"),
+    ]

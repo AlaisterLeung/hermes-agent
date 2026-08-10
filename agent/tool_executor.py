@@ -1052,10 +1052,16 @@ def _begin_tool_execution(
             if _is_destructive_command(command):
                 # Checkpointing reads the host filesystem. Never treat a
                 # Docker/SSH/cloud path as local merely because it is absolute.
-                cwd = _selected_local_target_cwd(
+                target_cwd = _selected_local_target_cwd(
                     effective_task_id, function_name, function_args,
                 )
-                if cwd:
+                if target_cwd:
+                    explicit_workdir = function_args.get("workdir")
+                    cwd = (
+                        os.path.abspath(os.path.expanduser(explicit_workdir))
+                        if isinstance(explicit_workdir, str) and explicit_workdir
+                        else target_cwd
+                    )
                     agent._checkpoint_mgr.ensure_checkpoint(
                         cwd, f"before terminal: {command[:60]}"
                     )
