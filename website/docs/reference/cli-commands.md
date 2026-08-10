@@ -84,6 +84,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes mcp` | Manage MCP server configurations and run Hermes as an MCP server. |
 | `hermes plugins` | Manage Hermes Agent plugins (install, enable, disable, remove). |
 | `hermes portal` | Nous Portal status, subscription link, and Tool Gateway routing. See [Tool Gateway](../user-guide/features/tool-gateway.md). |
+| `hermes targets` | Register, list, drain, and remove profile-scoped runtime execution targets without a gateway restart. |
 | `hermes tools` | Configure enabled tools per platform. |
 | `hermes computer-use` | Install or check the Computer Use (cua-driver) backend (macOS/Windows/Linux). |
 | `hermes pets` | Browse, install, and select [petdex](../user-guide/features/pets.md) animated pets shown across the CLI, TUI, and desktop app. Subcommands: `list`, `install`, `select`, `show`, `off`, `scale`, `remove`, `doctor`. |
@@ -1388,6 +1389,25 @@ Provider plugin selections are saved to `config.yaml`:
 General plugin disabled list is stored in `config.yaml` under `plugins.disabled`.
 
 See [Plugins](../user-guide/features/plugins.md) and [Build a Hermes Plugin](../developer-guide/plugins/index.md).
+
+## `hermes targets`
+
+```bash
+hermes targets register NAME --backend ssh --host HOST --user USER \
+  [--port PORT] [--key PATH] [--cwd PATH] [--timeout SECONDS] \
+  [--provider PROVIDER] [--owner-id ID] [--generation GEN] \
+  [--replace] [--if-generation OLD] [--set KEY=VALUE] [--json]
+hermes targets list [--all] [--json]
+hermes targets show NAME [--provider PROVIDER] [--json]
+hermes targets drain NAME [--provider PROVIDER] [--if-generation GEN] [--json]
+hermes targets remove NAME [--provider PROVIDER] [--if-generation GEN] [--json]
+```
+
+`unregister` aliases `remove`; `--ssh-host`, `--ssh-user`, `--ssh-port`, and `--ssh-key` alias the shorter SSH flags. The default provider is `cli`, the default owner ID is the target name, and an omitted generation uses the stable value `manual`. Use a controller-supplied generation for ephemeral infrastructure so drain/remove can compare-and-swap the exact resource. `--set` accepts repeatable backend-specific `KEY=VALUE` settings, parsing JSON values where possible; structural target/default/provider fields are rejected.
+
+Handled target validation, configuration, domain, and compare-and-swap failures exit with status 2. Without `--json`, they print a concise `Error: ...` message to stderr. With `--json`, stdout contains one secret-safe object with `status: "error"` and a human-readable `message`, and stderr remains empty.
+
+Runtime targets are profile-scoped provider fragments, not edits to `config.yaml`. Registration becomes available to a running gateway on the next independent dispatch. See [Named Execution Targets](../user-guide/configuration.md#named-execution-targets) for precedence, lifecycle, security, prompt-cache behavior, and the Hetzner example.
 
 ## `hermes tools`
 

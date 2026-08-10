@@ -1,4 +1,4 @@
-"""Resolve static named terminal execution targets.
+"""Resolve static and profile-scoped runtime terminal execution targets.
 
 The resolver is deliberately small and lazy: importing tool schemas never reads
 user configuration, and configured names never enter a schema.  Legacy flat
@@ -74,6 +74,7 @@ _TARGET_STRING_SETTINGS = frozenset({
     "daytona_image", "vercel_runtime", "ssh_host", "ssh_user", "ssh_key",
     "docker_shm_size", "modal_mode", "sudo_password",
 })
+_REGISTRY_METADATA_KEY = "__execution_target_registry_v1__"
 
 
 _effective_config_override: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -226,6 +227,9 @@ class ExecutionTargetResolution:
     named: bool
     is_default: bool = True
     profile_scope: str = ""
+    provider: str | None = None
+    owner_id: str | None = None
+    generation: str | None = None
 
     @property
     def spec_fingerprint(self) -> str:
@@ -239,6 +243,11 @@ class ExecutionTargetResolution:
             {
                 "config": dict(self.config),
                 "is_default": self.is_default,
+                "runtime_registry": {
+                    "provider": self.provider,
+                    "owner_id": self.owner_id,
+                    "generation": self.generation,
+                } if self.provider is not None else None,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -324,8 +333,8 @@ class ExecutionTargetResolution:
         return data
 
 
-def _load_unscoped_config() -> dict[str, Any]:
-    """Load the live source while ignoring a nested frozen RPC snapshot."""
+def _load_static_unscoped_config() -> dict[str, Any]:
+    """Load static effective config without runtime target fragments."""
     try:
         from agent.secret_scope import is_multiplex_active
 
@@ -343,11 +352,27 @@ def _load_unscoped_config() -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
+def load_static_execution_target_config() -> dict[str, Any]:
+    """Return current effective static config for registry management."""
+    return deepcopy(_load_static_unscoped_config())
+
+
+def _load_unscoped_config() -> dict[str, Any]:
+    """Load live static config plus the current profile registry."""
+    from tools.execution_target_overlay import overlay_runtime_execution_targets
+
+    return overlay_runtime_execution_targets(_load_static_unscoped_config())
+
+
 def _load_merged_config() -> dict[str, Any]:
     """Load merged config lazily so importing fixed tool schemas stays cheap."""
     override = _effective_config_override.get()
     if override is not None:
-        return deepcopy(override)
+        if _frozen_config_active.get():
+            return deepcopy(override)
+        from tools.execution_target_overlay import overlay_runtime_execution_targets
+
+        return overlay_runtime_execution_targets(override)
     return _load_unscoped_config()
 
 
@@ -470,6 +495,161 @@ def _validate_named_target_entry(
             invalid("modal_mode", "one of 'auto', 'direct', or 'managed'")
 
 
+def _explicit_legacy_terminal_keys(
+    flat: Mapping[str, Any],
+    canonical_defaults: Mapping[str, Any],
+) -> set[str]:
+    """Identify flat terminal settings with real legacy authority.
+
+    Raw profile config and managed scope retain exact presence information.
+    The classic CLI's project-fallback source does not, so remaining values are
+    considered explicit only when they differ from both shared config defaults
+    and the terminal tool's canonical defaults.  This deliberately prefers an
+    existing environment value when project provenance is ambiguous.
+    """
+    from hermes_cli.config import effective_terminal_config, read_raw_config
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    authority: set[str] = set()
+
+    def _collect_authority(source: Any) -> None:
+        if not isinstance(source, Mapping):
+            return
+        terminal = source.get("terminal")
+        if isinstance(terminal, Mapping):
+            authority.update(effective_terminal_config(dict(terminal)))
+
+    if os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1":
+        _collect_authority(read_raw_config())
+    try:
+        from hermes_cli import managed_scope
+
+        _collect_authority(managed_scope.load_managed_config())
+    except Exception:
+        # Provenance discovery must not make terminal activation unavailable
+        # when the optional managed scope cannot be read.
+        pass
+    if "env_type" in authority:
+        authority.add("backend")
+
+    values: dict[str, Any] = {
+        key: flat[key] for key in _TARGET_ENTRY_SETTINGS if key in flat
+    }
+    if "backend" not in values and "env_type" in flat:
+        values["backend"] = flat["env_type"]
+
+    shared = DEFAULT_CONFIG.get("terminal", {})
+    shared = shared if isinstance(shared, Mapping) else {}
+    explicit: set[str] = set()
+    missing = object()
+    for key, value in values.items():
+        if key in authority:
+            explicit.add(key)
+            continue
+        candidates: list[Any] = []
+        shared_value = shared.get(key, missing)
+        if shared_value is not missing:
+            candidates.append(shared_value)
+        canonical_key = "env_type" if key == "backend" else key
+        canonical_value = canonical_defaults.get(canonical_key, missing)
+        if canonical_value is not missing:
+            candidates.append(canonical_value)
+        if not candidates or all(value != candidate for candidate in candidates):
+            explicit.add(key)
+    return explicit
+
+
+def synthesize_legacy_default_target(
+    config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Build the live named ``default`` spec for activated flat config.
+
+    Multiplexed dispatches derive exclusively from the selected profile mapping.
+    Single-profile dispatches retain the legacy process-environment backend
+    selection, while current static/managed values refresh the effective spec.
+    Nothing returned here is persisted by the runtime registry.
+    """
+    legacy = resolve_execution_target(config=config)
+    if legacy.named:
+        return None
+    from tools.terminal_tool import _get_env_config
+
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplex = is_multiplex_active()
+    except Exception:
+        multiplex = False
+
+    flat = dict(legacy.config)
+    if multiplex:
+        # Process-global TERMINAL_* belongs to no profile in multiplex mode.
+        effective = _get_env_config(flat)
+        explicit_keys = set(_TARGET_ENTRY_SETTINGS) & set(flat)
+    else:
+        # Start with the canonical environment that legacy terminal execution
+        # actually uses.  Only raw/managed authority (or a conservative
+        # non-default project fallback) may replace an ambient value.
+        ambient = _get_env_config()
+        ambient_backend = (
+            str(ambient.get("env_type") or legacy.backend or "local").strip().lower()
+        )
+        canonical_defaults = _get_env_config({})
+        explicit_keys = _explicit_legacy_terminal_keys(flat, canonical_defaults)
+        seeded = {
+            "backend": ambient_backend,
+            **{
+                key: deepcopy(value)
+                for key, value in ambient.items()
+                if key in _TARGET_ENTRY_SETTINGS
+            },
+        }
+        for key in explicit_keys:
+            source_key = (
+                "backend"
+                if key == "backend" and "backend" in flat
+                else "env_type"
+                if key == "backend" and "env_type" in flat
+                else key
+            )
+            if source_key not in flat:
+                continue
+            value = flat[source_key]
+            if key == "cwd" and str(value or "").strip() in {".", "auto", "cwd"}:
+                # Match apply_terminal_config_to_env(): placeholders do not
+                # erase a concrete legacy TERMINAL_CWD value.
+                continue
+            seeded[key] = deepcopy(value)
+        effective = _get_env_config(seeded)
+
+    backend = (
+        str(effective.get("env_type") or legacy.backend or "local").strip().lower()
+    )
+    if backend not in _NAMED_TARGET_BACKENDS:
+        raise ExecutionTargetError(
+            f"Cannot activate runtime targets for unknown legacy backend {backend!r}."
+        )
+    allowed = _TARGET_COMMON_SETTINGS | _TARGET_BACKEND_SETTINGS[backend]
+    target_config: dict[str, Any] = {"backend": backend}
+    for key in allowed - {"backend"}:
+        if key in effective:
+            target_config[key] = deepcopy(effective[key])
+        elif (
+            key == "sudo_password"
+            and key in legacy.config
+            and (multiplex or key in explicit_keys)
+        ):
+            target_config[key] = deepcopy(legacy.config[key])
+    candidate = {
+        "terminal": {
+            "default_target": "default",
+            "targets": {"default": target_config},
+        },
+    }
+    resolve_execution_target("default", config=candidate)
+    return target_config
+
+
 def resolve_execution_target(
     target: Optional[str] = None,
     *,
@@ -498,6 +678,13 @@ def resolve_execution_target(
     raw_targets = terminal.get("targets")
     if raw_targets is None or raw_targets == {}:
         if target not in (None, "default"):
+            from tools.execution_target_lifecycle import (
+                unavailable_runtime_target_message,
+            )
+
+            unavailable = unavailable_runtime_target_message(root, target)
+            if unavailable:
+                raise ExecutionTargetError(unavailable)
             raise ExecutionTargetError(
                 f"Unknown execution target {target!r}. Named targets are not configured. "
                 f"Available targets: {_available(['default'])}."
@@ -540,6 +727,13 @@ def resolve_execution_target(
     selected = target if target is not None else terminal.get("default_target")
     if not isinstance(selected, str) or not selected or selected not in raw_targets:
         if target is not None:
+            from tools.execution_target_lifecycle import (
+                unavailable_runtime_target_message,
+            )
+
+            unavailable = unavailable_runtime_target_message(root, target)
+            if unavailable:
+                raise ExecutionTargetError(unavailable)
             prefix = f"Unknown execution target {target!r}."
         else:
             prefix = (
@@ -578,10 +772,17 @@ def resolve_execution_target(
     _validate_named_target_entry(
         selected, raw_targets[selected], merged, backend,
     )
+    from tools.execution_target_lifecycle import runtime_record_metadata
+
+    runtime_records = runtime_record_metadata(root, selected, status="active")
+    runtime_record = runtime_records[0] if len(runtime_records) == 1 else {}
     return ExecutionTargetResolution(
         target=selected, backend=backend, config=merged, named=True,
         is_default=selected == terminal.get("default_target"),
         profile_scope=profile_scope,
+        provider=runtime_record.get("provider"),
+        owner_id=runtime_record.get("owner_id"),
+        generation=runtime_record.get("generation"),
     )
 
 
