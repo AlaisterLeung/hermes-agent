@@ -10,9 +10,21 @@ from tools.execution_target_registry import (
     RuntimeRegistrySnapshot,
     load_runtime_registry,
 )
+from tools.execution_target_lifecycle import (
+    REGISTRY_METADATA_KEY,
+    runtime_record_metadata_entry,
+)
 
 
-REGISTRY_METADATA_KEY = "__execution_target_registry_v1__"
+def _metadata_entry(record: Any, status: str) -> dict[str, str]:
+    return runtime_record_metadata_entry(
+        execution_target=record.execution_target,
+        provider=record.provider,
+        owner_id=record.owner_id,
+        generation=record.generation,
+        state=record.state,
+        status=status,
+    )
 
 
 def _available(names: list[str]) -> str:
@@ -97,14 +109,7 @@ def overlay_runtime_execution_targets(
             if raise_for_target is not None:
                 raise
             for record in snapshot.records:
-                records_metadata.append({
-                    "execution_target": record.execution_target,
-                    "provider": record.provider,
-                    "owner_id": record.owner_id,
-                    "generation": record.generation,
-                    "state": record.state,
-                    "status": "inactive_legacy",
-                })
+                records_metadata.append(_metadata_entry(record, "inactive_legacy"))
             diagnostics.append(
                 RegistryDiagnostic(
                     code="activation_state_invalid",
@@ -122,14 +127,7 @@ def overlay_runtime_execution_targets(
         static_named = True
     else:
         for record in snapshot.records:
-            records_metadata.append({
-                "execution_target": record.execution_target,
-                "provider": record.provider,
-                "owner_id": record.owner_id,
-                "generation": record.generation,
-                "state": record.state,
-                "status": "inactive_legacy",
-            })
+            records_metadata.append(_metadata_entry(record, "inactive_legacy"))
         if snapshot.records:
             diagnostics.append(
                 RegistryDiagnostic(
@@ -155,14 +153,7 @@ def overlay_runtime_execution_targets(
     for name, records in sorted(by_name.items()):
         if name in static_names:
             for record in records:
-                records_metadata.append({
-                    "execution_target": name,
-                    "provider": record.provider,
-                    "owner_id": record.owner_id,
-                    "generation": record.generation,
-                    "state": record.state,
-                    "status": "shadowed_static",
-                })
+                records_metadata.append(_metadata_entry(record, "shadowed_static"))
             diagnostics.append(
                 RegistryDiagnostic(
                     code="static_name_reserved",
@@ -173,14 +164,7 @@ def overlay_runtime_execution_targets(
         if len(records) > 1:
             providers = sorted(record.provider for record in records)
             for record in records:
-                records_metadata.append({
-                    "execution_target": name,
-                    "provider": record.provider,
-                    "owner_id": record.owner_id,
-                    "generation": record.generation,
-                    "state": record.state,
-                    "status": "provider_collision",
-                })
+                records_metadata.append(_metadata_entry(record, "provider_collision"))
             diagnostics.append(
                 RegistryDiagnostic(
                     code="provider_name_collision",
@@ -193,14 +177,7 @@ def overlay_runtime_execution_targets(
             continue
         record = records[0]
         status = "active" if record.state == "ready" else "draining"
-        records_metadata.append({
-            "execution_target": name,
-            "provider": record.provider,
-            "owner_id": record.owner_id,
-            "generation": record.generation,
-            "state": record.state,
-            "status": status,
-        })
+        records_metadata.append(_metadata_entry(record, status))
         if record.state == "ready":
             targets[name] = deepcopy(dict(record.config))
             runtime_records[name] = record

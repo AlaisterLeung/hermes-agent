@@ -22,6 +22,7 @@ from tools.execution_target_registry import (
     load_runtime_registry,
     registry_directory,
     update_provider_fragment,
+    validate_provider_name,
     write_provider_fragment_for_tests,
 )
 from tools.execution_targets import (
@@ -212,6 +213,238 @@ def test_generation_repoint_changes_runtime_identity_even_for_same_alias_config(
     assert first.security_scope != second.security_scope
     assert first.session_key("session") == second.session_key("session")
     assert first.backend_task_id("session") != second.backend_task_id("session")
+
+
+def test_nested_dispatch_preserves_complete_runtime_generation_identity(
+    registry_home,
+    tmp_path,
+):
+    from tools import approval as approval_mod
+    from tools import code_execution_tool as code_mod
+
+    write_provider_fragment_for_tests(
+        "Provider-A",
+        {"box": _record(str(tmp_path), generation="server-1")},
+    )
+    outer = resolve_execution_target("box")
+    frozen = code_mod._frozen_target_config(outer)
+
+    def resolve_nested(_name, args, task_id=None):
+        nested = resolve_execution_target(args["target"])
+        approval_key = approval_mod._execution_scoped_pattern_key(
+            "command:deploy",
+            nested.target,
+            nested.named,
+            nested.security_scope,
+        )
+        return nested, approval_key, task_id
+
+    nested, approval_key, nested_task_id = code_mod._dispatch_rpc_tool(
+        resolve_nested,
+        "terminal",
+        {"target": "box"},
+        "nested-session",
+        frozen,
+    )
+
+    assert nested_task_id == "nested-session"
+    assert nested.target == outer.target
+    assert nested.backend == outer.backend
+    assert nested.config == outer.config
+    assert nested.provider == outer.provider == "provider-a"
+    assert nested.owner_id == outer.owner_id == "box-17"
+    assert nested.generation == outer.generation == "server-1"
+    assert nested.spec_fingerprint == outer.spec_fingerprint
+    assert nested.security_scope == outer.security_scope
+    assert nested.environment_key("default") == outer.environment_key("default")
+    assert nested.backend_task_id("default") == outer.backend_task_id("default")
+    assert nested.file_coordination_key("session") == outer.file_coordination_key(
+        "session"
+    )
+    assert approval_key == approval_mod._execution_scoped_pattern_key(
+        "command:deploy",
+        outer.target,
+        outer.named,
+        outer.security_scope,
+    )
+
+
+def test_nested_approval_identity_distinguishes_same_config_generations(
+    registry_home,
+    tmp_path,
+):
+    from tools import approval as approval_mod
+    from tools import code_execution_tool as code_mod
+
+    def nested_approval_key(frozen):
+        def handler(_name, args, task_id=None):
+            del task_id
+            nested = resolve_execution_target(args["target"])
+            return (
+                nested.generation,
+                approval_mod._execution_scoped_pattern_key(
+                    "command:deploy",
+                    nested.target,
+                    nested.named,
+                    nested.security_scope,
+                ),
+            )
+
+        return code_mod._dispatch_rpc_tool(
+            handler,
+            "terminal",
+            {"target": "box"},
+            "nested-session",
+            frozen,
+        )
+
+    write_provider_fragment_for_tests(
+        "provider-a",
+        {"box": _record(str(tmp_path), generation="g1")},
+    )
+    first = resolve_execution_target("box")
+    first_frozen = code_mod._frozen_target_config(first)
+    write_provider_fragment_for_tests(
+        "provider-a",
+        {"box": _record(str(tmp_path), generation="g2")},
+    )
+    second = resolve_execution_target("box")
+    second_frozen = code_mod._frozen_target_config(second)
+
+    first_generation, first_key = nested_approval_key(first_frozen)
+    second_generation, second_key = nested_approval_key(second_frozen)
+
+    assert (first_generation, second_generation) == ("g1", "g2")
+    assert first_key != second_key
+
+
+def test_nested_runtime_docker_dispatch_reuses_outer_hosting_environment(
+    registry_home,
+    tmp_path,
+    monkeypatch,
+):
+    from tools import code_execution_tool as code_mod
+    from tools import file_tools as file_mod
+    from tools import terminal_tool as terminal_mod
+
+    record = _record(str(tmp_path), generation="docker-g1", backend="docker")
+    record["config"]["container_persistent"] = True
+    write_provider_fragment_for_tests("provider-a", {"box": record})
+    outer = resolve_execution_target("box")
+
+    class HostingEnvironment:
+        cwd = "/workspace"
+
+        def __init__(self):
+            self.cleanup_calls = 0
+
+        def cleanup(self, force_remove=False):
+            del force_remove
+            self.cleanup_calls += 1
+
+    hosting = HostingEnvironment()
+    terminal_mod._record_environment_target(hosting, outer)
+    environment_key = outer.environment_key("default")
+    monkeypatch.setattr(
+        terminal_mod,
+        "_active_environments",
+        {environment_key: hosting},
+    )
+    monkeypatch.setattr(terminal_mod, "_last_activity", {})
+    monkeypatch.setattr(terminal_mod, "_creation_locks", {})
+    monkeypatch.setattr(file_mod, "_file_ops_cache", {})
+    monkeypatch.setattr(
+        terminal_mod,
+        "_create_environment",
+        lambda **_kwargs: pytest.fail("nested dispatch replaced its hosting runtime"),
+    )
+
+    def nested_file_ops(_name, args, task_id=None):
+        ops = file_mod._get_file_ops(task_id, target=args["target"])
+        return ops.env, resolve_execution_target(args["target"])
+
+    nested_env, nested = code_mod._dispatch_rpc_tool(
+        nested_file_ops,
+        "read_file",
+        {"target": "box"},
+        "outer-script",
+        code_mod._frozen_target_config(outer),
+    )
+
+    assert nested_env is hosting
+    assert nested.spec_fingerprint == outer.spec_fingerprint
+    assert terminal_mod._active_environments[environment_key] is hosting
+    assert hosting.cleanup_calls == 0
+
+
+def test_runtime_generations_isolate_all_file_coordination_state(
+    registry_home,
+    tmp_path,
+    monkeypatch,
+):
+    from tools import file_state
+    from tools import file_tools as file_mod
+
+    write_provider_fragment_for_tests(
+        "provider-a",
+        {"box": _record(str(tmp_path), generation="g1", backend="ssh")},
+    )
+    first = resolve_execution_target("box")
+    first_key = first.file_coordination_key("reader")
+    first_writer_key = first.file_coordination_key("writer")
+    first_namespace = file_mod._file_state_namespace("reader", "box", _resolution=first)
+
+    write_provider_fragment_for_tests(
+        "provider-a",
+        {"box": _record(str(tmp_path), generation="g2", backend="ssh")},
+    )
+    second = resolve_execution_target("box")
+    second_key = second.file_coordination_key("reader")
+    second_namespace = file_mod._file_state_namespace(
+        "reader", "box", _resolution=second
+    )
+
+    assert first.session_key("reader") == second.session_key("reader")
+    assert first.storage_task_id("default") == second.storage_task_id("default")
+    assert first_key != second_key
+    assert first_namespace != second_namespace
+
+    registry = file_state.FileStateRegistry()
+    path = "/srv/project/shared.txt"
+    registry.record_read(
+        first_key,
+        path,
+        namespace=first_namespace,
+        stat_path=False,
+    )
+    registry.note_write(
+        first_writer_key,
+        path,
+        namespace=first_namespace,
+        stat_path=False,
+    )
+    assert registry.check_stale(first_key, path, namespace=first_namespace)
+    assert registry.check_stale(second_key, path, namespace=second_namespace) is None
+    assert registry._lock_for(path, first_namespace) is not registry._lock_for(
+        path, second_namespace
+    )
+
+    monkeypatch.setattr(file_mod, "_read_tracker", {})
+    monkeypatch.setattr(file_mod, "_patch_failure_tracker", {})
+    file_mod._record_not_found("read", path, first_key, "g1-miss")
+    assert (
+        file_mod._check_not_found_cache(
+            "read", path, second_key, check_host_filesystem=False
+        )
+        is None
+    )
+    first_data = file_mod._read_tracker[first_key]
+    first_data["dedup"][(path, 1, 20)] = 7.0
+    first_data["read_history"].add((path, 1, 20))
+    assert second_key not in file_mod._read_tracker
+    assert file_mod._record_patch_failure(first_key, path) == 1
+    assert file_mod._record_patch_failure(first_key, path) == 2
+    assert file_mod._record_patch_failure(second_key, path) == 1
 
 
 def test_frozen_dispatch_does_not_pivot_mid_update(registry_home, tmp_path):
@@ -412,6 +645,122 @@ def test_production_update_rejects_oversized_fragment_without_replacing_active_s
         if item.provider == "provider-a"
     } == {("existing", "still-active")}
     assert resolve_execution_target("existing").generation == "still-active"
+
+
+def test_returned_snapshot_nested_mutation_cannot_poison_registry_cache(
+    registry_home,
+    tmp_path,
+):
+    victim = _record(str(tmp_path), backend="docker")
+    victim["config"].update({
+        "docker_env": {"DESTINATION": "trusted"},
+        "docker_volumes": ["trusted:/workspace/trusted"],
+    })
+    write_provider_fragment_for_tests("provider-a", {"victim": victim})
+
+    returned = load_runtime_registry()
+    returned_config = returned.records[0].config
+    returned_config["docker_env"]["DESTINATION"] = "poisoned"
+    returned_config["docker_volumes"].append("poisoned:/workspace/poisoned")
+
+    cached = load_runtime_registry()
+    forced = load_runtime_registry(force=True)
+    for snapshot in (cached, forced):
+        config = snapshot.records[0].config
+        assert config["docker_env"] == {"DESTINATION": "trusted"}
+        assert config["docker_volumes"] == ["trusted:/workspace/trusted"]
+
+
+def test_failing_cross_provider_mutator_cannot_poison_cache_or_disk(
+    registry_home,
+    tmp_path,
+):
+    victim = _record(str(tmp_path), backend="docker")
+    victim["config"].update({
+        "docker_env": {"DESTINATION": "trusted"},
+        "docker_volumes": ["trusted:/workspace/trusted"],
+    })
+    write_provider_fragment_for_tests("victim-provider", {"victim": victim})
+    victim_path = registry_directory() / "victim-provider.json"
+    disk_before = victim_path.read_bytes()
+
+    def poison_then_fail(snapshot, current):
+        del current
+        record = next(
+            item for item in snapshot.records if item.provider == "victim-provider"
+        )
+        record.config["docker_env"]["DESTINATION"] = "poisoned"
+        record.config["docker_volumes"].append("poisoned:/workspace/poisoned")
+        raise RuntimeError("provider callback failed")
+
+    with pytest.raises(RuntimeError, match="provider callback failed"):
+        update_provider_fragment("attacker", poison_then_fail)
+
+    assert victim_path.read_bytes() == disk_before
+    for snapshot in (load_runtime_registry(), load_runtime_registry(force=True)):
+        record = next(
+            item for item in snapshot.records if item.provider == "victim-provider"
+        )
+        assert record.config["docker_env"] == {"DESTINATION": "trusted"}
+        assert record.config["docker_volumes"] == ["trusted:/workspace/trusted"]
+
+
+def test_provider_identity_is_lowercase_in_writer_payload_and_parser(
+    registry_home,
+    tmp_path,
+):
+    assert validate_provider_name("Foo.Bar") == "foo.bar"
+    path = write_provider_fragment_for_tests(
+        "Foo.Bar",
+        {"box": _record(str(tmp_path))},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    snapshot = load_runtime_registry(force=True)
+
+    assert path.name == "foo.bar.json"
+    assert payload["provider"] == "foo.bar"
+    assert snapshot.records[0].provider == "foo.bar"
+
+
+def test_noncanonical_casefold_alias_fails_safe_without_overwrite(
+    registry_home,
+    tmp_path,
+):
+    directory = registry_directory()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    alias = directory / "Foo.json"
+    alias.write_text(
+        json.dumps({
+            "version": 1,
+            "provider": "Foo",
+            "targets": {"first": _record(str(tmp_path / "first"))},
+        }),
+        encoding="utf-8",
+    )
+    alias.chmod(0o600)
+    original = alias.read_bytes()
+    original_entries = {
+        entry.name for entry in directory.iterdir() if entry.suffix == ".json"
+    }
+    invalidate_runtime_registry_cache()
+
+    snapshot = load_runtime_registry(force=True)
+    assert snapshot.records == ()
+    assert any(diagnostic.provider == "foo" for diagnostic in snapshot.diagnostics)
+    with pytest.raises(RuntimeRegistryError, match="Provider 'foo' is unavailable"):
+        update_provider_fragment(
+            "foo",
+            lambda _snapshot, current: {
+                **current,
+                "second": _record(str(tmp_path / "second")),
+            },
+        )
+
+    assert alias.read_bytes() == original
+    assert {
+        entry.name for entry in directory.iterdir() if entry.suffix == ".json"
+    } == original_entries
 
 
 def test_rapid_same_size_atomic_replacement_is_observed(registry_home, tmp_path):

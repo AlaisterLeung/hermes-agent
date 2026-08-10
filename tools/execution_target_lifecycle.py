@@ -5,7 +5,27 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-_REGISTRY_METADATA_KEY = "__execution_target_registry_v1__"
+REGISTRY_METADATA_KEY = "__execution_target_registry_v1__"
+
+
+def runtime_record_metadata_entry(
+    *,
+    execution_target: str,
+    provider: str,
+    owner_id: str,
+    generation: str,
+    state: str,
+    status: str,
+) -> dict[str, str]:
+    """Build the canonical runtime-record sidecar shape used by resolvers."""
+    return {
+        "execution_target": execution_target,
+        "provider": provider,
+        "owner_id": owner_id,
+        "generation": generation,
+        "state": state,
+        "status": status,
+    }
 
 
 def runtime_record_metadata(
@@ -14,7 +34,7 @@ def runtime_record_metadata(
     *,
     status: str | None = None,
 ) -> list[Mapping[str, Any]]:
-    registry = root.get(_REGISTRY_METADATA_KEY)
+    registry = root.get(REGISTRY_METADATA_KEY)
     records = registry.get("records") if isinstance(registry, Mapping) else None
     if not isinstance(records, list):
         return []

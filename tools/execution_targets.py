@@ -281,6 +281,18 @@ class ExecutionTargetResolution:
         key = str(self.scope_task_key(str(raw_session_key or "default")))
         return (key, self.target) if self.named else key
 
+    def file_coordination_key(self, raw_session_key: Optional[str]) -> Hashable:
+        """Return file-operation state identity, generation-scoped at runtime.
+
+        Static named targets retain their historical per-alias session key.
+        Runtime aliases add their immutable security scope so a provider
+        repoint cannot inherit repeated-read, stale-write, or patch state.
+        """
+        key = self.session_key(raw_session_key)
+        if self.provider is None or not isinstance(key, tuple):
+            return key
+        return (key[0], f"{key[1]}@runtime-{self.security_scope}")
+
     def backend_task_id(self, task_key: Hashable) -> str:
         """Return a bounded backend-safe isolation id.
 

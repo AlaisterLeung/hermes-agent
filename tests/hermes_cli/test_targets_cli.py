@@ -12,6 +12,7 @@ import pytest
 from hermes_cli.targets import register_cli
 from tools.execution_target_registry import (
     invalidate_runtime_registry_cache,
+    load_runtime_registry,
     registry_directory,
 )
 from tools.execution_targets import (
@@ -153,6 +154,157 @@ def test_register_list_show_and_secret_safe_json(cli_home, capsys):
     shown = json.loads(capsys.readouterr().out)
     assert shown["routing"]["ssh_port"] == 443
     assert secret_path not in json.dumps(shown)
+
+
+def test_provider_aliases_canonicalize_to_one_cli_owner(cli_home, capsys):
+    for name, provider in (("first", "Foo"), ("second", "foo")):
+        assert (
+            _run([
+                "register",
+                name,
+                "--backend",
+                "local",
+                "--provider",
+                provider,
+                "--generation",
+                f"{name}-g1",
+                "--json",
+            ])
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)["provider"] == "foo"
+
+    fragment = registry_directory() / "foo.json"
+    payload = json.loads(fragment.read_text(encoding="utf-8"))
+    assert payload["provider"] == "foo"
+    assert set(payload["targets"]) == {"first", "second"}
+    assert not (registry_directory() / "Foo.json").exists() or (
+        registry_directory() / "Foo.json"
+    ).samefile(fragment)
+
+    assert _run(["show", "second", "--provider", "FOO", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["provider"] == "foo"
+
+
+def test_register_and_replace_publish_reloadable_0600_files_under_strict_umask(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    home = tmp_path / "strict-umask-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    set_execution_target_config_source({"terminal": {"backend": "local"}})
+    invalidate_runtime_registry_cache()
+    original_umask = os.umask(0o777)
+    try:
+        first = [
+            "register",
+            "box",
+            "--backend",
+            "local",
+            "--provider",
+            "Controller",
+            "--generation",
+            "g1",
+            "--json",
+        ]
+        assert _run(first) == 0
+        assert json.loads(capsys.readouterr().out)["provider"] == "controller"
+
+        replacement = [
+            "register",
+            "box",
+            "--backend",
+            "local",
+            "--provider",
+            "controller",
+            "--generation",
+            "g2",
+            "--replace",
+            "--if-generation",
+            "g1",
+            "--json",
+        ]
+        assert _run(replacement) == 0
+        assert json.loads(capsys.readouterr().out)["generation"] == "g2"
+
+        state_path = registry_directory() / ".registry-state.json"
+        provider_path = registry_directory() / "controller.json"
+        assert state_path.stat().st_mode & 0o777 == 0o600
+        assert provider_path.stat().st_mode & 0o777 == 0o600
+        reloaded = load_runtime_registry(force=True)
+        record = next(
+            item for item in reloaded.records if item.provider == "controller"
+        )
+        assert record.generation == "g2"
+    finally:
+        os.umask(original_umask)
+        set_execution_target_config_source(None)
+        invalidate_runtime_registry_cache()
+
+
+def test_post_publication_reload_failure_returns_stable_json_error_under_umask(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    import tools.execution_target_registry as registry_mod
+
+    home = tmp_path / "reload-failure-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    set_execution_target_config_source({
+        "terminal": {
+            "default_target": "local",
+            "targets": {"local": {"backend": "local", "cwd": str(tmp_path)}},
+        },
+    })
+    invalidate_runtime_registry_cache()
+    original_load = registry_mod.load_runtime_registry
+
+    def unavailable_after_publication(*, force=False):
+        snapshot = original_load(force=force)
+        if force and (registry_directory() / "controller.json").exists():
+            return registry_mod.RuntimeRegistrySnapshot()
+        return snapshot
+
+    monkeypatch.setattr(
+        registry_mod,
+        "load_runtime_registry",
+        unavailable_after_publication,
+    )
+    original_umask = os.umask(0o777)
+    try:
+        assert (
+            _run([
+                "register",
+                "box",
+                "--backend",
+                "local",
+                "--provider",
+                "controller",
+                "--generation",
+                "g1",
+                "--json",
+            ])
+            == 2
+        )
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["status"] == "error"
+        assert payload["message"] == ("Runtime execution target 'box' was not found.")
+        assert captured.err == ""
+        assert "StopIteration" not in captured.out
+        provider_path = registry_directory() / "controller.json"
+        assert provider_path.stat().st_mode & 0o777 == 0o600
+        assert original_load(force=True).records[0].generation == "g1"
+    finally:
+        os.umask(original_umask)
+        set_execution_target_config_source(None)
+        invalidate_runtime_registry_cache()
 
 
 def test_idempotency_replace_and_generation_cas(cli_home, capsys):

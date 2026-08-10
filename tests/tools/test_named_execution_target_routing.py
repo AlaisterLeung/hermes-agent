@@ -1476,6 +1476,7 @@ def test_ssh_target_aliases_share_file_state_lock_namespace(
     monkeypatch, isolated_target_state,
 ):
     import tools.execution_targets as targets_mod
+    from tools import file_state
 
     _, file_mod = isolated_target_state
     ssh = {
@@ -1500,6 +1501,20 @@ def test_ssh_target_aliases_share_file_state_lock_namespace(
     alias = file_mod._file_state_namespace("writer", "alias")
     assert alpha == alias
     assert alpha.startswith("ssh:")
+
+    alpha_resolution = targets_mod.resolve_execution_target("alpha")
+    alias_resolution = targets_mod.resolve_execution_target("alias")
+    alpha_key = alpha_resolution.file_coordination_key("reader")
+    alias_key = alias_resolution.file_coordination_key("writer")
+    path = "/srv/project/shared.txt"
+    registry = file_state.FileStateRegistry()
+    registry.record_read(alpha_key, path, namespace=alpha, stat_path=False)
+    registry.note_write(alias_key, path, namespace=alias, stat_path=False)
+    warning = registry.check_stale(alpha_key, path, namespace=alpha)
+
+    assert warning is not None
+    assert "writer" in warning
+    assert registry._lock_for(path, alpha) is registry._lock_for(path, alias)
 
 
 def test_persistent_docker_replacements_share_storage_lock_namespace(

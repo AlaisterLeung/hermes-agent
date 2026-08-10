@@ -93,6 +93,25 @@ _cache_lock = threading.RLock()
 _snapshot_cache: dict[Path, tuple[tuple[Any, ...], RuntimeRegistrySnapshot]] = {}
 
 
+def _clone_snapshot(snapshot: RuntimeRegistrySnapshot) -> RuntimeRegistrySnapshot:
+    """Return a caller-owned copy without exposing cached nested JSON values."""
+    return RuntimeRegistrySnapshot(
+        records=tuple(
+            RuntimeTargetRecord(
+                execution_target=record.execution_target,
+                provider=record.provider,
+                config=deepcopy(dict(record.config)),
+                owner_id=record.owner_id,
+                generation=record.generation,
+                state=record.state,
+            )
+            for record in snapshot.records
+        ),
+        diagnostics=snapshot.diagnostics,
+        legacy_activated=snapshot.legacy_activated,
+    )
+
+
 def registry_directory() -> Path:
     """Return the active profile's runtime target-fragment directory."""
     from hermes_constants import get_hermes_home
@@ -101,13 +120,13 @@ def registry_directory() -> Path:
 
 
 def validate_provider_name(provider: str) -> str:
-    """Validate a provider name before it can become a filename."""
+    """Validate and canonicalize the provider identity used in storage."""
     if not isinstance(provider, str) or not _PROVIDER_RE.fullmatch(provider):
         raise RuntimeRegistryError(
             "Provider must be 1-64 characters using only letters, digits, '.', "
             "'_', or '-', and must start with a letter or digit."
         )
-    return provider
+    return provider.lower()
 
 
 def _validate_target_name(name: Any) -> str:
@@ -248,6 +267,7 @@ def validate_fragment_targets(
 
 
 def _fragment_payload(provider: str, targets: Mapping[str, Any]) -> dict[str, Any]:
+    provider = validate_provider_name(provider)
     return {
         "version": REGISTRY_VERSION,
         "provider": provider,
@@ -387,8 +407,11 @@ def _parse_state(path: Path) -> bool:
 
 
 def _parse_fragment(path: Path) -> tuple[RuntimeTargetRecord, ...]:
-    provider_from_name = path.stem
-    validate_provider_name(provider_from_name)
+    provider_from_name = validate_provider_name(path.stem)
+    if path.stem != provider_from_name:
+        raise RuntimeRegistryError(
+            "provider fragment filename must use its canonical lowercase identity"
+        )
     data = _read_secure_json(path)
     if not isinstance(data, Mapping):
         raise RuntimeRegistryError("provider fragment root must be an object")
@@ -481,10 +504,43 @@ def _load_snapshot_uncached(directory: Path) -> RuntimeRegistrySnapshot:
             ),
             legacy_activated=legacy_activated,
         )
-    for path in entries:
-        if path.name.startswith(".") or path.suffix != ".json":
+    fragment_entries = [
+        path
+        for path in entries
+        if not path.name.startswith(".") and path.suffix == ".json"
+    ]
+    casefold_groups: dict[str, list[Path]] = {}
+    for path in fragment_entries:
+        casefold_groups.setdefault(path.name.casefold(), []).append(path)
+    colliding_paths: set[Path] = set()
+    for paths in casefold_groups.values():
+        if len(paths) < 2:
             continue
-        provider = path.stem if _PROVIDER_RE.fullmatch(path.stem) else None
+        colliding_paths.update(paths)
+        try:
+            provider = validate_provider_name(paths[0].stem)
+        except RuntimeRegistryError:
+            provider = None
+        diagnostics.append(
+            RegistryDiagnostic(
+                code="provider_identity_collision",
+                provider=provider,
+                message=(
+                    f"Runtime target provider {provider!r} is unavailable because "
+                    "multiple fragment filenames have the same canonical identity."
+                    if provider is not None
+                    else "Runtime provider fragments have colliding unsafe filenames."
+                ),
+            )
+        )
+
+    for path in fragment_entries:
+        if path in colliding_paths:
+            continue
+        try:
+            provider = validate_provider_name(path.stem)
+        except RuntimeRegistryError:
+            provider = None
         try:
             records.extend(_parse_fragment(path))
         except (OSError, RuntimeRegistryError):
@@ -515,13 +571,17 @@ def load_runtime_registry(*, force: bool = False) -> RuntimeRegistrySnapshot:
         with _cache_lock:
             cached = _snapshot_cache.get(directory)
             if not force and cached is not None and cached[0] == before:
-                return cached[1]
+                cached_snapshot = cached[1]
+            else:
+                cached_snapshot = None
+        if cached_snapshot is not None:
+            return _clone_snapshot(cached_snapshot)
         snapshot = _load_snapshot_uncached(directory)
         after = _registry_signature(directory)
         if before == after:
             with _cache_lock:
                 _snapshot_cache[directory] = (after, snapshot)
-            return snapshot
+            return _clone_snapshot(snapshot)
     # A continuously changing provider should not make static targets fail.
     return RuntimeRegistrySnapshot(
         diagnostics=(
@@ -541,6 +601,22 @@ def invalidate_runtime_registry_cache() -> None:
 
 def _ensure_registry_directory() -> Path:
     directory = registry_directory()
+    runtime_directory = directory.parent
+    runtime_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime_st = runtime_directory.lstat()
+    if stat.S_ISLNK(runtime_st.st_mode) or not stat.S_ISDIR(runtime_st.st_mode):
+        raise RuntimeRegistryError("Runtime state path is not a secure directory.")
+    try:
+        runtime_directory.chmod(0o700)
+    except OSError:
+        pass
+    runtime_st = runtime_directory.lstat()
+    if _user_only_error(
+        runtime_directory,
+        stat.S_IMODE(runtime_st.st_mode),
+        getattr(runtime_st, "st_uid", None),
+    ):
+        raise RuntimeRegistryError("Runtime state directory is not user-only.")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     st = directory.lstat()
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
@@ -673,21 +749,100 @@ def _serialized_json_bytes(payload: Mapping[str, Any]) -> bytes:
     return data
 
 
+def _assert_no_casefold_alias(path: Path) -> None:
+    """Refuse a noncanonical directory entry that aliases *path*."""
+    try:
+        entries = path.parent.iterdir()
+        for entry in entries:
+            if (
+                entry.name.casefold() == path.name.casefold()
+                and entry.name != path.name
+            ):
+                raise RuntimeRegistryError(
+                    f"Refusing to replace noncanonical registry entry {entry.name!r}; "
+                    f"provider filenames must use {path.name!r}."
+                )
+    except RuntimeRegistryError:
+        raise
+    except OSError as exc:
+        raise RuntimeRegistryError(
+            "Could not verify runtime registry filename ownership."
+        ) from exc
+
+
+def _set_owner_only_mode(fd: int, path: Path) -> None:
+    """Apply mode 0600 despite the process umask, with a Windows fallback."""
+    fchmod = getattr(os, "fchmod", None)
+    if callable(fchmod):
+        try:
+            fchmod(fd, 0o600)
+            return
+        except (OSError, NotImplementedError):
+            pass
+    try:
+        os.chmod(path, 0o600, follow_symlinks=False)
+    except (TypeError, NotImplementedError):
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        if os.name != "nt":
+            raise RuntimeRegistryError(
+                f"Could not secure temporary registry file {path.name}."
+            ) from exc
+
+
+def _verify_publication_file(path: Path, *, fd: int | None = None) -> None:
+    """Verify one publication is a single-link, owner-only regular file."""
+    try:
+        linked = path.lstat()
+        opened = os.fstat(fd) if fd is not None else linked
+    except OSError as exc:
+        raise RuntimeRegistryError(
+            f"Registry publication {path.name} became unavailable."
+        ) from exc
+    if fd is not None and (linked.st_dev, linked.st_ino) != (
+        opened.st_dev,
+        opened.st_ino,
+    ):
+        raise RuntimeRegistryError(
+            f"Registry publication {path.name} changed while being written."
+        )
+    if not stat.S_ISREG(linked.st_mode) or not stat.S_ISREG(opened.st_mode):
+        raise RuntimeRegistryError(
+            f"Registry publication {path.name} is not a regular file."
+        )
+    if getattr(linked, "st_nlink", 1) != 1 or getattr(opened, "st_nlink", 1) != 1:
+        raise RuntimeRegistryError(
+            f"Registry publication {path.name} has an unsafe link count."
+        )
+    permission_error = _user_only_error(
+        path,
+        stat.S_IMODE(opened.st_mode),
+        getattr(opened, "st_uid", None),
+    )
+    if permission_error:
+        raise RuntimeRegistryError(permission_error)
+
+
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     data = _serialized_json_bytes(payload)
+    _assert_no_casefold_alias(path)
     temp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(temp, flags, 0o600)
     try:
+        _set_owner_only_mode(fd, temp)
+        _verify_publication_file(temp, fd=fd)
         with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        _verify_publication_file(temp, fd=fd)
         os.close(fd)
         fd = -1
         os.replace(temp, path)
+        _verify_publication_file(path)
         try:
             directory_fd = os.open(path.parent, os.O_RDONLY)
         except OSError:
@@ -784,8 +939,9 @@ def write_provider_fragment_for_tests(
     This deliberately remains useful to provider integrations and acceptance
     tests without exposing an unsafe partial-record mutation API.
     """
+    provider = validate_provider_name(provider)
     with registry_write_lock() as directory:
-        path = directory / f"{validate_provider_name(provider)}.json"
+        path = directory / f"{provider}.json"
         _atomic_write_json(path, _fragment_payload(provider, targets))
         invalidate_runtime_registry_cache()
         return path

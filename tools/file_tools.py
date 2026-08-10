@@ -243,8 +243,13 @@ def _file_state_namespace(
         from tools.execution_targets import resolve_execution_target
 
         resolution = _resolution or resolve_execution_target(execution_target)
+        runtime_prefix = (
+            f"runtime-{resolution.security_scope}:"
+            if resolution.provider is not None
+            else ""
+        )
         if resolution.backend == "local":
-            return None
+            return f"{profile}{runtime_prefix}local" if runtime_prefix else None
         # Preserve the pre-target single-profile legacy state key.
         if not resolution.named:
             return None
@@ -259,7 +264,7 @@ def _file_state_namespace(
                 "port": int(cfg.get("ssh_port") or 22),
             }, sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(physical.encode("utf-8")).hexdigest()[:20]
-            return f"{profile}ssh:{digest}"
+            return f"{profile}{runtime_prefix}ssh:{digest}"
         if resolution.backend == "docker":
             persistent = resolution.config.get("container_persistent", True)
             if isinstance(persistent, str):
@@ -270,10 +275,13 @@ def _file_state_namespace(
                 owner = resolution.storage_task_id(
                     _resolve_container_task_id(str(task_id)),
                 )
-                return f"{profile}docker-storage:{owner}"
+                return f"{profile}{runtime_prefix}docker-storage:{owner}"
         # Other remote/container targets create distinct backend resources even
         # when their visible path strings happen to match.
-        return f"{profile}{resolution.backend}:{resolution.security_scope}"
+        return (
+            f"{profile}{runtime_prefix}{resolution.backend}:"
+            f"{resolution.security_scope}"
+        )
     except Exception:
         # Unknown targets are reported by the tool resolver before state access.
         return execution_target
@@ -1976,7 +1984,7 @@ def read_file_tool(
             resolution = resolve_execution_target(target)
         selected_target = resolution.target if resolution.named else None
         host_mtime_tracking = resolution.backend == "local"
-        state_task_id = resolution.session_key(task_id)
+        state_task_id = resolution.file_coordination_key(task_id)
         state_namespace = _file_state_namespace(
             task_id, selected_target, _resolution=resolution,
         )
@@ -2468,7 +2476,9 @@ def notify_other_tool_call(
                 from tools.execution_targets import resolve_execution_target
 
                 keys = [
-                    resolve_execution_target(execution_target).session_key(task_id)
+                    resolve_execution_target(execution_target).file_coordination_key(
+                        task_id
+                    )
                 ]
             except Exception:
                 keys = [task_id]
@@ -2515,7 +2525,7 @@ def _invalidate_dedup_for_path(
     from tools.execution_targets import resolve_execution_target
     resolution = _resolution or resolve_execution_target(execution_target)
     selected_target = resolution.target if resolution.named else None
-    state_task_id = resolution.session_key(task_id)
+    state_task_id = resolution.file_coordination_key(task_id)
     try:
         resolved = str(_resolve_path_for_task(
             filepath, task_id, selected_target, _resolution=resolution,
@@ -2561,7 +2571,7 @@ def _update_read_timestamp(
     from tools.execution_targets import resolve_execution_target
     resolution = _resolution or resolve_execution_target(execution_target)
     selected_target = resolution.target if resolution.named else None
-    state_task_id = resolution.session_key(task_id)
+    state_task_id = resolution.file_coordination_key(task_id)
     _invalidate_dedup_for_path(
         filepath, task_id, selected_target, _resolution=resolution,
     )
@@ -2595,7 +2605,7 @@ def _check_file_staleness(
     from tools.execution_targets import resolve_execution_target
     resolution = _resolution or resolve_execution_target(execution_target)
     selected_target = resolution.target if resolution.named else None
-    state_task_id = resolution.session_key(task_id)
+    state_task_id = resolution.file_coordination_key(task_id)
     try:
         resolved = str(_resolve_path_for_task(
             filepath, task_id, selected_target, _resolution=resolution,
@@ -2680,7 +2690,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(exc))
     selected_target = resolution.target if resolution.named else None
     host_mtime_tracking = resolution.backend == "local"
-    state_task_id = resolution.session_key(task_id)
+    state_task_id = resolution.file_coordination_key(task_id)
     state_namespace = _file_state_namespace(
             task_id, selected_target, _resolution=resolution,
         )
@@ -2816,7 +2826,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(exc))
     selected_target = resolution.target if resolution.named else None
     host_mtime_tracking = resolution.backend == "local"
-    state_task_id = resolution.session_key(task_id)
+    state_task_id = resolution.file_coordination_key(task_id)
     state_namespace = _file_state_namespace(
             task_id, selected_target, _resolution=resolution,
         )
@@ -3068,7 +3078,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         resolution = resolve_execution_target(execution_target)
         selected_target = resolution.target if resolution.named else None
-        state_task_id = resolution.session_key(task_id)
+        state_task_id = resolution.file_coordination_key(task_id)
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.

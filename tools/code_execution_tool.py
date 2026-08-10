@@ -717,7 +717,27 @@ def _frozen_target_config(resolution) -> dict:
         targets[default_target] = {"backend": "local"}
     terminal["default_target"] = default_target
     terminal["targets"] = targets
-    return {"terminal": terminal}
+    frozen = {"terminal": terminal}
+    if resolution.provider is not None:
+        from tools.execution_target_lifecycle import (
+            REGISTRY_METADATA_KEY,
+            runtime_record_metadata_entry,
+        )
+
+        frozen[REGISTRY_METADATA_KEY] = {
+            "records": [
+                runtime_record_metadata_entry(
+                    execution_target=resolution.target,
+                    provider=resolution.provider,
+                    owner_id=resolution.owner_id,
+                    generation=resolution.generation,
+                    state="ready",
+                    status="active",
+                )
+            ],
+            "diagnostics": [],
+        }
+    return frozen
 
 
 def _dispatch_rpc_tool(

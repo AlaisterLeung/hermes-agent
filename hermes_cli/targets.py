@@ -82,6 +82,7 @@ def _snapshot_with_provider(
     provider: str,
     targets: Mapping[str, Mapping[str, Any]],
 ) -> RuntimeRegistrySnapshot:
+    provider = validate_provider_name(provider)
     records = [record for record in snapshot.records if record.provider != provider]
     for name, record in sorted(targets.items()):
         records.append(
@@ -266,11 +267,7 @@ def _cmd_register(args: argparse.Namespace) -> int:
             mutate,
             activate_legacy=activate_legacy,
         )
-        record = next(
-            item
-            for item in updated.records
-            if item.provider == provider and item.execution_target == name
-        )
+        record = _find_runtime_record(updated, name, provider)
         from tools.execution_target_overlay import overlay_runtime_execution_targets
         from tools.execution_targets import resolve_execution_target
 
@@ -415,11 +412,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
 def _cmd_show(args: argparse.Namespace) -> int:
     try:
         rows, _diagnostics = _collect_rows(include_all=True)
+        provider = (
+            validate_provider_name(args.provider) if args.provider is not None else None
+        )
         matches = [
             row
             for row in rows
             if row["execution_target"] == args.name
-            and (args.provider is None or row["provider"] == args.provider)
+            and (provider is None or row["provider"] == provider)
         ]
         if not matches:
             raise RuntimeRegistryError(f"Execution target {args.name!r} was not found.")
@@ -445,6 +445,8 @@ def _find_runtime_record(
     name: str,
     provider: str | None,
 ) -> RuntimeTargetRecord:
+    if provider is not None:
+        provider = validate_provider_name(provider)
     matches = [
         record
         for record in snapshot.records
@@ -529,7 +531,10 @@ def _cmd_remove(args: argparse.Namespace) -> int:
 
 def _add_identity_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("name", help="Execution-target name")
-    parser.add_argument("--provider", help="Owning provider when ambiguous")
+    parser.add_argument(
+        "--provider",
+        help="Owning provider when ambiguous (canonicalized to lowercase)",
+    )
     parser.add_argument(
         "--if-generation",
         metavar="GEN",
@@ -559,7 +564,11 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     )
     register.add_argument("--cwd")
     register.add_argument("--timeout", type=int)
-    register.add_argument("--provider", default="cli")
+    register.add_argument(
+        "--provider",
+        default="cli",
+        help="Owning provider (canonicalized to lowercase)",
+    )
     register.add_argument("--owner-id")
     register.add_argument("--generation")
     register.add_argument("--replace", action="store_true")
@@ -584,7 +593,7 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     listing.set_defaults(func=_cmd_list)
     show = sub.add_parser("show", help="Show one target without secrets")
     show.add_argument("name")
-    show.add_argument("--provider")
+    show.add_argument("--provider", help="Owning provider (case-insensitive)")
     show.add_argument("--json", action="store_true")
     show.set_defaults(func=_cmd_show)
     drain = sub.add_parser("drain", help="Reject new calls for one generation")
