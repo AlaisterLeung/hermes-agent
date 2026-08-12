@@ -751,6 +751,28 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    @pytest.mark.parametrize(
+        ("host_script", "selected_target_script", "expected"),
+        [
+            ("echo safe\n", "hermes gateway restart\n", True),
+            ("hermes gateway restart\n", "echo safe\n", False),
+        ],
+    )
+    def test_selected_target_reader_is_authoritative_over_host_twin(
+        self, tmp_path, host_script, selected_target_script, expected,
+    ):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        (tmp_path / "run.sh").write_text(host_script, encoding="utf-8")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash run.sh",
+            cwd=str(tmp_path),
+            read_remote_script=lambda _path: selected_target_script,
+        ) is expected
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
