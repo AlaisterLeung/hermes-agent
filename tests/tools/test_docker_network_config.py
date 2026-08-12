@@ -6,6 +6,8 @@ expose it, so operators could not request networkless Docker execution from
 config.yaml.
 """
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
 from tools.environments import docker as docker_env
 
@@ -47,7 +49,9 @@ def test_sibling_container_config_sites_carry_docker_network():
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
-def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
+def _reuse_guard_harness(
+    monkeypatch, *, existing_mode: str | None, network: bool,
+):
     """Drive DockerEnvironment through the cross-process reuse path with a
     fake existing container whose NetworkMode is *existing_mode*.
 
@@ -69,7 +73,11 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             # missing label as "<no value>".
             Result.stdout = "existing-container-id\trunning\t<no value>\n"
         elif len(cmd) > 1 and cmd[1] == "inspect":
-            Result.stdout = f"{existing_mode}\n"
+            if existing_mode is None:
+                Result.returncode = 1
+                Result.stderr = "temporary inspect failure"
+            else:
+                Result.stdout = f"{existing_mode}\n"
         elif len(cmd) > 1 and cmd[1] == "run":
             Result.stdout = "fresh-container-id\n"
         return Result()
@@ -97,6 +105,41 @@ def test_reuse_rejects_networked_container_when_lockdown_requested(monkeypatch):
     )
     run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
     assert "--network=none" in run_cmd
+
+
+def test_reuse_network_mismatch_refuses_to_remove_leased_container(monkeypatch):
+    monkeypatch.setattr(
+        docker_env,
+        "_acquire_exclusive_container_lease",
+        lambda container_id, lease_root=None: None,
+    )
+
+    with pytest.raises(RuntimeError, match="still used.*refusing removal"):
+        _reuse_guard_harness(
+            monkeypatch, existing_mode="bridge", network=False,
+        )
+
+
+def test_reuse_inspect_failure_fails_closed_without_removal(monkeypatch):
+    removal_attempted = False
+
+    def fail_if_removal_attempted(_self, container_id):
+        nonlocal removal_attempted
+        removal_attempted = True
+        raise AssertionError(container_id)
+
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_retire_network_mismatched_container",
+        fail_if_removal_attempted,
+    )
+
+    with pytest.raises(RuntimeError, match="Could not verify NetworkMode"):
+        _reuse_guard_harness(
+            monkeypatch, existing_mode=None, network=False,
+        )
+
+    assert removal_attempted is False
 
 
 def test_reuse_keeps_airgapped_container_when_lockdown_requested(monkeypatch):
