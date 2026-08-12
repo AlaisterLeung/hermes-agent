@@ -18,10 +18,12 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
-from tools.environments.base import BaseEnvironment, EnvironmentConnectionError, _SHELL_ENV_NAME_RE
+from tools.environments.base import (BaseEnvironment, EnvironmentConnectionError, _SHELL_ENV_NAME_RE,
+    get_sandbox_dir)
 from tools.environments.base_output import _popen_bash
 from tools.environments.docker_egress import (
     _EGRESS_LABEL_KEY, _critical_egress_env_names, _egress_enforce_on_docker, _egress_proxy_args_for_docker,
@@ -41,7 +43,213 @@ _DOCKER_SEARCH_PATHS = [
 ]
 
 _docker_executable: Optional[str] = None  # resolved once, cached
-_ENV_VAR_NAME_RE = _SHELL_ENV_NAME_RE
+_docker_executable: Optional[str] = None  # resolved once, cached
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_EGRESS_LABEL_KEY = "hermes-egress"
+_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_CURRENT_PROCESS_CONTAINER_IDS: set[str] = set()
+_CONTAINER_LEASES: dict[tuple[str, str], tuple[TextIO, int]] = {}
+_CONTAINER_LEASES_LOCK = threading.Lock()
+_ENVIRONMENT_LEASE_TRACKING_LOCK = threading.Lock()
+
+
+def _lease_dir(root: Path | None = None) -> Path:
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    from tools.environments.base import get_sandbox_dir
+
+    lease_dir = get_sandbox_dir() / "docker" / ".runtime-leases"
+    lease_dir.mkdir(parents=True, exist_ok=True)
+    return lease_dir
+
+
+def _container_lease_path(
+    container_id: str, lease_root: Path | None = None,
+) -> Path:
+    safe_id = _sanitize_label_value(container_id)
+    return _lease_dir(lease_root) / f"container-{safe_id}.lock"
+
+
+def _storage_lease_path(
+    storage_label: str, lease_root: Path | None = None,
+) -> Path:
+    safe_label = _sanitize_label_value(storage_label)
+    return _lease_dir(lease_root) / f"storage-{safe_label}.lock"
+
+
+def _try_file_lock(handle: TextIO, *, exclusive: bool) -> bool:
+    """Acquire a non-blocking cross-process file lock on POSIX or Windows."""
+    if os.name == "nt":
+        try:
+            import portalocker
+        except ImportError as exc:
+            raise RuntimeError(
+                "Persistent named Docker targets require portalocker on Windows."
+            ) from exc
+        flags = portalocker.LOCK_EX if exclusive else portalocker.LOCK_SH
+        try:
+            portalocker.lock(handle, flags | portalocker.LOCK_NB)
+        except portalocker.exceptions.LockException:
+            return False
+        return True
+
+    import fcntl
+
+    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    try:
+        fcntl.flock(handle.fileno(), flags | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock_file(handle: TextIO) -> None:
+    if os.name == "nt":
+        import portalocker
+
+        portalocker.unlock(handle)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _hold_container_lease(
+    container_id: str, lease_root: Path | None = None,
+) -> None:
+    """Hold a shared lease while this process can dispatch to a container."""
+    if not container_id:
+        return
+    root = _lease_dir(lease_root).resolve()
+    lease_key = (str(root), container_id)
+    with _CONTAINER_LEASES_LOCK:
+        current = _CONTAINER_LEASES.get(lease_key)
+        if current is not None:
+            handle, count = current
+            _CONTAINER_LEASES[lease_key] = (handle, count + 1)
+            return
+        handle = open(
+            _container_lease_path(container_id, root), "a+", encoding="utf-8",
+        )
+        try:
+            acquired = _try_file_lock(handle, exclusive=False)
+        except Exception:
+            handle.close()
+            raise
+        if not acquired:
+            handle.close()
+            raise RuntimeError(
+                f"Docker runtime {container_id[:12]} is being retired by another "
+                "Hermes process; retry the operation."
+            )
+        _CONTAINER_LEASES[lease_key] = (handle, 1)
+
+
+def _release_container_lease(
+    container_id: str, lease_root: Path | None = None,
+) -> bool:
+    """Release one local holder; return True when the OS lease was closed."""
+    root = _lease_dir(lease_root).resolve()
+    lease_key = (str(root), container_id)
+    with _CONTAINER_LEASES_LOCK:
+        current = _CONTAINER_LEASES.get(lease_key)
+        if current is None:
+            return True
+        handle, count = current
+        if count > 1:
+            _CONTAINER_LEASES[lease_key] = (handle, count - 1)
+            return False
+        _CONTAINER_LEASES.pop(lease_key, None)
+    try:
+        _unlock_file(handle)
+    finally:
+        handle.close()
+    return True
+
+
+def _release_runtime_tracking(
+    container_id: str, lease_root: Path | None = None,
+) -> None:
+    if _release_container_lease(container_id, lease_root):
+        _CURRENT_PROCESS_CONTAINER_IDS.discard(container_id)
+
+
+def _track_environment_container(env, container_id: str) -> None:
+    # Re-tracking can happen during concurrent recovery. Retire the previous
+    # finalizer's ownership before taking a new one, and serialize per-process
+    # finalizer replacement so every lease count always has one live releaser.
+    with _ENVIRONMENT_LEASE_TRACKING_LOCK:
+        previous = getattr(env, "_lease_finalizer", None)
+        if previous is not None and previous.alive:
+            previous()
+        lease_root = getattr(env, "_lease_root", None)
+        _hold_container_lease(container_id, lease_root)
+        _CURRENT_PROCESS_CONTAINER_IDS.add(container_id)
+        env._lease_finalizer = weakref.finalize(
+            env, _release_runtime_tracking, container_id, lease_root,
+        )
+
+
+def _acquire_exclusive_container_lease(
+    container_id: str, lease_root: Path | None = None,
+):
+    """Return an exclusive lease handle, None when another process is live."""
+    handle = open(
+        _container_lease_path(container_id, lease_root), "a+", encoding="utf-8",
+    )
+    try:
+        acquired = _try_file_lock(handle, exclusive=True)
+    except Exception:
+        handle.close()
+        raise
+    if not acquired:
+        handle.close()
+        return None
+    return handle
+
+
+def _close_exclusive_container_lease(handle) -> None:
+    if handle is None:
+        return
+    try:
+        _unlock_file(handle)
+    finally:
+        handle.close()
+
+
+def _acquire_storage_creation_lease(
+    storage_label: str, timeout: float = 30.0, *,
+    lease_root: Path | None = None,
+) -> TextIO:
+    """Serialize inspect/reconcile/create for one stable storage owner."""
+    handle = open(
+        _storage_lease_path(storage_label, lease_root), "a+", encoding="utf-8",
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if _try_file_lock(handle, exclusive=True):
+                return handle
+        except Exception:
+            handle.close()
+            raise
+        if time.monotonic() >= deadline:
+            handle.close()
+            raise RuntimeError(
+                f"Timed out waiting for Docker storage owner {storage_label}; "
+                "another Hermes process is creating or reconciling it."
+            )
+        time.sleep(0.05)
+
+
+def _close_storage_creation_lease(handle: TextIO) -> None:
+    try:
+        _unlock_file(handle)
+    finally:
+        handle.close()
+
+
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -513,7 +721,9 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
-        snap_compat: bool = False):
+        snap_compat: bool = False,
+        storage_task_id: str | None = None,
+        legacy_storage_task_id: str | None = None):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -522,6 +732,37 @@ class DockerEnvironment(BaseEnvironment):
         # Set by terminal_tool._create_environment for session-scoped containers
         # (docker + container_persistent: false): removed at session close/idle timeout.
         self._session_scoped = False
+
+        self._lease_root = (
+            get_sandbox_dir() / "docker" / ".runtime-leases"
+        ).resolve()
+        storage_label = ""
+        if self._persistent and storage_task_id:
+            storage_root = str(get_sandbox_dir().resolve())
+            storage_owner = f"{storage_task_id}\0{storage_root}"
+            storage_label = "storage-" + hashlib.sha256(
+                storage_owner.encode("utf-8")
+            ).hexdigest()[:20]
+        storage_guard = (
+            _acquire_storage_creation_lease(
+                storage_label, lease_root=self._lease_root,
+            )
+            if storage_label else None
+        )
+        storage_guard_finalizer = (
+            weakref.finalize(self, _close_storage_creation_lease, storage_guard)
+            if storage_guard is not None else None
+        )
+
+        def _release_storage_guard_early() -> None:
+            nonlocal storage_guard
+            if storage_guard is None:
+                return
+            if storage_guard_finalizer is not None:
+                storage_guard_finalizer.detach()
+            _close_storage_creation_lease(storage_guard)
+            storage_guard = None
+
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
@@ -878,6 +1119,7 @@ class DockerEnvironment(BaseEnvironment):
         recovery fails so the caller surfaces the original error."""
         logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
         self._container_id = None
+        _release_runtime_tracking(old_container_id, self._lease_root)
 
         existing = self._find_reusable_container(
             self._labels.get("hermes-task-id", ""),
@@ -897,6 +1139,7 @@ class DockerEnvironment(BaseEnvironment):
         if not self._container_id:
             if not self._image:
                 logger.error("Recovery: no saved image name, cannot recreate container")
+                _release_storage_guard()
                 return False
             try:
                 new_name = f"hermes-{uuid.uuid4().hex[:8]}"
@@ -907,6 +1150,7 @@ class DockerEnvironment(BaseEnvironment):
                 logger.info("Recovery: created fresh container %s (%s)", new_name, self._container_id[:12])
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
                 logger.error("Recovery: failed to create new container: %s", e)
+                _release_storage_guard()
                 return False
 
         try:
@@ -962,6 +1206,148 @@ class DockerEnvironment(BaseEnvironment):
             fail="docker inspect NetworkMode failed: %s", nonzero="docker inspect NetworkMode returned %d: %s")
         return (result.stdout.strip() or None) if result is not None else None
 
+    def _retire_network_mismatched_container(self, container_id: str) -> None:
+        """Remove a confirmed network-mismatched reuse candidate safely."""
+        lease = _acquire_exclusive_container_lease(
+            container_id, self._lease_root,
+        )
+        if lease is None:
+            raise RuntimeError(
+                f"Docker runtime {container_id[:12]} has a network mode that "
+                "conflicts with docker_network=false, but it is still used by "
+                "another environment or Hermes process; refusing removal."
+            )
+        try:
+            try:
+                removed = subprocess.run(
+                    [self._docker_exe, "rm", "-f", container_id],
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=30,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                raise RuntimeError(
+                    f"Failed to remove network-mismatched Docker runtime "
+                    f"{container_id[:12]}: {exc}"
+                ) from exc
+            if removed.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to remove network-mismatched Docker runtime "
+                    f"{container_id[:12]}: "
+                    f"{removed.stderr.strip() or removed.stdout.strip()}"
+                )
+        finally:
+            _close_exclusive_container_lease(lease)
+
+    def _remove_superseded_storage_containers(
+        self,
+        storage_label: str,
+        profile_label: str,
+        current_task_label: str,
+        current_egress_label: str = "off",
+        *,
+        allow_exact_reuse: bool,
+    ) -> None:
+        """Remove prior-process runtimes sharing this stable storage owner.
+
+        A config-derived runtime task label changes when a named target is
+        edited. Persistent storage has a deliberately stable label, so a new
+        Hermes process must retire any old-spec container before mounting that
+        storage into the replacement. Containers already managed by this process
+        are skipped; hot edits retire those through terminal_tool after in-flight
+        users release them.
+        """
+        format_expr = (
+            '{{.ID}}\t{{.Label "hermes-task-id"}}\t'
+            '{{.Label "hermes-process-instance"}}\t'
+            '{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
+        )
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe, "ps", "-a", "--no-trunc",
+                    "--filter", "label=hermes-agent=1",
+                    "--filter", f"label=hermes-storage-id={storage_label}",
+                    "--filter", f"label=hermes-profile={profile_label}",
+                    "--format", format_expr,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RuntimeError(
+                "Could not inspect prior Docker runtimes for persistent storage "
+                f"{storage_label}: {exc}"
+            ) from exc
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Could not inspect prior Docker runtimes for persistent storage "
+                f"{storage_label}: {result.stderr.strip()}"
+            )
+
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) not in (3, 4):
+                continue
+            container_id, task_label, process_label = parts[:3]
+            egress_label = parts[3] if len(parts) == 4 else ""
+            if not container_id:
+                continue
+            egress_matches = (
+                egress_label == current_egress_label
+                if current_egress_label != "off"
+                else egress_label in ("", "<no value>", "off")
+            )
+            if (
+                allow_exact_reuse
+                and task_label == current_task_label
+                and egress_matches
+            ):
+                continue
+            if container_id in _CURRENT_PROCESS_CONTAINER_IDS:
+                raise RuntimeError(
+                    f"Docker runtime {container_id[:12]} for persistent storage "
+                    f"{storage_label} is still cached by this Hermes process. "
+                    "Clean up that target or restart Hermes before applying "
+                    "the changed Docker target config."
+                )
+            lease = _acquire_exclusive_container_lease(
+                container_id, self._lease_root,
+            )
+            if lease is None:
+                raise RuntimeError(
+                    f"Docker runtime {container_id[:12]} for persistent storage "
+                    f"{storage_label} is still used by another Hermes process "
+                    f"({process_label or 'unknown owner'}). Stop that process or "
+                    "restore the previous target config before retrying."
+                )
+            try:
+                removed = subprocess.run(
+                    [self._docker_exe, "rm", "-f", container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+                if removed.returncode != 0:
+                    raise RuntimeError(
+                        f"Could not retire superseded Docker runtime "
+                        f"{container_id[:12]} for persistent storage "
+                        f"{storage_label}: {removed.stderr.strip()}"
+                    )
+                logger.info(
+                    "Retired superseded Docker runtime %s before mounting storage %s",
+                    container_id[:12], storage_label,
+                )
+            finally:
+                _close_exclusive_container_lease(lease)
+
     def _find_reusable_container(
         self, task_label: str, profile_label: str, egress_label: str) -> Optional[tuple[str, str]]:
         """``(container_id, state)`` of an existing container labeled for this task/profile/
@@ -1013,6 +1399,9 @@ class DockerEnvironment(BaseEnvironment):
         the thread to finish before the interpreter exits, so ``docker stop`` / ``docker rm`` actually
         completes when we do trigger it.
         """
+        existing_thread = getattr(self, "_cleanup_thread", None)
+        if existing_thread is not None and existing_thread.is_alive():
+            return
         container_id = self._container_id
         if not container_id:
             # Bind-mount dirs are still dropped in non-persistent mode.
@@ -1029,6 +1418,27 @@ class DockerEnvironment(BaseEnvironment):
         # Capture what the worker needs — the thread can outlive ``self``.
         docker_exe = self._docker_exe
         log_id = container_id[:12]
+        workspace_dirs = (self._workspace_dir, self._home_dir)
+        self._cleanup_error = None
+
+        def _container_is_absent() -> bool:
+            try:
+                inspected = subprocess.run(
+                    [docker_exe, "container", "inspect", container_id],
+                    capture_output=True, timeout=15,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                return False
+            if getattr(inspected, "returncode", 0) == 0:
+                return False
+            detail = (
+                f"{getattr(inspected, 'stdout', '')} "
+                f"{getattr(inspected, 'stderr', '')}"
+            ).lower()
+            return any(marker in detail for marker in (
+                "no such", "not found", "does not exist",
+            ))
 
         def _do_cleanup() -> None:
             for argv, fail_msg in ((["stop", "-t", "10"], "docker stop %s timed out / failed: %s"),
@@ -1074,7 +1484,13 @@ class DockerEnvironment(BaseEnvironment):
         """Block up to *timeout* seconds for the cleanup thread (atexit hook). True if it
         finished or none was started, False on timeout."""
         thread = getattr(self, "_cleanup_thread", None)
-        if thread is None or not thread.is_alive():
-            return True
-        thread.join(timeout=timeout)
-        return not thread.is_alive()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return False
+        cleanup_error = getattr(self, "_cleanup_error", None)
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"Docker cleanup failed transactionally: {cleanup_error}"
+            ) from cleanup_error
+        return True

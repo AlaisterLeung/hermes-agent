@@ -101,11 +101,15 @@ def _pop_not_found(op: str, resolved_str: str, task_id: str) -> None:
         nf.pop((op, resolved_str), None)
 
 
-def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
+def _check_not_found_cache(op: str, resolved_str: str, task_id: str,
+                           *, check_host_filesystem: bool = True) -> str | None:
     """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
 
     *op* is "read" or "search" (different error JSON shapes). Evicted by TTL,
     by write_file/patch on the path, or by any other tool call.
+    ``check_host_filesystem=False`` (remote/container targets) skips the
+    host-side existence stat: a host path matching a remote path must not
+    invalidate the remote miss cache.
     """
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
@@ -119,7 +123,7 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     # "check → create → read" is common, so never serve a stale miss for a path
     # that now exists. The stat runs OUTSIDE the tracker lock: a hung stat on a
     # dead network mount must not stall every task.
-    if os.path.exists(resolved_str):
+    if check_host_filesystem and os.path.exists(resolved_str):
         with _read_tracker_lock:
             _pop_not_found(op, resolved_str, task_id)
         return None
@@ -162,21 +166,63 @@ def reset_file_dedup(task_id: str = None):
             task_data.setdefault("dedup_generation_reads", set()).clear()
 
 
-def notify_other_tool_call(task_id: str = "default"):
+def notify_other_tool_call(
+    task_id: str = "default", execution_target: str | None = None,
+):
     """Reset the consecutive read/search counter for a task.
 
     Called by the dispatcher for every tool OTHER than read_file/search_files.
     Also clears stub-hit counters and the not-found cache: any other tool may
     have created a previously-missing path (or flipped its permissions).
+    Target-aware: resets every tracker key that could hold this task's state
+    (legacy task id, scoped task key, or the selected target's coordination key).
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
-        if task_data:
+        if execution_target is None:
+            try:
+                from tools.execution_targets import resolve_execution_target
+
+                scoped_task_id = resolve_execution_target().scope_task_key(task_id)
+            except Exception:
+                scoped_task_id = task_id
+            keys = [task_id, scoped_task_id] + [
+                key for key in _read_tracker
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and key[0] in {task_id, scoped_task_id}
+                )
+            ]
+        else:
+            try:
+                from tools.execution_targets import resolve_execution_target
+
+                keys = [
+                    resolve_execution_target(execution_target).file_coordination_key(
+                        task_id
+                    )
+                ]
+            except Exception:
+                keys = [task_id]
+        for key in keys:
+            task_data = _read_tracker.get(key)
+            if not task_data:
+                continue
             task_data["last_key"] = None
             task_data["consecutive"] = 0
-            for key in ("dedup_hits", "not_found"):
-                if task_data.get(key):
-                    task_data[key].clear()
+            # An intervening non-read tool call breaks any stub-loop in
+            # progress, so clear per-key dedup hit counters too.
+            if "dedup_hits" in task_data:
+                task_data["dedup_hits"].clear()
+            # Any other tool (terminal, delegate, ...) may have created a
+            # previously-missing path — a cached miss is no longer
+            # trustworthy. The serve-side existence guard in
+            # _check_not_found_cache already covers this, but clearing
+            # here keeps the cache honest and covers exotic cases the
+            # stat can't (e.g. permission flips).
+            nf = task_data.get("not_found")
+            if nf:
+                nf.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:

@@ -7,6 +7,7 @@ files via ``env.execute()``.
 """
 
 import base64
+from copy import deepcopy
 import json
 import logging
 import secrets
@@ -14,6 +15,7 @@ import shlex
 import socket
 import threading
 import time
+from typing import Any, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 from tools.registry import tool_error
@@ -40,11 +42,20 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
 
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
-                        where: str) -> str:
+                        where: str, execution_target: Optional[str] = None,
+                        execution_target_scope: Optional[str] = None,
+                        execution_target_config: Optional[dict] = None) -> str:
     """Enforce allow-list + budget, then dispatch one authenticated request. Only a dispatched
     call consumes budget and is logged; refusals are free."""
     tool_name = request.get("tool", "")
     tool_args = request.get("args", {})
+    if execution_target:
+        try:
+            tool_args = _inherit_execution_target(
+                tool_name, tool_args, execution_target, execution_target_scope,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
     if tool_name not in allowed_tools:
         return tool_error(f"Tool '{tool_name}' is not available in execute_code. "
                           f"Available: {', '.join(sorted(allowed_tools))}")
@@ -57,7 +68,13 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     # Silence handler status prints so they don't leak into the CLI spinner.
     try:
         with thread_scoped_silence():
-            result = dispatch(tool_name, tool_args)
+            if execution_target_config is not None:
+                from tools.execution_targets import execution_target_config_scope
+
+                with execution_target_config_scope(execution_target_config):
+                    result = dispatch(tool_name, tool_args)
+            else:
+                result = dispatch(tool_name, tool_args)
     except Exception as exc:
         logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
         result = tool_error(str(exc))
@@ -67,9 +84,122 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     return result
 
 
+def _inherit_execution_target(
+    tool_name: str,
+    tool_args: Any,
+    execution_target: Optional[str],
+    execution_target_scope: Optional[str] = None,
+) -> Any:
+    """Bind target-aware RPC calls to the outer execute_code target.
+
+    The RPC token grants access to host-side Hermes tools. A script approved to
+    run in one sandbox must not use it to pivot a nested file/terminal call onto
+    another target. ``search_files`` uses ``execution_target`` because its
+    historical ``target`` argument selects the search mode.
+    """
+    if not execution_target or not isinstance(tool_args, dict):
+        return tool_args
+    selector = "execution_target" if tool_name == "search_files" else "target"
+    if tool_name not in {"terminal", "read_file", "write_file", "patch", "search_files"}:
+        return tool_args
+
+    if execution_target_scope:
+        from tools.execution_targets import resolve_live_execution_target
+
+        try:
+            live_resolution = resolve_live_execution_target(execution_target)
+        except Exception as exc:
+            raise ValueError(
+                f"Execution target {execution_target!r} is no longer available: {exc}"
+            ) from exc
+        if live_resolution.security_scope != execution_target_scope:
+            raise ValueError(
+                f"Execution target {execution_target!r} changed while execute_code "
+                "was running; nested target-aware calls are blocked."
+            )
+
+    inherited = dict(tool_args)
+    requested = inherited.get(selector)
+    if requested is None:
+        inherited[selector] = execution_target
+    elif str(requested) != execution_target:
+        raise ValueError(
+            f"execute_code RPC is bound to target {execution_target!r}; "
+            f"nested {tool_name} cannot select {requested!r}"
+        )
+    if tool_name == "read_file" and execution_target_scope:
+        runtime_scope = inherited.get("runtime_scope")
+        if runtime_scope is not None and runtime_scope != execution_target_scope:
+            raise ValueError(
+                "Nested read_file runtime_scope does not match the outer "
+                f"execute_code runtime for target {execution_target!r}."
+            )
+    return inherited
+
+
+def _frozen_target_config(resolution) -> dict:
+    """Freeze the effective config without making inherited fields explicit."""
+    terminal = deepcopy(dict(resolution.config))
+    # Preserve the selected target's FULL config (cwd, ssh_*, docker_*) — nested
+    # target-aware calls resolve their workspace against it.
+    selected_cfg = deepcopy(dict(resolution.config))
+    selected_cfg["backend"] = resolution.backend
+    targets = {resolution.target: selected_cfg}
+    if resolution.is_default:
+        default_target = resolution.target
+    else:
+        default_target = "__hermes_original_default__"
+        while default_target in targets:
+            default_target += "_"
+        targets[default_target] = {"backend": "local", "cwd": "."}
+    terminal["default_target"] = default_target
+    terminal["targets"] = targets
+    frozen = {"terminal": terminal}
+    if resolution.provider is not None:
+        from tools.execution_target_lifecycle import (
+            REGISTRY_METADATA_KEY,
+            runtime_record_metadata_entry,
+        )
+
+        frozen[REGISTRY_METADATA_KEY] = {
+            "records": [
+                runtime_record_metadata_entry(
+                    execution_target=resolution.target,
+                    provider=resolution.provider,
+                    owner_id=resolution.owner_id,
+                    generation=resolution.generation,
+                    state="ready",
+                    status="active",
+                )
+            ],
+            "diagnostics": [],
+        }
+    return frozen
+
+
+def _dispatch_rpc_tool(
+    handler,
+    tool_name: str,
+    tool_args: Any,
+    task_id: str,
+    execution_target_config: Optional[dict],
+):
+    """Dispatch under the immutable target config approved for this script."""
+    if execution_target_config is None:
+        return handler(tool_name, tool_args, task_id=task_id)
+
+    from tools.execution_targets import execution_target_config_scope
+
+    with execution_target_config_scope(execution_target_config):
+        return handler(tool_name, tool_args, task_id=task_id)
+
+
 def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: list,
                      tool_call_counter: list, max_tool_calls: int, allowed_tools: frozenset,
-                     stop_event: threading.Event, rpc_token: str, dispatch=None):
+                     stop_event: threading.Event, rpc_token: str, dispatch=None,
+                     execution_target: Optional[str] = None,
+                     execution_target_scope: Optional[str] = None,
+                     execution_target_config: Optional[dict] = None):
     """Accept one client and serve newline-delimited JSON requests until it disconnects, idles
     300s, or the call limit is reached. ``tool_call_counter`` is a mutable ``[int]``. ``dispatch``
     overrides how an allowed, budgeted call runs: per-call sandboxes use the default (the thread
@@ -113,6 +243,9 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
                         request, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
                         max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
                         call_start=call_start, where="sandbox",
+                        execution_target=execution_target,
+                        execution_target_scope=execution_target_scope,
+                        execution_target_config=execution_target_config,
                     ) if _rpc_token_ok(request, rpc_token) else tool_error("Unauthorized RPC request")
                 conn.sendall((resp + "\n").encode())
     except socket.timeout:
@@ -129,7 +262,9 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str):
+                   rpc_token: str, execution_target: Optional[str] = None,
+                   execution_target_scope: Optional[str] = None,
+                   execution_target_config: Optional[dict] = None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
@@ -165,6 +300,9 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                     request, allowed_tools=allowed_tools, tool_call_counter=tool_call_counter,
                     max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
                     call_start=call_start, where="remote sandbox",
+                    execution_target=execution_target,
+                    execution_target_scope=execution_target_scope,
+                    execution_target_config=execution_target_config,
                 )
                 # Write the response atomically (tmp + rename) via echo piping —
                 # Modal doesn't reliably deliver stdin_data to chained commands.

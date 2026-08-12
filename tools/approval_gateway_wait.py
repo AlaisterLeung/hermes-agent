@@ -17,6 +17,7 @@ import uuid
 
 from tools.interrupt import is_interrupted
 from tools import approval_context as _ctx
+from tools import approval as _approval
 from tools.approval_human_wait import activity_heartbeat, human_wait_window
 
 logger = logging.getLogger("tools.approval")
@@ -70,7 +71,7 @@ def _poll_event(event: threading.Event, session_key: str, *, interrupt_log: str)
 def _finish(payload: dict, resolved: bool, choice: str | None, reason, **extra) -> dict:
     """Fire the post hook and build the decision dict. Unresolved (timeout) and
     a None choice both mean the user never answered."""
-    _ctx._fire_approval_hook("post_approval_response", **payload,
+    _approval._fire_approval_hook("post_approval_response", **payload,
                         choice="timeout" if not resolved else (choice or "timeout"), **extra)
     return {"resolved": resolved, "choice": choice, "reason": reason, **extra}
 
@@ -84,7 +85,7 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     returns ``None``: single-use consent covers only the leader's execution,
     so the caller must issue a fresh prompt. Hooks fire with ``coalesced=True``
     so observers see the follower's lifecycle without a duplicate prompt."""
-    _ctx._fire_approval_hook("pre_approval_request", **payload, coalesced=True)
+    _approval._fire_approval_hook("pre_approval_request", **payload, coalesced=True)
     state = _poll_event(leader.event, session_key,
                         interrupt_log="Coalesced approval wait interrupted by user signal — "
                                       "returning deny for session %s")
@@ -115,7 +116,6 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     the user must /approve N times while the agent sits wedged. Followers adopt
     the leader's ``session``/``always``/``deny``/timeout; a ``once`` covers only
     the leader, so the follower falls through to a fresh prompt."""
-    from tools import approval as _approval
 
     primary_key = approval_data.get("pattern_key", "")
     payload = {
@@ -124,6 +124,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "pattern_key": primary_key,
         "pattern_keys": list(approval_data.get("pattern_keys", [primary_key])),
         "session_key": session_key, "surface": surface,
+        "target": approval_data.get("target", ""),
+        "backend": approval_data.get("backend", ""),
     }
     keys = list(approval_data.get("pattern_keys") or [])
     with _approval._lock:
@@ -148,14 +150,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
                 _approval._gateway_queues.pop(session_key, None)
 
     # Plugins hear about the request before the gateway does (real-time observers).
-    _ctx._fire_approval_hook("pre_approval_request", **payload)
+    _approval._fire_approval_hook("pre_approval_request", **payload)
     # Bridges sync agent thread → async gateway.
     try:
         notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
-        _ctx._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
+        _approval._fire_approval_hook("post_approval_response", **payload, choice="notify_failed")
         return {"resolved": False, "choice": None, "notify_failed": True}
 
     state = _poll_event(entry.event, session_key,

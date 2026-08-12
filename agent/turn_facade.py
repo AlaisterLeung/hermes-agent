@@ -115,7 +115,15 @@ class TurnFacadeMixin:
             )
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            # logical_environment_turn scopes per-target logical-environment turn accounting to
+            # this task (named execution targets).
+            from tools.terminal_tool import logical_environment_turn
+
+            with (
+                bind_subagent_parent(self),
+                scoped_runtime_main({}),
+                logical_environment_turn(effective_task_id),
+            ):
                 try:
                     if lease is not None:
                         lease.start()

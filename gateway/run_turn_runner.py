@@ -834,7 +834,36 @@ class TurnRunner:
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
                 self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
 
-        return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
+        def clarify_context_cb(text: str, *, already_streamed: bool = False) -> None:
+            """Deliver decision-critical prose even when generic interims are off."""
+            if (
+                already_streamed
+                or not ctx._run_still_current()
+                or not ctx._status_adapter
+                or not str(text or "").strip()
+            ):
+                return
+            fut = self._schedule(
+                ctx._status_adapter.send(
+                    ctx._status_chat_id,
+                    text,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                "clarify context delivery scheduling error",
+            )
+            if fut is None:
+                return
+            try:
+                # The poll is sent from a separate blocking callback. Waiting
+                # here guarantees that its explanatory packet arrives first.
+                fut.result(timeout=15)
+            except Exception:
+                logger.warning(
+                    "Clarify context delivery failed before prompt",
+                    exc_info=True,
+                )
+
+        return stream_consumer, stream_delta_cb, interim_assistant_cb, clarify_context_cb, want_interim_messages
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -1084,7 +1113,8 @@ class TurnRunner:
         agent._gateway_turn_request_overrides = turn_overrides
 
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
-                                   stream_delta_cb, interim_assistant_cb, want_interim_messages):
+                                   stream_delta_cb, interim_assistant_cb, want_interim_messages,
+                                   clarify_context_cb=None):
         """Per-message state — callbacks and reasoning config change every turn, so they aren't
         baked into the cached agent."""
         ctx = self._ctx
@@ -1102,6 +1132,9 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
+        agent.clarify_context_callback = (
+            None if want_interim_messages else clarify_context_cb
+        )
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
@@ -1636,12 +1669,12 @@ class TurnRunner:
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
-        stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        stream_consumer, stream_delta_cb, interim_cb, clarify_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
-        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim, clarify_cb)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)

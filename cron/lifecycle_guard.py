@@ -139,7 +139,8 @@ _PIPE_TO_INTERPRETER = re.compile(
 # Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
 _BINARY_SNIFF_BYTES = 4096
 
-_ReadRemoteScriptFn = Callable[[str], Optional[str]]
+_ReadRemoteScriptResult = Optional[str] | tuple[Optional[str], bool]
+_ReadRemoteScriptFn = Callable[[str], _ReadRemoteScriptResult]
 
 # Wrappers that hand execution to their argument tail: the real command sits further right, so a
 # first-token-only guard would let `sudo bash ~/restart.sh` / `sudo launchctl submit ...` walk past.
@@ -396,6 +397,7 @@ def _budget_exhausted(what: str, depth: int) -> bool:
 
 
 # --- shell tokenization -----------------------------------------------------------------------
+
 
 def _split_logical_lines(text: str) -> list[str]:
     """Split on newlines outside quotes (a quoted newline is data, not a separator); honors
@@ -844,7 +846,7 @@ def _read_referenced_script(
 
 
 def _sanitize_remote_script_text(
-    text: Optional[str], *, max_bytes: Optional[int] = None
+    result: _ReadRemoteScriptResult, *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
     """Apply the local-read contract to text from an untrusted ``read_remote_script`` callback: NUL
     means binary (nothing to scan, checked first); oversized fails closed. Size compares re-encoded
@@ -856,7 +858,19 @@ def _sanitize_remote_script_text(
     inside each callback so the guarantee holds for every callback, not just the ones we hardened. See
     #76762, #77703.
     """
-    if not text or "\x00" in text:
+    if isinstance(result, tuple):
+        if len(result) != 2 or not isinstance(result[1], bool):
+            return None, True
+        text, unsafe = result
+        if unsafe:
+            return None, True
+    else:
+        text = result
+    if not text:
+        return None, False
+    if not isinstance(text, str):
+        return None, True
+    if "\x00" in text:
         return None, False
     byte_limit = _capped_read_limit(max_bytes)
     if len(text) > byte_limit:

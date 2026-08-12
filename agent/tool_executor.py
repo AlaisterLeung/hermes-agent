@@ -48,6 +48,7 @@ from agent.tool_dispatch_helpers import (
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
+    PERSISTED_OUTPUT_TAG,
     maybe_persist_tool_result,
     enforce_turn_budget,
     extract_persisted_path,
@@ -103,6 +104,276 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return budget_for_context_window(int(ctx) if ctx else None)
     except Exception:
         return DEFAULT_BUDGET
+
+def _handle_function_call_with_env_usage(
+    effective_task_id: str,
+    function_name: str,
+    function_args: dict,
+    **kwargs,
+):
+    from tools.terminal_tool import (
+        environment_turn_usage,
+        execution_environment_turn_key,
+    )
+
+    with environment_turn_usage(
+        effective_task_id,
+        environment_key=execution_environment_turn_key(
+            function_name, function_args, task_id=effective_task_id,
+        ),
+    ):
+        return _ra().handle_function_call(
+            function_name, function_args, effective_task_id, **kwargs,
+        )
+
+
+_TARGET_RESULT_TOOLS = {
+    "terminal", "read_file", "write_file", "patch", "search_files",
+    "execute_code", "process",
+}
+
+
+def _resolved_tool_target(tool_name: str, args: dict, result: Any = None) -> str | None:
+    """Resolve the target identity carried by a tool call/result."""
+    if tool_name in _TARGET_RESULT_TOOLS and isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("target"), str):
+            return payload["target"]
+    if tool_name == "search_files":
+        value = args.get("execution_target")
+    elif tool_name in _TARGET_RESULT_TOOLS:
+        value = args.get("target")
+    else:
+        value = None
+    return value if isinstance(value, str) and value else None
+
+
+def _result_runtime_scope(result: Any) -> str | None:
+    if not isinstance(result, str) or not result.lstrip().startswith("{"):
+        return None
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    scope = payload.get("runtime_scope") if isinstance(payload, dict) else None
+    return scope if isinstance(scope, str) and scope else None
+
+
+def _active_env_for_tool_result(
+    task_id: str, tool_name: str, args: dict, result: Any = None,
+):
+    if tool_name == "process":
+        session_id = args.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            try:
+                from tools.process_registry import process_registry
+
+                session = process_registry.get(session_id)
+                if session is not None and session.env_ref is not None:
+                    return session.env_ref
+            except Exception:
+                pass
+    if tool_name in _TARGET_RESULT_TOOLS and isinstance(result, str):
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            runtime_scope = payload.get("runtime_scope")
+            result_target = payload.get("target")
+            if (
+                isinstance(runtime_scope, str) and runtime_scope
+                and isinstance(result_target, str) and result_target
+            ):
+                try:
+                    from tools.terminal_tool import (
+                        get_environment_for_target_scope,
+                    )
+
+                    return get_environment_for_target_scope(
+                        task_id, result_target, runtime_scope,
+                    )
+                except Exception:
+                    return None
+    target = _resolved_tool_target(tool_name, args, result)
+    try:
+        return get_active_env(task_id, target=target)
+    except Exception:
+        # Persistence is best-effort. Preserve the handler's actionable
+        # configuration error instead of raising a second lookup failure.
+        return None
+
+
+def _append_persisted_target_hint(
+    content: str, target: str | None, runtime_scope: str | None = None,
+) -> str:
+    if (
+        target
+        and PERSISTED_OUTPUT_TAG in content
+        and "Execution target for this saved output:" not in content
+    ):
+        selector = f"target={json.dumps(target, ensure_ascii=True)}"
+        if runtime_scope:
+            selector += (
+                ", runtime_scope="
+                + json.dumps(runtime_scope, ensure_ascii=True)
+            )
+        return (
+            content
+            + "\nExecution target for this saved output: "
+            + json.dumps(target, ensure_ascii=True)
+            + f". Pass {selector} to `read_file`."
+        )
+    return content
+
+
+def _tool_target_map(agent) -> dict[str, Any]:
+    mapping = getattr(agent, "_execution_target_by_tool_call", None)
+    if not isinstance(mapping, dict):
+        mapping = {}
+        setattr(agent, "_execution_target_by_tool_call", mapping)
+    return mapping
+
+
+def _selected_local_target_cwd(
+    effective_task_id: str,
+    function_name: str,
+    function_args: dict,
+) -> str | None:
+    """Return the selected target's host cwd, or None for remote targets."""
+    selector_name = (
+        "execution_target" if function_name == "search_files" else "target"
+    )
+    target = function_args.get(selector_name)
+    try:
+        from tools.execution_targets import resolve_execution_target
+        from tools.terminal_tool import _get_env_config, get_session_cwd
+
+        resolution = resolve_execution_target(target)
+        if resolution.backend != "local":
+            return None
+        selected = resolution.target if resolution.named else None
+        cwd = get_session_cwd(effective_task_id, target=selected)
+        if not cwd:
+            config = (
+                _get_env_config(dict(resolution.config))
+                if resolution.named
+                else _get_env_config()
+            )
+            cwd = config.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            return None
+        return os.path.abspath(os.path.expanduser(cwd))
+    except Exception:
+        return None
+
+
+def _target_subdirectory_hints(
+    agent,
+    task_id: str,
+    tool_name: str,
+    args: dict,
+    target: str | None,
+):
+    """Load local hints from the selected target; never scan host paths for remotes."""
+    try:
+        from agent.subdirectory_hints import SubdirectoryHintTracker
+        from tools.execution_targets import resolve_execution_target
+        from tools.terminal_tool import _get_env_config, get_session_cwd
+
+        resolution = resolve_execution_target(target)
+        if resolution.backend != "local":
+            return None
+        if not resolution.named:
+            return agent._subdirectory_hints.check_tool_call(tool_name, args)
+        selected_target = resolution.target
+        cwd = get_session_cwd(task_id, target=selected_target)
+        if not cwd:
+            cwd = _get_env_config(dict(resolution.config)).get("cwd")
+        if not isinstance(cwd, str) or not cwd.strip():
+            return None
+        cache_key = (resolution.profile_scope, selected_target, cwd)
+        trackers = getattr(agent, "_target_subdirectory_hints", None)
+        if not isinstance(trackers, dict):
+            trackers = {}
+            setattr(agent, "_target_subdirectory_hints", trackers)
+        tracker = trackers.get(cache_key)
+        if tracker is None:
+            tracker = SubdirectoryHintTracker(working_dir=cwd)
+            trackers[cache_key] = tracker
+        return tracker.check_tool_call(tool_name, args)
+    except Exception:
+        # Hints are optional context. Never replace a tool result with hint
+        # discovery/configuration failures.
+        return None
+
+
+def _enforce_target_aware_turn_budget(
+    tool_messages: list[dict], task_id: str, config: BudgetConfig,
+    target_by_tool_call: dict[str, Any] | None = None,
+) -> None:
+    """Persist each aggregate-spilled result in its producing target."""
+    if target_by_tool_call is None:
+        target_by_tool_call = {}
+
+    def _resolve_message_env(message: dict):
+        call_id = str(message.get("tool_call_id") or "")
+        if call_id not in target_by_tool_call:
+            return default_env
+        identity = target_by_tool_call.get(call_id)
+        if isinstance(identity, dict):
+            env = identity.get("env")
+            if env is not None:
+                return env
+            target = identity.get("target")
+            runtime_scope = identity.get("runtime_scope")
+            if isinstance(target, str) and isinstance(runtime_scope, str):
+                try:
+                    from tools.terminal_tool import get_environment_for_target_scope
+
+                    return get_environment_for_target_scope(
+                        task_id, target, runtime_scope,
+                    )
+                except Exception:
+                    return None
+        else:
+            target = identity
+        if not isinstance(target, str) or not target:
+            return None
+        try:
+            return get_active_env(task_id, target=target)
+        except Exception:
+            return None
+
+    try:
+        default_env = get_active_env(task_id)
+    except Exception:
+        default_env = None
+
+    enforce_turn_budget(
+        tool_messages,
+        env=default_env,
+        env_resolver=_resolve_message_env,
+        config=config,
+    )
+    for message in tool_messages:
+        tool_call_id = str(message.get("tool_call_id") or "")
+        identity = target_by_tool_call.get(tool_call_id)
+        target = identity.get("target") if isinstance(identity, dict) else identity
+        runtime_scope = (
+            identity.get("runtime_scope") if isinstance(identity, dict) else None
+        )
+        content = message.get("content", "")
+        if isinstance(content, str):
+            message["content"] = _append_persisted_target_hint(
+                content, target, runtime_scope,
+            )
+        if tool_call_id:
+            target_by_tool_call.pop(tool_call_id, None)
+
 
 _MAX_TOOL_WORKERS = 8  # concurrent worker threads per batch
 _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
@@ -674,8 +945,20 @@ def _dispatch_authorized_once(
     elif ref.name == "skill_manage":
         agent._iters_since_skill = 0
 
-    _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    from contextlib import nullcontext
+
+    target_config_scope = nullcontext()
+    if ref.name in _TARGET_RESULT_TOOLS:
+        from tools.execution_targets import frozen_execution_target_config
+
+        target_config_scope = frozen_execution_target_config()
+
+    # Checkpoint preflight and handler execution must observe exactly the
+    # same target generation. A live alias reload becomes visible only to
+    # the next tool dispatch, never between these two side effects.
+    with target_config_scope:
+        _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+        return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
 
 
 def _run_agent_tool_execution_middleware(

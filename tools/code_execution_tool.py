@@ -12,6 +12,8 @@ scrubbing, interpreter/cwd), tools/code_execution_rpc.py (RPC servers).
 """
 
 import base64
+from copy import deepcopy
+import functools
 import json
 import logging
 import os
@@ -29,7 +31,8 @@ from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
 
 from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
-from tools.code_execution_rpc import _rpc_poll_loop
+from tools.code_execution_rpc import (_rpc_poll_loop, _frozen_target_config,
+    _inherit_execution_target, _dispatch_rpc_tool)
 
 logger = logging.getLogger(__name__)
 
@@ -123,21 +126,21 @@ _TOOL_STUBS = {
     "web_extract": ("urls: list, char_limit: int = None",
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
         '{"urls": urls, "char_limit": char_limit}'),
-    "read_file": ("path: str, offset: int = 1, limit: int = 2000",
+    "read_file": ("path: str, offset: int = 1, limit: int = 2000, target: str = None, runtime_scope: str = None",
         '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
-        '{"path": path, "offset": offset, "limit": limit}'),
-    "write_file": ("path: str, content: str, cross_profile: bool = False",
+        '{"path": path, "offset": offset, "limit": limit, "target": target, "runtime_scope": runtime_scope}'),
+    "write_file": ("path: str, content: str, cross_profile: bool = False, target: str = None",
         '"""Write content to a file (always overwrites). Returns dict with status."""',
-        '{"path": path, "content": content, "cross_profile": cross_profile}'),
-    "search_files": ('pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, order: str = "discovery"',
+        '{"path": path, "content": content, "cross_profile": cross_profile, "target": target}'),
+    "search_files": ('pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, execution_target: str = None',
         '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
-        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "order": order}'),
-    "patch": ('path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False',
+        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "execution_target": execution_target}'),
+    "patch": ('path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False, target: str = None',
         '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status."""',
-        '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile}'),
-    "terminal": ("command: str, timeout: int = None, workdir: str = None",
+        '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile, "target": target}'),
+    "terminal": ("command: str, timeout: int = None, workdir: str = None, target: str = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}'),
+        '{"command": command, "timeout": timeout, "workdir": workdir, "target": target}'),
 }
 
 
@@ -394,55 +397,158 @@ def _call(tool_name, args):
 
 # ---- Remote execution support (file-based RPC via terminal backend) ----
 
-def _get_or_create_env(task_id: str):
+def _resolve_remote_operation_cwd(task_id: str, resolution: Any, config: dict) -> str:
+    """Resolve the selected target cwd without consulting mutable env state."""
+    from tools.terminal_tool import (
+        _apply_task_cwd_override,
+        get_session_cwd,
+        resolve_task_overrides,
+    )
+
+    raw_task_id = task_id or "default"
+    overrides = resolve_task_overrides(raw_task_id)
+    cwd_override = (
+        overrides.get("cwd")
+        if (
+            not resolution.named
+            or (resolution.is_default and resolution.backend != "ssh")
+        )
+        else None
+    )
+    cwd = (
+        cwd_override
+        or get_session_cwd(raw_task_id, _resolution=resolution)
+        or config["cwd"]
+    )
+    return _apply_task_cwd_override(config, cwd, cwd_override)
+
+
+def _get_or_create_env(
+    task_id: str,
+    target: Optional[str] = None,
+    expected_target_scope: Optional[str] = None,
+):
     """``(env, env_type)`` — the environment the terminal/file tools share for *task_id*, created on
     first use (same double-checked per-task lock pattern as file_tools._get_file_ops)."""
-    from tools.terminal_tool_backends import _container_config_from_config, _create_environment, _ssh_config_from_config
     from tools.terminal_tool import (
+        _create_environment,
         _active_environments, _env_lock, _get_env_config, _last_activity,
-        _start_cleanup_thread, _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id, _resolve_task_host_cwd, _is_container_backend, _select_image,
+        _start_cleanup_thread, _creation_locks, _creation_locks_lock,
+        _resolve_container_task_id, _resolve_task_host_cwd, _select_image,
+        resolve_task_overrides, _record_environment_lifetime,
+        _record_environment_target, _environment_matches_target,
+        _prepare_environment_replacement, _EnvironmentReplacementError,
+        _retire_replaced_environment,
+        _cleanup_environment_resource,
+        _environment_has_stable_storage,
+        _build_environment_constructor_configs,
     )
-    effective_task_id = _resolve_container_task_id(task_id)
+    from tools.execution_targets import (
+        execution_target_config_is_frozen,
+        resolve_execution_target,
+        resolve_live_execution_target,
+    )
+
+    raw_task_id = task_id or "default"
+    resolution = resolve_execution_target(target)
+    if (
+        expected_target_scope is not None
+        and resolution.security_scope != expected_target_scope
+    ):
+        raise ValueError(
+            f"Execution target {resolution.target!r} changed after approval."
+        )
+    base_task_id = _resolve_container_task_id(raw_task_id)
+    effective_task_id = resolution.environment_key(base_task_id)
+    backend_task_id = resolution.backend_task_id(base_task_id)
+    config = (
+        _get_env_config(dict(resolution.config))
+        if resolution.named else _get_env_config()
+    )
+
     def _cached():
         with _env_lock:
             env = _active_environments.get(effective_task_id)
-            if env is not None:
+            if env is not None and _environment_matches_target(env, resolution):
                 _last_activity[effective_task_id] = time.time()
-        return env
+                return env
+        return None
+
     env = _cached()
     if env is not None:
-        return env, _get_env_config()["env_type"]
+        return env, config["env_type"]
     with _creation_locks_lock:
         task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
     with task_lock:
         env = _cached()
         if env is not None:
-            return env, _get_env_config()["env_type"]
-        config = _get_env_config()
+            return env, config["env_type"]
+        try:
+            _prepare_environment_replacement(
+                _active_environments.get(effective_task_id),
+                effective_task_id,
+                target_name=resolution.target,
+            )
+        except _EnvironmentReplacementError as exc:
+            raise ValueError(str(exc)) from exc
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
-        container_config = None
-        if _is_container_backend(env_type):
-            # Shared shaper: execute_code's own key subset dropped docker_extra_args / docker_forward_env /
-            # docker_env, so a sandbox created from this path lost the operator's configured settings.
-            container_config = _container_config_from_config(config)
+        overrides = resolve_task_overrides(raw_task_id)
+
+        cwd = _resolve_remote_operation_cwd(raw_task_id, resolution, config)
+
+        container_config, ssh_config, local_config = (
+            _build_environment_constructor_configs(
+                config, resolution, base_task_id,
+            )
+        )
+
         logger.info("Creating new %s environment for execute_code task %s...",
-                     env_type, effective_task_id[:8])
+                     env_type, str(effective_task_id)[:48])
         env = _create_environment(
             env_type=env_type, image=_select_image(env_type, overrides, config),
-            cwd=overrides.get("cwd") or config["cwd"], timeout=config["timeout"],
-            ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
+            cwd=cwd, timeout=config["timeout"],
+            ssh_config=ssh_config,
             container_config=container_config,
-            local_config={"persistent": config.get("local_persistent", False)} if env_type == "local" else None,
-            task_id=effective_task_id, host_cwd=_resolve_task_host_cwd(config, task_id),
+            local_config=local_config,
+            task_id=backend_task_id, host_cwd=_resolve_task_host_cwd(config, raw_task_id),
         )
+        _record_environment_lifetime(env, config)
+        _record_environment_target(env, resolution)
+
+        publish_error = None
         with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
+            if resolution.named:
+                try:
+                    live_resolution = (
+                        resolution
+                        if execution_target_config_is_frozen()
+                        else resolve_live_execution_target(target)
+                    )
+                except Exception as exc:
+                    publish_error = str(exc)
+                else:
+                    if live_resolution.security_scope != resolution.security_scope:
+                        publish_error = (
+                            f"Execution target {resolution.target!r} changed "
+                            "while its environment was being created."
+                        )
+            if publish_error is None:
+                replaced_env = _active_environments.get(effective_task_id)
+                _active_environments[effective_task_id] = env
+                _last_activity[effective_task_id] = time.time()
+        if publish_error is not None:
+            _cleanup_environment_resource(
+                env,
+                force_remove=True,
+                preserve_storage=_environment_has_stable_storage(env),
+            )
+            raise ValueError(publish_error + " Retry execute_code.")
+        if replaced_env is not None and replaced_env is not env:
+            _retire_replaced_environment(replaced_env, effective_task_id)
+
         _start_cleanup_thread()
         logger.info("%s environment ready for execute_code task %s",
-                     env_type, effective_task_id[:8])
+                     env_type, str(effective_task_id)[:48])
         return env, env_type
 
 
@@ -553,7 +659,12 @@ def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
-                         exec_start: float) -> str:
+                         exec_start: float, resolution=None,
+                         inherited_target: Optional[str] = None,
+                         expected_target_scope: Optional[str] = None,
+                         rpc_target_config: Optional[dict] = None,
+                         operation_cwd: Optional[str] = None,
+                         mode: str = "strict") -> str:
     """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
     serve file-RPC from a polling thread, run, clean up."""
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
@@ -572,16 +683,29 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, [], tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                  inherited_target, expected_target_scope, rpc_target_config))
         rpc_thread.start()
         env_prefix = (f"HERMES_RPC_DIR={quoted_rpc_dir} HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
-                      "PYTHONDONTWRITEBYTECODE=1")
+                      "PYTHONDONTWRITEBYTECODE=1 "
+                      f"PYTHONPATH={shlex.quote(sandbox_dir)}:$PYTHONPATH")
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
-        script_result = env.execute(f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
-                                    timeout=timeout)
+        if mode == "project" and operation_cwd:
+            run_cwd = operation_cwd
+        else:
+            run_cwd = sandbox_dir
+        script_ref = (
+            shlex.quote(f"{sandbox_dir}/script.py")
+            if mode == "project"
+            else "script.py"
+        )
+        script_result = env.execute(
+            f"{env_prefix} python3 {script_ref}",
+            cwd=run_cwd,
+            timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
         # Backend exit codes: 124 = timeout wrapper, 130 = SIGINT.
@@ -598,6 +722,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
     result = _remote_result(status, stdout_text, exec_start,
                             {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]})
+    if resolution is not None:
+        result.update(resolution.metadata(cwd=operation_cwd))
     if status == "timeout":
         _apply_timeout(result, f"Script timed out after {timeout}s and was killed.")
         logger.warning("execute_code (remote) timed out after %ss (limit %ss) with %d tool calls",
@@ -611,20 +737,68 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
 
 
 def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
-                    reset: bool = False) -> str:
+                    target: Optional[str] = None, reset: bool = False,
+                    expected_target_scope: Optional[str] = None,
+                    expected_target_config: Optional[dict] = None,
+                    mode: str = "strict") -> str:
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
     a kernel cannot be spawned and the only route for hosts that cannot sustain a background process."""
     _cfg = _load_config()
     timeout, max_tool_calls = _cfg.get("timeout", DEFAULT_TIMEOUT), _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     sandbox_tools, effective_task_id = _sandbox_tools_for(enabled_tools), task_id or "default"
-    env, env_type = _get_or_create_env(effective_task_id)
+    from tools.execution_targets import resolve_execution_target
+
+    resolution = resolve_execution_target(target)
+    # Legacy omitted/default selection already routes every nested call to the
+    # one existing environment. Keep that path byte-for-byte compatible and
+    # only inject/pass the extra selector when named targets are configured.
+    inherited_target = resolution.target if resolution.named else None
+    rpc_target_config = expected_target_config
+    if rpc_target_config is None and resolution.named:
+        rpc_target_config = _frozen_target_config(resolution)
+    if (
+        expected_target_scope is not None
+        and resolution.security_scope != expected_target_scope
+    ):
+        return tool_error(
+            f"Execution target {resolution.target!r} changed after approval; "
+            "execute_code was not started."
+        )
+    from tools.terminal_tool import _get_env_config
+
+    operation_config = (
+        _get_env_config(dict(resolution.config))
+        if resolution.named else _get_env_config()
+    )
+    operation_cwd = _resolve_remote_operation_cwd(
+        effective_task_id,
+        resolution,
+        operation_config,
+    )
+    try:
+        env, env_type = _get_or_create_env(
+            effective_task_id,
+            inherited_target,
+            expected_target_scope,
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
     exec_start = time.monotonic()
     try:
         py_check = env.execute("command -v python3 >/dev/null 2>&1 && echo OK", cwd="/", timeout=15)
         if "OK" not in py_check.get("output", ""):
-            return _error_result(f"Python 3 is not available in the {env_type} terminal "
-                                 "environment. Install Python to use execute_code with remote backends.")
+            result = {
+                "status": "error",
+                "error": (
+                    f"Python 3 is not available in the {env_type} terminal "
+                    "environment. Install Python to use execute_code with remote backends."
+                ),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }
+            result.update(resolution.metadata(cwd=operation_cwd))
+            return json.dumps(result)
         # Session-kernel path: one persistent kernel per owner on the
         # run-to-completion transport. Spawn failure falls OPEN to the per-call
         # path below so a degraded remote host never blocks execution.
@@ -643,12 +817,28 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
             logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
             kernel_result = None
         if kernel_result is not None:
-            return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
+            result_json = _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
+            try:
+                payload = json.loads(result_json)
+                payload.update(resolution.metadata(cwd=operation_cwd))
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception:
+                return result_json
         logger.info("remote session kernel unavailable on %s; using per-call path", env_type)
     except Exception as exc:
-        return _remote_failure(exc, exec_start, 0)
+        failure = _remote_failure(exc, exec_start, 0)
+        try:
+            payload = json.loads(failure)
+            payload.update(resolution.metadata(cwd=operation_cwd))
+            return json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            return failure
     return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
-                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
+                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start,
+                                resolution=resolution, inherited_target=inherited_target,
+                                expected_target_scope=expected_target_scope,
+                                rpc_target_config=rpc_target_config,
+                                operation_cwd=operation_cwd, mode=mode)
 
 
 # ---- Main entry point ----
@@ -659,6 +849,7 @@ def execute_code(
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     reset: bool = False,
+    target: Optional[str] = None,
 ) -> str:
     """Run Python in the session's persistent kernel (local) or on the remote terminal backend,
     with RPC access to a subset of Hermes tools; returns the JSON result string. "Sandbox" means
@@ -697,15 +888,41 @@ def execute_code(
                 "it could complete (SIGTERM propagates to child processes). "
                 "Run the lifecycle command from a shell outside the gateway."
             )
+    from tools.execution_targets import resolve_execution_target
+
+    try:
+        resolution = resolve_execution_target(target)
+    except Exception as exc:
+        return tool_error(str(exc))
+    # Legacy omitted/default selection already routes every nested call to the
+    # one existing environment. Preserve that call shape and only propagate a
+    # selector when named targets are configured.
+    inherited_target = resolution.target if resolution.named else None
+    inherited_target_scope = resolution.security_scope if resolution.named else None
+    inherited_target_config = (
+        _frozen_target_config(resolution) if resolution.named else None
+    )
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
+    _env_config = (
+        _get_env_config(dict(resolution.config))
+        if resolution.named else _get_env_config()
+    )
     env_type = _env_config["env_type"]
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
     from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
+    _guard = check_execute_code_guard(
+        code, env_type,
+        has_host_access=_docker_has_host_access(_env_config),
+        execution_target=resolution.target,
+        execution_backend=resolution.backend,
+        execution_target_named=resolution.named,
+        execution_target_scope=(
+            resolution.security_scope if resolution.named else ""
+        ),
+    )
     if not _guard.get("approved", False):
         return _error_result(_guard.get("message") or "execute_code blocked by approval guard.")
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't
@@ -713,22 +930,61 @@ def execute_code(
     if _guard.get("user_approved"):
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
+    if inherited_target_scope is not None:
+        try:
+            live_resolution = resolve_execution_target(inherited_target)
+        except Exception as exc:
+            return tool_error(
+                f"Execution target {inherited_target!r} is no longer available: {exc}"
+            )
+        if live_resolution.security_scope != inherited_target_scope:
+            return tool_error(
+                f"Execution target {inherited_target!r} changed after approval; "
+                "execute_code was not started."
+            )
+
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset))
+        mode = _get_execution_mode()
+        if inherited_target is None:
+            return _execute_remote(
+                code, task_id, enabled_tools, reset=bool(reset), mode=mode)
+        return _execute_remote(
+            code, task_id, enabled_tools, inherited_target, reset=bool(reset),
+            expected_target_scope=inherited_target_scope,
+            expected_target_config=inherited_target_config,
+            mode=mode,
+        )
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
     from tools.code_kernel import execute_in_session_kernel
     _cfg = _load_config()
     _mode = _get_execution_mode()
-    return execute_in_session_kernel(
+    result = execute_in_session_kernel(
         code, task_id=task_id or "", mode=_mode, child_python=_resolve_child_python(_mode),
-        child_cwd=_resolve_child_cwd(_mode, "", task_id=task_id or ""),
+        child_cwd=_resolve_child_cwd(
+            _mode, "", task_id=task_id or "", target=inherited_target,
+            _resolution=resolution,
+        ),
         sandbox_tools=frozenset(_sandbox_tools_for(enabled_tools)),
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
+        execution_target=inherited_target,
+        execution_target_config=inherited_target_config,
+        execution_target_scope=(resolution.security_scope if resolution.named else None),
     )
+    try:
+        payload = json.loads(result)
+        payload.update(resolution.metadata(
+            cwd=_resolve_child_cwd(
+                _mode, "", task_id=task_id or "", target=inherited_target,
+                _resolution=resolution,
+            ),
+        ))
+        return json.dumps(payload, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return result
 
 
 def _kill_process_group(proc, escalate: bool = False):
@@ -795,14 +1051,14 @@ _TOOL_DOC_LINES = [
     ("web_extract", "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
      "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
-    ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
+    ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000, target: str = None, runtime_scope: str = None) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
-    ("write_file", "  write_file(path: str, content: str) -> dict\n    Always overwrites the entire file."),
-    ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, order=\"discovery\") -> dict\n"
-     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
-    ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
+    ("write_file", "  write_file(path: str, content: str, target: str = None) -> dict\n    Always overwrites the entire file."),
+    ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, execution_target: str = None) -> dict\n"
+     "    target selects search mode (\"content\" or \"files\"); execution_target selects the configured environment. Returns {\"matches\": [...]}"),
+    ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False, target: str = None) -> dict\n"
      "    Replaces old_string with new_string in the file."),
-    ("terminal", "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
+    ("terminal", "  terminal(command: str, timeout=None, workdir=None, target: str = None) -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
 ]
 
@@ -866,6 +1122,13 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                     "and print your final result to stdout.")},
                 "reset": {"type": "boolean", "description": (
                     "Discard the kernel's persistent state and start fresh before running this code.")},
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Optional named execution target, for example 'local' "
+                        "or 'devbox'. Uses terminal.default_target when omitted."
+                    ),
+                },
             },
             "required": ["code"],
         },
@@ -889,7 +1152,8 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         return tool_error(f"execute_code received a {type(code).__name__} in 'code', but it "
                           "requires Python source as a string. Retry as execute_code(code=\"...\").")
     return execute_code(code=code or "", task_id=kwargs.get("task_id"),
-                        enabled_tools=kwargs.get("enabled_tools"), reset=bool(args.get("reset", False)))
+                        enabled_tools=kwargs.get("enabled_tools"), reset=bool(args.get("reset", False)),
+                        target=args.get("target"))
 
 
 registry.register(

@@ -236,9 +236,14 @@ class CellAuthority:
     refused instead of running under a stale approval/session/turn identity.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, execution_target: str | None = None,
+                 execution_target_config: dict | None = None,
+                 execution_target_scope: str | None = None):
         import contextvars
         self.task_id = task_id
+        self.execution_target = execution_target
+        self.execution_target_config = execution_target_config
+        self.execution_target_scope = execution_target_scope
         self.ctx = contextvars.copy_context()
         self.active = True
         self._api = None  # (get_approval, get_sudo, set_approval, set_sudo)
@@ -260,7 +265,26 @@ class CellAuthority:
         if not self.active:
             return tool_error("No active execute_code cell: the cell this kernel call "
                               "belonged to has settled, so its tool authority is retired.")
-        return self.ctx.run(self._invoke, tool_name, tool_args)
+        def _run():
+            inherited_args = tool_args
+            if self.execution_target is not None:
+                try:
+                    from tools.code_execution_rpc import _inherit_execution_target
+
+                    inherited_args = _inherit_execution_target(
+                        tool_name, inherited_args, self.execution_target,
+                        getattr(self, "execution_target_scope", None),
+                    )
+                except ValueError as exc:
+                    from tools.registry import tool_error as _te
+                    return _te(str(exc))
+            if self.execution_target_config is not None:
+                from tools.execution_targets import execution_target_config_scope
+
+                with execution_target_config_scope(self.execution_target_config):
+                    return self._invoke(tool_name, inherited_args)
+            return self._invoke(tool_name, inherited_args)
+        return self.ctx.run(_run)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
@@ -745,12 +769,17 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    execution_target: str | None = None, execution_target_config: dict | None = None,
+    execution_target_scope: str | None = None,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
     session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
+    kernel.execution_target = execution_target
+    kernel.execution_target_config = execution_target_config
+    kernel.execution_target_scope = execution_target_scope
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
@@ -772,7 +801,12 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
-    authority = CellAuthority(task_id)
+    authority = CellAuthority(
+        task_id,
+        execution_target=getattr(kernel, "execution_target", None),
+        execution_target_config=getattr(kernel, "execution_target_config", None),
+        execution_target_scope=getattr(kernel, "execution_target_scope", None),
+    )
     with kernel.lock:
         try:
             if kernel.proc is None:

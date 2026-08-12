@@ -11,6 +11,7 @@ deny), ``_check_binary_document_write``, ``_check_protected_instruction_write``
 import fnmatch
 import os
 from pathlib import Path
+from typing import Any
 
 from tools.binary_extensions import has_opaque_document_extension, is_pdf_path
 from tools.file_tools_paths import _expand_tilde, _resolve_path_for_task
@@ -76,40 +77,74 @@ def _resolved_or_raw(filepath: str, task_id: str) -> str:
         return filepath
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
+def _check_sensitive_path(
+    filepath: str, task_id: str = "default", execution_target: str | None = None,
+    *, _resolution: Any = None,
+) -> str | None:
     """Return an error message if the path targets a sensitive system location."""
-    candidates = (_resolved_or_raw(filepath, task_id), os.path.normpath(_expand_tilde(filepath)))
-    if any(c.startswith(_SENSITIVE_PATH_PREFIXES) or c in _SENSITIVE_EXACT_PATHS for c in candidates):
-        return (
-            f"Refusing to write to sensitive system path: {filepath}\n"
-            "Use the terminal tool with sudo if you need to modify system files.")
-    # approvals.mode and other security settings live in config.yaml; a
-    # prompt-injected agent could silently disable exec approval by editing it.
+    try:
+        resolved = str(_resolve_path_for_task(
+            filepath, task_id, execution_target, _resolution=_resolution,
+        ))
+    except (OSError, ValueError):
+        resolved = filepath
+    normalized = os.path.normpath(_expand_tilde(filepath))
+    _err = (
+        f"Refusing to write to sensitive system path: {filepath}\n"
+        "Use the terminal tool with sudo if you need to modify system files."
+    )
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
+            return _err
+    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+        return _err
+    # Prevent agents from modifying the Hermes config file directly.
+    # approvals.mode and other security settings live here; a malicious or
+    # prompt-injected agent could silently disable exec approval by writing to
+    # this file.
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and hermes_config in candidates:
+    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
-    return None
+            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
+    try:
+        from agent.file_safety import get_write_denied_error
+
+        return get_write_denied_error(resolved, verb="Write")
+    except Exception:
+        return None
 
 
-# ── Protected agent-instruction files (always-ask approval gate) ─────────
+# ---------------------------------------------------------------------------
+# Protected agent-instruction files (always-ask approval gate)
+# ---------------------------------------------------------------------------
 # Files that steer FUTURE agent behavior are a prompt-injection persistence
-# vector (AGENTS.md / CLAUDE.md / SOUL.md / .cursorrules / project .hermes tree).
-# Writes ALWAYS require human approval — even under --yolo — and fail closed
-# without a human channel. Basenames match in ANY directory, case-insensitively.
-# Ported from: RooCodeInc/Roo-Code RooProtectedController (Apache-2.0). Companion: the terminal-tool vector
-# is covered separately (#58631); this gate covers the write_file/patch vector. Symlink lesson from #41351:
-# always realpath before matching. Scope decision (documented): basenames match in ANY directory, because
-# project-context instruction files are loaded from cwd trees — an AGENTS.md anywhere the agent might later
-# run from is a live target. Basenames match case-insensitively so case-variant spellings on
-# case-insensitive filesystems (macOS/Windows) cannot slip past; on case-sensitive filesystems most loaders
-# probe common case variants too, so the stricter behavior is kept uniform.
+# vector: an injected instruction that edits AGENTS.md / CLAUDE.md / SOUL.md /
+# .cursorrules (or a project-local .hermes config tree) outlives the current
+# turn and poisons every later session that loads it. Writes to these files
+# therefore ALWAYS require human approval — even under --yolo / auto-approve —
+# and fail closed when no human channel exists.
+#
+# Ported from: RooCodeInc/Roo-Code RooProtectedController (Apache-2.0).
+# Companion: the terminal-tool vector is covered separately (#58631); this
+# gate covers the write_file/patch vector. Symlink lesson from #41351:
+# always realpath before matching.
+#
+# Scope decision (documented): basenames match in ANY directory, because
+# project-context instruction files are loaded from cwd trees — an
+# AGENTS.md anywhere the agent might later run from is a live target.
+# Basenames match case-insensitively so case-variant spellings on
+# case-insensitive filesystems (macOS/Windows) cannot slip past; on
+# case-sensitive filesystems most loaders probe common case variants too,
+# so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
-    "agents.md", "claude.md", "soul.md", ".cursorrules"})
+    "agents.md", "claude.md", "soul.md", ".cursorrules",
+})
 
-
+_real_hermes_home_cached: str | None = None
+_real_hermes_home_loaded = False
 def _protected_instruction_config() -> tuple[bool, list[str]]:
     """Return ``(enabled, extra_patterns)`` from ``security.protected_instruction_files`` /
     ``security.protected_instruction_extra_patterns`` (fnmatch on basename). Config read
@@ -304,41 +339,100 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
     return result.get("message") or blocked.format(why="was denied.")
 
 
-def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
-    """Return the container-side Hermes mirror prefix for persistent Docker file tools."""
+def _get_container_mirror_prefix_for_task(
+    task_id: str = "default", execution_target: str | None = None,
+    *, _resolution: Any = None,
+) -> str | None:
+    """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
         from tools.terminal_tool import (
-            _active_environments, _env_lock, _get_env_config, _resolve_container_task_id)
-        container_key = _resolve_container_task_id(task_id)
-        with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
-        if env is not None:
-            persistent_docker = (env.__class__.__name__ == "DockerEnvironment"
-                                 and bool(getattr(env, "_persistent", False)))
-            return "/root/.hermes" if persistent_docker else None
-        config = _get_env_config()
+            _active_environments,
+            _env_lock,
+            _get_env_config,
+            _resolve_container_task_id,
+        )
+        from tools.execution_targets import resolve_execution_target
+
+        resolution = _resolution or resolve_execution_target(execution_target)
+        container_key = resolution.environment_key(_resolve_container_task_id(task_id))
+        raw_key = resolution.environment_key(task_id)
     except Exception:
         return None
+
+    try:
+        with _env_lock:
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
+
+        if env is not None:
+            if env.__class__.__name__ == "DockerEnvironment" and bool(
+                getattr(env, "_persistent", False)
+            ):
+                return "/root/.hermes"
+            return None
+
+        config = (
+            _get_env_config(dict(resolution.config))
+            if resolution.named else _get_env_config()
+        )
+    except Exception:
+        return None
+
     if config.get("env_type") == "docker" and config.get("container_persistent", True):
         return "/root/.hermes"
     return None
+def _check_cross_profile_path(
+    filepath: str, task_id: str = "default", execution_target: str | None = None,
+    *, _resolution: Any = None,
+) -> str | None:
+    """Return a soft-guard warning when ``filepath`` lands on a host-side
+    sandbox-mirror of authoritative profile state, or the Docker
+    container's sandbox mirror of Hermes state.
 
+    Two detectors (both #32049): these catch writes that would be
+    SILENTLY LOST — the host Hermes process never reads the mirror, so
+    the write succeeds but changes nothing. That is a lost-work guard,
+    not profile isolation.
 
-def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | None:
-    """Soft-guard: warn when ``filepath`` lands on a host-side or Docker sandbox MIRROR of
-    Hermes state (a write the host never reads). Not profile isolation — that guard was
-    removed; ``cross_profile=True`` keeps bypassing this one for replay compat. Fails open."""
+    NOTE: the third detector this shared check used to run — the
+    cross-PROFILE write guard (another profile's skills/plugins/cron/
+    memories) — was removed by maintainer decision: profiles were never
+    isolated (same OS user; terminal writes anywhere), so the guard was
+    ceremony. The system prompt's profile hint remains the only
+    steering. ``cross_profile=True`` still bypasses the mirror guards
+    (name kept for replay/transcript compat).
+
+    Returns ``None`` when the write is in-scope or outside Hermes scope.
+    """
     try:
-        from agent.file_safety import get_container_mirror_warning, get_sandbox_mirror_warning
+        from agent.file_safety import (
+            get_container_mirror_warning,
+            get_sandbox_mirror_warning,
+        )
     except Exception:
+        # Fail open on import error — the existing sensitive-path guard
+        # plus the write_denied list still apply.
         return None
-    resolved = _resolved_or_raw(filepath, task_id)
+
+    # Resolve via the task's cwd so a relative path in a session that
+    # cd'd elsewhere is classified against the right base.
+    try:
+        resolved = str(_resolve_path_for_task(
+            filepath, task_id, execution_target, _resolution=_resolution,
+        ))
+    except (OSError, ValueError):
+        resolved = filepath
+
     warning = get_sandbox_mirror_warning(resolved)
     if warning is not None:
         return warning
-    return get_container_mirror_warning(resolved, mirror_prefix=_get_container_mirror_prefix_for_task(task_id))
 
-
+    mirror_prefix = _get_container_mirror_prefix_for_task(
+        task_id, execution_target, _resolution=_resolution,
+    )
+    return get_container_mirror_warning(
+        resolved,
+        mirror_prefix=mirror_prefix,
+    )
 def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
     """Reject text-tool writes that would corrupt a binary document (read_file showed
     EXTRACTED text, so the model may write it back). Opaque formats are always rejected;

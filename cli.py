@@ -321,6 +321,23 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
     """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions). Env always wins when already set."""
     terminal_config = defaults.get("terminal", {})
 
+    # Named execution targets: pin the resolver's config source and flatten the
+    # default target's settings into the legacy TERMINAL_* view. Skipped inside
+    # the gateway, whose config bridge owns the env layer.
+    named_terminal_mode = (
+        isinstance(terminal_config, dict)
+        and isinstance(terminal_config.get("targets"), dict)
+        and bool(terminal_config.get("targets"))
+    )
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        from tools.execution_targets import set_execution_target_config_source
+
+        set_execution_target_config_source(defaults)
+
+    from hermes_cli.config import effective_terminal_config
+    terminal_config = effective_terminal_config(terminal_config)
+    defaults["terminal"] = terminal_config
+
     # "backend" (documented) and legacy "env_type" are both accepted; "backend" wins.
     if "backend" in terminal_config:
         terminal_config["env_type"] = terminal_config["backend"]
@@ -328,9 +345,13 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
     # Local backend: cwd is always os.getcwd(). Non-local: a placeholder is popped so
     # terminal_tool uses its per-backend default; an explicit path is kept.
     effective_backend = terminal_config.get("env_type", "local")
-    if effective_backend == "local":
+    if effective_backend == "local" and (
+        not named_terminal_mode
+        or terminal_config.get("cwd") in _CWD_PLACEHOLDERS
+    ):
         terminal_config["cwd"] = os.getcwd()
-        defaults["terminal"]["cwd"] = terminal_config["cwd"]
+        if not named_terminal_mode:
+            defaults["terminal"]["cwd"] = terminal_config["cwd"]
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
 

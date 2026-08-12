@@ -349,6 +349,13 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+    # Trailing fields preserve the positional constructor contract for every
+    # pre-existing ProcessSession field.
+    target: str = ""                           # Named execution target (empty in legacy mode)
+    backend: str = ""                          # Resolved terminal backend
+    timeout_seconds: int = 0                   # Selected target's wait ceiling
+    environment_task_key: str = ""            # Profile-scoped env ownership key
+    runtime_scope: str = ""                   # Producing target generation/scope
 
     def append_output(self, text: str) -> None:
         """Append to the rolling output buffer under the session lock, keeping the tail."""
@@ -376,7 +383,8 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "watch_patterns")
+    "parent_session_id", "notify_on_complete", "watch_patterns",
+    "target", "backend", "timeout_seconds", "environment_task_key", "runtime_scope")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -428,6 +436,22 @@ class ProcessRegistry:
         # a read-only terminal tab without killing the process.
         self.on_output = None
         self.on_close = None
+
+    @staticmethod
+    def _with_execution_metadata(result: dict, session: ProcessSession) -> dict:
+        """Add stable target/backend identity to a process result."""
+        if session.target:
+            result["target"] = session.target
+        if session.backend:
+            result["backend"] = session.backend
+        runtime_scope = session.runtime_scope or getattr(
+            session.env_ref, "_hermes_target_scope", None
+        )
+        if isinstance(runtime_scope, str) and runtime_scope:
+            result["runtime_scope"] = runtime_scope
+        if session.cwd and "cwd" not in result:
+            result["cwd"] = session.cwd
+        return result
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -816,7 +840,10 @@ class ProcessRegistry:
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "") -> ProcessSession:
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        target: str = "", backend: str = "", timeout_seconds: int = 0,
+        environment_task_key: str = "", runtime_scope: str = "", env_ref: Any = None,
+    ) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing."""
@@ -827,7 +854,10 @@ class ProcessRegistry:
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
+            target=target, backend=backend or "local", timeout_seconds=timeout_seconds,
+            environment_task_key=environment_task_key, runtime_scope=runtime_scope, env_ref=env_ref)
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -911,12 +941,18 @@ class ProcessRegistry:
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", target: str = "", backend: str = "",
+        timeout_seconds: int = 0, environment_task_key: str = "", runtime_scope: str = "",
+    ) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        session = self._new_session(
+            command, task_id, owner_task_id, session_key, cwd,
+            target=target, backend=backend, timeout_seconds=timeout_seconds,
+            environment_task_key=environment_task_key, runtime_scope=runtime_scope,
+            env_ref=env, pid_scope="sandbox")
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -926,7 +962,12 @@ class ProcessRegistry:
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
         try:
-            result = env.execute(bg_command, timeout=timeout, rewrite_compound_background=False)
+            result = env.execute(
+                bg_command,
+                cwd=cwd,
+                timeout=timeout,
+                rewrite_compound_background=False,
+            )
             output = result.get("output", "").strip()
             session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
             # No PID from the wrapper (syntax error, broken redirect): a failed launch,
@@ -1188,6 +1229,9 @@ class ProcessRegistry:
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
+                **({"target": session.target} if session.target else {}),
+                **({"backend": session.backend} if session.backend else {}),
+                **({"cwd": session.cwd} if session.cwd else {}),
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
@@ -1486,6 +1530,7 @@ class ProcessRegistry:
         result = {
             **self._status_head(session), "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at), "output_preview": output_preview}
+        self._with_execution_metadata(result, session)
         if session.exited:
             result.update(self._exit_fields(session))
             # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
@@ -1523,6 +1568,7 @@ class ProcessRegistry:
         result = {
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
+        self._with_execution_metadata(result, session)
         if session.exited and observed_completion_output:
             self._completion_consumed.add(session_id)
         return result
@@ -1533,8 +1579,17 @@ class ProcessRegistry:
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import is_interrupted as _is_interrupted
 
+        session = self.get(session_id)
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
         try:
-            max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            # A target-selected session waits on ITS ceiling, not the global default.
+            max_timeout = (
+                int(session.timeout_seconds)
+                if int(session.timeout_seconds) > 0
+                else int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            )
         except (ValueError, TypeError):
             max_timeout = 180
         # The schema says minimum=1 but not every caller enforces it; timeout=0 is
@@ -1559,10 +1614,12 @@ class ProcessRegistry:
             if session.exited:
                 self._completion_consumed.add(session_id)
                 result = self._exit_snapshot(session, "exited")
+                self._with_execution_metadata(result, session)
             elif _is_interrupted():
                 result = {
                     "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
                     "note": "User sent a new message -- wait interrupted"}
+                self._with_execution_metadata(result, session)
             if result is not None:
                 if timeout_note:
                     result["timeout_note"] = timeout_note
@@ -1575,6 +1632,7 @@ class ProcessRegistry:
             "status": "timeout", "command": session.command, "output": _output_tail(session, 1000),
             # Not a failure — models re-issued identical waits after misreading this as an error.
             "process_running": True}
+        self._with_execution_metadata(result, session)
         base_note = (
             f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
         if session.started_at:
@@ -1800,7 +1858,11 @@ class ProcessRegistry:
                 "uptime_seconds": int(time.time() - s.started_at),
                 "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
+                **({"target": s.target} if s.target else {}),
+                **({"backend": s.backend} if s.backend else {}),
+                **({"runtime_scope": s.runtime_scope} if s.runtime_scope else {}),
             }
+            ProcessRegistry._with_execution_metadata(entry, s)
             # Flag processes surfaced only because they share the gateway session (not the current task) —
             # these are the long-lived background processes a user may have forgotten about (#29177).
             if task_id and session_key and s.task_id != task_id and s.session_key == session_key:
@@ -1829,9 +1891,21 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited and predicate(s) for s in self._running.values())
 
-    def has_active_processes(self, task_id: str) -> bool:
-        """Whether any process for ``task_id`` is still running."""
-        return self._any_running(lambda s: s.task_id == task_id)
+    def has_active_processes(self, task_id: Any) -> bool:
+        """Whether any process for ``task_id`` is still running. Accepts a plain task id
+        or a ``(environment_task_key, target)`` tuple for named-target scoping."""
+        if isinstance(task_id, tuple) and len(task_id) == 2:
+            base_task_id, target = task_id
+            return self._any_running(lambda s: (
+                (s.environment_task_key or s.task_id) == base_task_id
+                and s.target == target
+            ))
+        return self._any_running(
+            lambda s: (s.environment_task_key or s.task_id) == task_id)
+
+    def has_active_environment(self, env: Any) -> bool:
+        """Return whether a running session still references *env* by identity."""
+        return self._any_running(lambda s: s.env_ref is env)
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
         """Active processes for a gateway session key. Processes older than
@@ -2098,6 +2172,10 @@ def _handle_process(args, **kw):
             return tool_error(f"session_id is required for {action}")
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
+        if not redact and isinstance(result, dict):
+            session = process_registry.get(session_id)
+            if session is not None:
+                process_registry._with_execution_metadata(result, session)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
 

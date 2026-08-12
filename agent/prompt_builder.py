@@ -5,6 +5,7 @@ with memory and ephemeral prompts.
 """
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -778,19 +779,7 @@ WSL_ENVIRONMENT_HINT = (
 # would mislead, so the agent only sees the machine it can touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox", "managed_modal"})
 
-# Used when the live probe fails: only what the backend choice implies — never an invented cwd/user/$HOME.
-_BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
-    "docker": "a Docker container (Linux)",
-    "singularity": "a Singularity container (Linux)",
-    "modal": "a Modal sandbox (Linux)",
-    "managed_modal": "a managed Modal sandbox (Linux)",
-    "daytona": "a Daytona workspace (Linux)",
-    "vercel_sandbox": "a Vercel sandbox (Linux)",
-    "ssh": "a remote host reached over SSH (likely Linux)",
-}
 
-# Per-process probe cache keyed by (env_type, cwd_hint) so a mid-process backend switch rebuilds.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
 
 
 def _plugin_backend_attr(backend: str, attr: str, default=None):
@@ -896,34 +885,186 @@ def _run_backend_probe(env_type: str, terminal_tool) -> str:
     return (result.get("output") or "").strip()
 
 
-def _format_backend_probe(output: str) -> str:
-    """Render the probe's key=value lines as an indented summary ("" if nothing usable)."""
-    parsed = {k.strip(): v.strip() for k, _, v in (line.partition("=") for line in output.splitlines() if "=" in line)}
-    known = lambda key: parsed.get(key) if parsed.get(key) != "unknown" else None  # noqa: E731
-    fields = (
-        ("OS", " ".join(x for x in (known("os"), known("kernel")) if x)),
-        ("User", known("user")), ("Home", parsed.get("home")), ("Working directory", parsed.get("cwd")),
-    )
-    return "\n".join(f"  {label}: {value}" for label, value in fields if value)
+def _plugin_backend_description(backend: str) -> str | None:
+    """Prompt fallback description declared by a plugin backend, if any."""
+    try:
+        from agent.terminal_env_registry import get_provider
+
+        provider = get_provider(backend)
+        if provider is not None:
+            return provider.env_description
+    except Exception:
+        pass
+    return None
 
 
-def _probe_remote_backend(env_type: str) -> str | None:
-    """Describe the active non-local backend via a live probe; None if it failed (cached, failures included)."""
-    cache_key = (env_type, _tenv_read("TERMINAL_CWD", ""))
-    formatted = _BACKEND_PROBE_CACHE.get(cache_key)
-    if formatted is None:
-        formatted = ""
-        try:
-            import tools.terminal_tool as terminal_tool  # heavy; only needed for non-local backends
-        except Exception as e:
-            logger.debug("Backend probe unavailable (import failed): %s", e)
+_BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
+    "docker": "a Docker container (Linux)",
+    "singularity": "a Singularity container (Linux)",
+    "modal": "a Modal sandbox (Linux)",
+    "managed_modal": "a managed Modal sandbox (Linux)",
+    "daytona": "a Daytona workspace (Linux)",
+    "vercel_sandbox": "a Vercel sandbox (Linux)",
+    "ssh": "a remote host reached over SSH (likely Linux)",
+}
+
+
+# Cache the backend probe result per process so we only pay the probe cost
+# on the first prompt build of a session. Keyed by (env_type, cwd_hint) so
+# a mid-process backend switch rebuilds the string. Kept in-module (not on
+# disk) because the probe captures live backend state that may change
+# across Hermes restarts.
+_BACKEND_PROBE_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+
+def _probe_remote_backend(
+    env_type: str,
+    terminal_config: dict | None = None,
+    target_name: str = "",
+) -> str | None:
+    """Run a tiny introspection command inside the active terminal backend.
+
+    Returns a pre-formatted multi-line string describing the backend's OS,
+    $HOME, cwd, and user — or None if the probe failed. Result is cached
+    per process. Used only for non-local backends where the agent's tools
+    operate on a different machine than the host Hermes runs on.
+    """
+    if terminal_config is None:
+        config_identity = _tenv_read("TERMINAL_CWD", "")
+    else:
+        serialized = json.dumps(
+            terminal_config, sort_keys=True, default=str, ensure_ascii=True,
+        )
+        config_identity = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    cache_key = (env_type, target_name, config_identity)
+    cached = _BACKEND_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached or None
+
+    try:
+        # Import locally: tools/ imports are heavy and only relevant when a
+        # non-local backend is actually configured. The env factory lives in
+        # tools.terminal_tool_backends (probe tests patch it there).
+        from tools.terminal_tool import _get_env_config, _is_container_backend  # type: ignore
+        from tools.terminal_tool_backends import (  # type: ignore
+            _container_config_from_config,
+            _create_environment,
+            _ssh_config_from_config,
+        )
+    except Exception as e:
+        logger.debug("Backend probe unavailable (import failed): %s", e)
+        _BACKEND_PROBE_CACHE[cache_key] = ""
+        return None
+
+    env = None
+    try:
+        config = (
+            _get_env_config(dict(terminal_config))
+            if terminal_config is not None
+            else _get_env_config()
+        )
+        # Build the environment the same way tools/terminal_tool.py does for a
+        # live command: select the backend image, then assemble ssh/container
+        # config from the env-derived dict. (There is no `get_environment`
+        # factory — the real entry point is `_create_environment`.)
+        if env_type == "docker":
+            image = config.get("docker_image", "")
+        elif env_type == "singularity":
+            image = config.get("singularity_image", "")
+        elif env_type == "modal":
+            image = config.get("modal_image", "")
+        elif env_type == "daytona":
+            image = config.get("daytona_image", "")
         else:
+            image = ""
+
+        ssh_config = _ssh_config_from_config(config) if env_type == "ssh" else None
+
+        container_config = (
+            _container_config_from_config(config)
+            if _is_container_backend(env_type) else None
+        )
+
+        env = _create_environment(
+            env_type=env_type,
+            image=image,
+            cwd=config.get("cwd", ""),
+            timeout=config.get("timeout", 180),
+            ssh_config=ssh_config,
+            container_config=container_config,
+            task_id=(
+                "prompt-backend-probe-"
+                + hashlib.sha256(
+                    f"{env_type}:{target_name}:{config_identity}".encode("utf-8")
+                ).hexdigest()[:12]
+            ),
+            host_cwd=config.get("host_cwd"),
+            # Only ssh honors this: isolated ControlMaster socket, no remote dir
+            # setup / file sync / snapshot — and its cleanup() is then safe.
+            probe_only=True,
+        )
+        # Single-line POSIX probe — works on any Unixy backend. Wrapped in
+        # `2>/dev/null` so a missing binary doesn't pollute the output.
+        probe_cmd = (
+            "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
+            "\"$(uname -s 2>/dev/null || echo unknown)\" "
+            "\"$(uname -r 2>/dev/null || echo unknown)\" "
+            "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
+        )
+        result = env.execute(probe_cmd, timeout=4)
+        if result.get("returncode") != 0:
+            logger.debug("Backend probe returned non-zero: %r", result)
+            _BACKEND_PROBE_CACHE[cache_key] = ""
+            return None
+        output = (result.get("output") or "").strip()
+        if not output:
+            _BACKEND_PROBE_CACHE[cache_key] = ""
+            return None
+    except Exception as e:
+        logger.debug("Backend probe failed: %s", e)
+        _BACKEND_PROBE_CACHE[cache_key] = ""
+        return None
+    finally:
+        # The probe only needs a one-shot `uname`; without teardown the
+        # backend leaves a second idle sandbox (task_id="prompt-backend-probe")
+        # running for the whole process lifetime next to the agent's own one.
+        # probe_only instances (own ControlMaster socket, no remote dir setup /
+        # file sync / snapshot) make teardown safe for ssh too, so every
+        # backend is cleaned up here.
+        if env is not None:
             try:
-                formatted = _format_backend_probe(_run_backend_probe(env_type, terminal_tool))
-            except Exception as e:
-                logger.debug("Backend probe failed: %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = formatted
-    return formatted or None
+                from tools.terminal_tool_lifecycle import _cleanup_env
+
+                _cleanup_env(env, force_remove=True)
+            except Exception:
+                logger.debug("Backend probe cleanup failed", exc_info=True)
+
+    # Parse key=value lines back into a tidy summary.
+    parsed: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.strip()
+
+    pieces = []
+    os_bits = " ".join(x for x in (parsed.get("os"), parsed.get("kernel")) if x and x != "unknown")
+    if os_bits:
+        pieces.append(f"OS: {os_bits}")
+    if parsed.get("user") and parsed["user"] != "unknown":
+        pieces.append(f"User: {parsed['user']}")
+    if parsed.get("home"):
+        pieces.append(f"Home: {parsed['home']}")
+    if parsed.get("cwd"):
+        pieces.append(f"Working directory: {parsed['cwd']}")
+
+    if not pieces:
+        _BACKEND_PROBE_CACHE[cache_key] = ""
+        return None
+
+    formatted = "\n".join(f"  {p}" for p in pieces)
+    _BACKEND_PROBE_CACHE[cache_key] = formatted
+    return formatted
 
 
 def _clear_backend_probe_cache() -> None:
@@ -956,26 +1097,7 @@ def _local_host_hints() -> list[str]:
     return ["\n".join(host_lines), _WINDOWS_BASH_SHELL_HINT]
 
 
-def _remote_backend_hint(backend: str) -> str:
-    """Backend-only block for remote/sandbox backends (host info deliberately suppressed)."""
-    lead = (f"Terminal backend: {backend}. Your `terminal`, `read_file`, `write_file`, `patch`, and "
-            f"`search_files` tools all operate inside ")
-    probe = _probe_remote_backend(backend)
-    if probe:
-        return lead + (
-            f"this {backend} environment — NOT on the machine where Hermes itself is running. The host OS, "
-            f"home, and cwd of the Hermes process are irrelevant; only the following backend state matters:\n{probe}"
-        )
-    description = (
-        _BACKEND_FALLBACK_DESCRIPTIONS.get(backend)
-        or _plugin_backend_attr(backend, "env_description")
-        or f"a {backend} environment (likely Linux)"
-    )
-    return lead + (
-        f"{description} — NOT on the machine where Hermes itself runs. The backend probe didn't respond at "
-        f"prompt-build time, so the sandbox's current user, $HOME, and working directory are unknown from here. "
-        f"If you need them, probe directly with a terminal call like `uname -a && whoami && pwd`."
-    )
+
 
 
 def _config_readonly(what: str) -> dict:
@@ -988,22 +1110,167 @@ def _config_readonly(what: str) -> dict:
         return {}
 
 
-def _embedder_environment_hint() -> str:
-    """Embedder-supplied environment description: HERMES_ENVIRONMENT_HINT (container ENV)
-    wins over config.yaml ``agent.environment_hint``. Read once at prompt-build time."""
-    return (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip() or str(
-        (_config_readonly("agent.environment_hint").get("agent", {}) or {}).get("environment_hint", "")).strip()
-
-
 def build_environment_hints() -> str:
     """Execution-environment block: local backends get host OS/home/cwd; remote/sandbox
     backends get ONLY the backend's own state (the agent's tools cannot touch the host).
-    WSL and embedder hints are appended."""
-    backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
+    WSL and embedder hints are appended. With named execution targets configured, the
+    default target's backend/config drives the block and a target inventory is appended."""
+    import platform
+    import sys
+
+    hints: list[str] = []
+
+    target_inventory = ()
+    default_target = None
+    try:
+        from tools.execution_targets import list_execution_targets
+
+        resolved_targets = list_execution_targets()
+        if resolved_targets and resolved_targets[0].named:
+            target_inventory = resolved_targets
+            default_target = next(
+                (item for item in target_inventory if item.is_default),
+                target_inventory[0],
+            )
+    except Exception as e:
+        logger.debug("Could not resolve named execution targets for prompt: %s", e)
+
+    backend = (
+        default_target.backend
+        if default_target is not None
+        else (_tenv_read("TERMINAL_ENV", "local") or "local")
+    ).strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
-    hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
-    hints += [WSL_ENVIRONMENT_HINT] if is_wsl() else []
-    return "\n\n".join(h for h in (*hints, _embedder_environment_hint()) if h)
+
+    if not is_remote_backend:
+        # --- Host info block (local backend: host == where tools run) ---
+        host_lines: list[str] = []
+        if is_wsl():
+            host_lines.append("Host: WSL (Windows Subsystem for Linux)")
+        elif sys.platform == "win32":
+            host_lines.append(f"Host: Windows ({_windows_marketing_version()})")
+        elif sys.platform == "darwin":
+            mac_ver = platform.mac_ver()[0]
+            host_lines.append(f"Host: macOS ({mac_ver or platform.release()})")
+        else:
+            host_lines.append(f"Host: {platform.system()} ({platform.release()})")
+
+        host_lines.append(f"User home directory: {os.path.expanduser('~')}")
+        try:
+            if default_target is not None:
+                from tools.terminal_tool import _get_env_config
+
+                cwd_hint = _get_env_config(dict(default_target.config)).get("cwd")
+            else:
+                cwd_hint = resolve_agent_cwd()
+            if cwd_hint:
+                host_lines.append(f"Current working directory: {cwd_hint}")
+        except (OSError, TypeError, ValueError):
+            pass
+
+        if sys.platform == "win32" and not is_wsl():
+            host_lines.append(
+                "Note: on Windows, the machine hostname (e.g. from `hostname` "
+                "or uname) is NOT the username. Use the 'User home directory' "
+                "above to construct paths under C:\\Users\\<user>\\, never the "
+                "hostname."
+            )
+        hints.append("\n".join(host_lines))
+
+        # Windows-local terminal runs bash, not PowerShell — the model must
+        # know this or it will issue PowerShell syntax and fail.
+        if sys.platform == "win32" and not is_wsl():
+            hints.append(_WINDOWS_BASH_SHELL_HINT)
+    else:
+        # --- Remote backend block (host info suppressed) ---
+        probe = (
+            _probe_remote_backend(
+                backend,
+                terminal_config=dict(default_target.config),
+                target_name=(
+                    f"{default_target.profile_scope}:{default_target.target}"
+                    if default_target.profile_scope
+                    else default_target.target
+                ),
+            )
+            if default_target is not None
+            else _probe_remote_backend(backend)
+        )
+        tool_scope = (
+            "Calls to `terminal`, `read_file`, `write_file`, `patch`, "
+            "`search_files`, and `execute_code` that omit an execution-target "
+            "selector operate"
+            if default_target is not None
+            else (
+                "Your `terminal`, `read_file`, `write_file`, `patch`, "
+                "`search_files`, and `execute_code` tools all operate"
+            )
+        )
+        if probe:
+            hints.append(
+                f"Terminal backend: {backend}. {tool_scope} "
+                f"inside this {backend} environment — NOT on the machine "
+                f"where Hermes itself is running. The host OS, home, and cwd "
+                f"of the Hermes process are irrelevant; only the following "
+                f"backend state matters:\n{probe}"
+            )
+        else:
+            description = _BACKEND_FALLBACK_DESCRIPTIONS.get(
+                backend,
+            ) or _plugin_backend_description(backend) or (
+                f"a {backend} environment (likely Linux)"
+            )
+            hints.append(
+                f"Terminal backend: {backend}. {tool_scope} "
+                f"inside {description} — NOT on the machine where Hermes "
+                f"itself runs. The backend probe didn't respond at "
+                f"prompt-build time, so the sandbox's current user, $HOME, "
+                f"and working directory are unknown from here. If you need "
+                f"them, probe directly with a terminal call like "
+                f"`uname -a && whoami && pwd`."
+            )
+
+    if default_target is not None and default_target.named:
+        target_summary = ", ".join(
+            f"{json.dumps(item.target, ensure_ascii=True)} ({item.backend}"
+            f"{', default' if item.is_default else ''})"
+            for item in target_inventory
+        )
+        hints.append(
+            "Configured execution targets: " + target_summary + ". "
+            "`terminal`, `read_file`, `write_file`, `patch`, and `execute_code` "
+            "select one with `target`; `search_files` uses `execution_target` "
+            "because its existing `target` argument selects content/files mode. "
+            "Omitting the selector uses the default target. Environment facts "
+            "above describe only the default target "
+            f"{json.dumps(default_target.target, ensure_ascii=True)}; "
+            "tool results report the resolved target, backend, and cwd."
+        )
+
+    if is_wsl():
+        hints.append(WSL_ENVIRONMENT_HINT)
+
+    # Embedder-supplied environment description. Lets a host that wraps Hermes
+    # (e.g. a sandbox runner / managed platform) explain the environment the
+    # agent is running in — proxy, credential handling, mount layout — without
+    # forking the identity slot (SOUL.md). Read once at prompt-build time, so
+    # it's part of the stable, cache-safe system prompt. The env var is the
+    # build-time/embedder mechanism (set in a container ENV); config.yaml
+    # ``agent.environment_hint`` is the user-facing surface. Env var wins.
+    extra = (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip()
+    if not extra:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            extra = str(
+                (load_config_readonly().get("agent", {}) or {}).get("environment_hint", "")
+            ).strip()
+        except Exception as e:
+            logger.debug("Could not read agent.environment_hint from config: %s", e)
+    if extra:
+        hints.append(extra)
+
+    return "\n\n".join(hints)
 
 
 CONTEXT_FILE_MAX_CHARS = 20_000

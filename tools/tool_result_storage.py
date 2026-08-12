@@ -224,30 +224,61 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
                 return _persisted(remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
-    logger.info("Inline-truncating large tool result: %s (%d chars, no sandbox write)",
-                tool_name, len(content))
-    return (f"{preview}\n\n[Truncated: tool response was {len(content):,} chars. "
-            "Full output could not be saved to sandbox.]")
+
+    logger.info(
+        "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
+        tool_name, len(content),
+    )
+    return (
+        f"{preview}\n\n"
+        f"[Truncated: tool response was {len(content):,} chars. "
+        f"Full output could not be saved to sandbox.]"
+    )
 
 
-def enforce_turn_budget(tool_messages: list[dict], env=None,
-                        config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
-    """Layer 3: persist the largest non-persisted results first until the turn's aggregate is
-    under budget. Mutates the list in-place and returns it."""
-    sizes = [len(msg.get("content", "")) for msg in tool_messages]
-    total_size = sum(sizes)
-    candidates = [(i, size) for i, size in enumerate(sizes)
-                  if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")]
+def enforce_turn_budget(
+    tool_messages: list[dict],
+    env=None,
+    env_resolver=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+) -> list[dict]:
+    """Layer 3: enforce aggregate budget across all tool results in a turn.
+
+    If total chars exceed budget, persist the largest non-persisted results
+    first (via sandbox write) until under budget. Already-persisted results
+    are skipped.
+
+    ``env_resolver`` may return the producing environment for each message;
+    this keeps saved outputs on the same named execution target as the tool
+    call. Mutates the list in-place and returns it.
+    """
+    candidates = []
+    total_size = 0
+    for i, msg in enumerate(tool_messages):
+        content = msg.get("content", "")
+        size = len(content)
+        total_size += size
+        if PERSISTED_OUTPUT_TAG not in content:
+            candidates.append((i, size))
+
     if total_size <= config.turn_budget:
         return tool_messages
     for idx, size in sorted(candidates, key=lambda x: x[1], reverse=True):
         if total_size <= config.turn_budget:
             break
-        content = tool_messages[idx]["content"]
-        tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
+        msg = tool_messages[idx]
+        content = msg["content"]
+        tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
+
+        message_env = env_resolver(msg) if callable(env_resolver) else env
         replacement = maybe_persist_tool_result(
-            content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
-            env=env, config=config, threshold=0)
+            content=content,
+            tool_name=_BUDGET_TOOL_NAME,
+            tool_use_id=tool_use_id,
+            env=message_env if callable(env_resolver) else env,
+            config=config,
+            threshold=0,
+        )
         if replacement != content:
             total_size += len(replacement) - size
             tool_messages[idx]["content"] = replacement

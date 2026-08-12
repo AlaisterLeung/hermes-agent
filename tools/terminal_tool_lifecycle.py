@@ -14,7 +14,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Hashable, Optional
 from tools.environments.singularity import _get_scratch_dir
 from tools.terminal_tool_backends import (
     _container_config_from_config,
@@ -144,35 +144,81 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
-        _last_activity,
+        _last_activity, _active_turns_for_environment_key,
     )
     current_time = time.time()
 
-    # Sandboxes with active background processes stay alive (refresh activity).
+    # Check the process registry -- skip cleanup for sandboxes with active
+    # background processes (their _last_activity gets refreshed to keep them alive).
     try:
         from tools.process_registry import process_registry
         for task_id in list(_last_activity.keys()):
             if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time
+                _last_activity[task_id] = current_time  # Keep sandbox alive
     except ImportError:
         pass
 
-    # Phase 1: unregister stale entries atomically under the lock; phase 2:
-    # stop them outside it (see _unregister_env for why).
+    # Phase 1: collect stale entries and remove them from tracking dicts while
+    # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
+    # Docker teardown can block for 10-15s, which would stall every concurrent
+    # terminal/file tool call waiting on _env_lock.
+    envs_to_stop = []  # list of (task_id, env) pairs
+
     with _env_lock:
-        stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
-        envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
-        for t in stale:
-            _last_activity.pop(t, None)
+        for task_id, last_time in list(_last_activity.items()):
+            if _active_turns_for_environment_key(task_id) > 0:
+                # An active tool or overlapping logical turn owns this runtime.
+                # Refresh activity so it gets a complete idle window afterward.
+                _last_activity[task_id] = current_time
+                continue
+            tracked_env = _active_environments.get(task_id)
+            effective_lifetime = getattr(
+                tracked_env, "_hermes_lifetime_seconds", lifetime_seconds,
+            )
+            if current_time - last_time > effective_lifetime:
+                env = _active_environments.pop(task_id, None)
+                _last_activity.pop(task_id, None)
+                if env is not None:
+                    envs_to_stop.append((task_id, env))
+
+        # Also purge per-task creation locks for cleaned-up tasks
         with _creation_locks_lock:
-            for t in stale:
-                _creation_locks.pop(t, None)
+            for task_id, _ in envs_to_stop:
+                _creation_locks.pop(task_id, None)
+
+    # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
+    # are not blocked while Modal/Docker sandboxes shut down.
     for task_id, env in envs_to_stop:
-        if env is not None:
-            _clear_file_ops_cache(task_id)
-            _teardown_env(env, task_id)
+        # Invalidate stale file_ops cache entry (Bug fix: prevents
+        # ShellFileOperations from referencing a dead sandbox)
+        try:
+            from tools.file_tools import clear_file_ops_cache
+            clear_file_ops_cache(task_id)
+        except ImportError:
+            pass
 
+        try:
+            if hasattr(env, 'cleanup'):
+                env.cleanup()
+            elif hasattr(env, 'stop'):
+                env.stop()
+            elif hasattr(env, 'terminate'):
+                env.terminate()
 
+            logger.info("Cleaned up inactive environment for task: %s", task_id)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s already cleaned up", task_id)
+            else:
+                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+
+    # Replaced environments are no longer selectable. Give concurrent foreground
+    # calls a one-minute grace period, then force-remove them once no tool turn or
+    # background process still references their task scope.
+    from tools.terminal_tool import _cleanup_retired_environments
+    _cleanup_retired_environments(min_age_seconds=60.0, require_idle=True)
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
@@ -284,27 +330,138 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(
+    task_id: Hashable,
+    *,
+    force_remove: bool = False,
+    preserve_persistent: bool = False,
+    target: Optional[str] = None,
+    include_collapsed: bool = False,
+):
     """Manually clean up a specific environment by task_id.
 
     *force_remove* is forwarded to backends that accept it (currently only
     ``DockerEnvironment``). Default False matches session-lifecycle semantics:
-    callers (``AIAgent.close()`` on TUI/gateway session teardown, the per-turn
-    cleanup of non-persistent envs) must honor the user's persist-mode
-    preference — stopping the container here would break the "ONE long-lived
-    container shared across sessions" contract. Pass ``force_remove=True``
-    only for user-initiated teardown. The idle reaper calls ``env.cleanup()``
-    directly, so persist-mode idle envs are likewise no-op'd; only the orphan
-    reaper at next startup reclaims them.
+    callers must honor the user's persist-mode preference — stopping the
+    container here would break the "ONE long-lived container shared across
+    sessions" contract. Pass ``force_remove=True`` only for user-initiated
+    teardown. The idle reaper calls ``env.cleanup()`` directly, so
+    persist-mode idle envs are likewise no-op'd; only the orphan reaper at
+    next startup reclaims them.
+
+    ``preserve_persistent`` (per-turn cleanup) keeps persistent named sibling
+    environments live while removing only non-persistent targets.
+    ``include_collapsed`` extends key matching to the collapsed container id;
+    the caller must first release its logical turn lease.
     """
-    env = _unregister_env(task_id)
-    _clear_file_ops_cache(task_id)
-    if env is None:
-        return
-    _teardown_env(
-        env, task_id, force_remove=force_remove,
-        done_msg="Manually cleaned up environment for task: %s",
+    from tools.terminal_tool import (
+        _active_environments, _env_lock, _creation_locks, _creation_locks_lock,
+        _last_activity, _resolve_container_task_id, _environment_is_persistent,
+        _cleanup_retired_environments,
     )
+
+    if isinstance(task_id, tuple):
+        keys = [task_id]
+    elif target is None:
+        try:
+            from tools.terminal_tool import _target_resolution
+            resolution = _target_resolution(None)
+            scoped_task_id = resolution.scope_task_key(task_id)
+            collapsed_task_id = _resolve_container_task_id(str(task_id))
+            scoped_collapsed_task_id = resolution.scope_task_key(collapsed_task_id)
+        except Exception:
+            scoped_task_id = task_id
+            collapsed_task_id = task_id
+            scoped_collapsed_task_id = task_id
+        matching_task_ids = {task_id, scoped_task_id}
+        if include_collapsed:
+            matching_task_ids.update({
+                collapsed_task_id, scoped_collapsed_task_id,
+            })
+        with _env_lock:
+            keys = [
+                key for key in _active_environments
+                if key in matching_task_ids
+                or (
+                    isinstance(key, tuple) and len(key) == 2
+                    and key[0] in matching_task_ids
+                )
+            ]
+        if not keys:
+            keys = [task_id]
+    else:
+        from tools.terminal_tool import _target_resolution
+        resolution = _target_resolution(target)
+        if resolution.named:
+            keys = [resolution.environment_key(task_id)]
+        else:
+            keys = [task_id]
+
+    active_process_keys = set()
+    if preserve_persistent:
+        try:
+            from tools.process_registry import process_registry
+
+            active_process_keys = {
+                key for key in keys
+                if process_registry.has_active_processes(key)
+            }
+        except Exception:
+            logger.debug(
+                "Failed to inspect active processes before cleanup",
+                exc_info=True,
+            )
+
+    envs = []
+    removed_keys = []
+    with _env_lock:
+        for key in keys:
+            existing = _active_environments.get(key)
+            if key in active_process_keys:
+                continue
+            if (
+                preserve_persistent
+                and existing is not None
+                and _environment_is_persistent(existing)
+            ):
+                continue
+            env = _active_environments.pop(key, None)
+            _last_activity.pop(key, None)
+            removed_keys.append(key)
+            if env is not None:
+                envs.append((key, env))
+
+    # Clean up per-task creation lock
+    with _creation_locks_lock:
+        for key in removed_keys:
+            _creation_locks.pop(key, None)
+
+    # Invalidate stale file_ops cache entry
+    for key in removed_keys:
+        _clear_file_ops_cache(key)
+
+    for key in keys:
+        _cleanup_retired_environments(
+            task_key=key,
+            min_age_seconds=0.0,
+            require_idle=preserve_persistent,
+        )
+
+    if not envs:
+        return
+
+    for key, env in envs:
+        try:
+            _cleanup_env(env, force_remove=force_remove)
+
+            logger.info("Manually cleaned up environment for task: %s", key)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s already cleaned up", key)
+            else:
+                logger.warning("Error cleaning up environment for task %s: %s", key, e)
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:

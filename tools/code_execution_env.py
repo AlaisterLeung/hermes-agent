@@ -233,7 +233,8 @@ def _resolve_child_python(mode: str) -> str:
     return sys.executable
 
 
-def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
+def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "",
+                       target: str | None = None, *, _resolution=None) -> str:
     """Child cwd. Strict: the staging dir. Project mirrors the terminal/file-tool ladder so every
     file-writing path agrees: session cwd record (`cd` state) → registered ``session.cwd.set``
     override → TERMINAL_CWD → os.getcwd() → staging dir (never Popen on a missing cwd).
@@ -242,14 +243,44 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
     """
     if mode != "project":
         return staging_dir
+
+    target_resolution = _resolution
+    target_cwd = ""
+    if target is not None or target_resolution is not None:
+        try:
+            from tools.execution_targets import resolve_execution_target
+
+            target_resolution = (
+                target_resolution or resolve_execution_target(target)
+            )
+            target_cwd = (
+                str(target_resolution.config.get("cwd") or "").strip()
+                if target_resolution.named else ""
+            )
+        except Exception:
+            target_resolution = None
+
     if task_id:
         try:
             from tools.terminal_tool import get_session_cwd
-            recorded = get_session_cwd(task_id)
+            recorded = get_session_cwd(
+                task_id, target=target, _resolution=target_resolution,
+            )
         except Exception:
             recorded = None
         if recorded and os.path.isdir(recorded):
             return recorded
+        # A non-default target owns its configured cwd. The host workspace
+        # override below belongs to the default target and must not replace it.
+        if (
+            target_resolution is not None
+            and target_resolution.named
+            and not target_resolution.is_default
+            and target_cwd
+        ):
+            expanded_target_cwd = os.path.abspath(os.path.expanduser(target_cwd))
+            if os.path.isdir(expanded_target_cwd):
+                return expanded_target_cwd
         try:
             from tools.file_tools_paths import _registered_task_cwd_override
             session_cwd = _registered_task_cwd_override(task_id)
@@ -257,8 +288,15 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = None
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
-    from agent.runtime_cwd import scope_terminal_cwd
-    raw = scope_terminal_cwd().strip()
+    raw = target_cwd
+    if not raw:
+        try:
+            from agent.runtime_cwd import scope_terminal_cwd
+            raw = scope_terminal_cwd().strip()
+        except Exception:
+            raw = ""
+    if not raw:
+        raw = os.environ.get("TERMINAL_CWD", "").strip()
     for candidate in (os.path.expanduser(raw) if raw else "", os.getcwd()):
         if candidate and os.path.isdir(candidate):
             return candidate
