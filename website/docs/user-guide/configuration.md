@@ -154,6 +154,122 @@ terminal:
 
 For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
 
+### Named Execution Targets
+
+A single Hermes process can route terminal, file, and Python execution calls to several configured environments. Recognized backend settings under `terminal` are inherited by every target, and target entries can override backend-scoped values such as `backend`, `cwd`, `timeout`, image/resource fields, Docker options, and SSH connection fields. Keep process-wide policy such as shell initialization, environment-passthrough, approval, and code-execution settings at the top level: arbitrary nested keys are not automatically target-aware.
+
+```yaml
+terminal:
+  timeout: 180
+  container_memory: 5120
+  default_target: local
+  targets:
+    local:
+      backend: local
+      cwd: /workspace/local
+    devbox:
+      backend: ssh
+      ssh_host: devbox.example.com
+      ssh_user: bruno
+      cwd: /home/bruno/project
+```
+
+When `targets` is non-empty, a tool call with no selector uses `default_target`. The default must name an entry; invalid defaults and unknown explicit names fail with an error listing the available names. Target names are arbitrary non-empty strings.
+
+The tools use fixed string parameters so changing config does not change the model tool schema:
+
+```text
+terminal(command="git status", target="devbox")
+read_file(path="README.md", target="local")
+write_file(path="notes.txt", content="...", target="devbox")
+patch(mode="replace", path="app.py", old_string="old", new_string="new", target="devbox")
+execute_code(code="print('hello')", target="devbox")
+search_files(pattern="TODO", target="content", execution_target="devbox")
+```
+
+`search_files` is the compatibility exception: its existing `target` argument still selects `content` or `files` search mode, while `execution_target` selects the named environment. A target's terminal and file operations share the same environment and per-session working directory. A `cd` on one target does not change another target; an explicit `workdir` on a terminal call still wins.
+
+Background process follow-up actions remain keyed only by `session_id`. Process start, list, poll, log, wait, kill, and checkpoint results expose the selected `target` and `backend`. Local background processes can be recovered from checkpoints after a Hermes restart; remote/container process handles are currently reported as unavailable after restart rather than silently attaching to a newly created environment. Successful terminal/file/code-execution results expose target metadata (and `cwd` when available). The system prompt lists configured names and marks the default without changing tool schemas.
+
+Command and execute-code approval prompts identify the resolved target/backend. Session and UI-created permanent pattern approvals are scoped to the target's profile/name/effective configuration, so approving a command on one host does not silently authorize the same pattern after that target name is repointed. Explicit entries an operator writes in the global `approvals.command_allowlist` remain global by design. An `execute_code` RPC session is bound to its outer target and effective configuration: nested terminal/file calls inherit that target, cannot pivot to another one, and fail closed if the alias is repointed while the script is running.
+
+If `targets` is absent or empty, Hermes preserves the existing flat config and environment-variable behavior exactly. In that legacy mode, omitted `target` and `target="default"` select the existing environment; every other explicit name is an error. Environment variables remain the legacy single-backend interface and do not select named targets. In named mode Hermes mirrors the resolved default target into `TERMINAL_*` for older internal consumers, but explicit tool selection still comes only from `target` / `execution_target`. Once an entry point reloads or updates its effective configuration, new calls create a replacement environment for any changed target; already-running operations and background sessions remain bound to the environment in which they started. Static `config.yaml` edits still follow each entry point's normal reload/restart behavior. The provider-fragment registry described below is the explicit no-restart path and is checked at each independent dispatch. A persistent named Docker runtime is replaced only when no other logical turn, tool call, or process is using its shared storage; the replacing call's own nested leases do not block it. Retirement is transactional and fail-closed, so a failed container removal retains the prior runtime identity and returns an actionable retry error instead of publishing a replacement. Its separate stable profile/target storage identity keeps persistent home/workspace data across policy, timeout, or image changes.
+
+Target entries are validated strictly before environment creation. Unknown, misspelled, backend-inapplicable, malformed, or missing required settings return an error naming the target and field; documented top-level compatibility and policy fields remain supported.
+
+### Runtime target registry (no gateway restart)
+
+Static targets in `config.yaml` remain the right choice for durable, hand-managed environments. Controllers for ephemeral compute should publish provider-owned runtime targets with the built-in CLI instead:
+
+```bash
+hermes targets register hetzner-mybox \
+  --backend ssh \
+  --host hetzner-dev-mybox \
+  --user dev \
+  --port 443 \
+  --cwd /workspace \
+  --provider hetzner-devbox \
+  --owner-id mybox \
+  --generation "$SERVER_ID" \
+  --json
+
+hermes targets list --all
+hermes targets show hetzner-mybox --provider hetzner-devbox --json
+hermes targets drain hetzner-mybox --provider hetzner-devbox --if-generation "$SERVER_ID"
+hermes targets remove hetzner-mybox --provider hetzner-devbox --if-generation "$SERVER_ID"
+```
+
+Registration is visible to a long-lived gateway on its next independent tool dispatch; the gateway does not need to restart. One restart is still required when you deploy implementation code that adds this feature beneath an already-running gateway. Runtime discovery does not rewrite the cached system prompt or model tool schemas. The prompt's target inventory is only a startup hint, so the exact `execution_target` returned by `register --json` is the discovery event an agent or controller should use on its next tool call.
+
+Static configuration has precedence and reserves its target names. Runtime providers cannot change `default_target`. If two providers claim the same runtime name, that name fails closed while unrelated static and healthy runtime targets continue working. Use `hermes targets list --all` to see collisions, draining records, and secret-safe provider diagnostics. Malformed, unreadable, insecure, or symlinked fragments make only that provider unavailable; Hermes does not route through indefinitely stale last-known-good data or fall back to a lower-policy default.
+
+Each provider owns its complete versioned fragment at:
+
+```text
+$HERMES_HOME/runtime/execution-targets.d/<provider>.json
+```
+
+A provider fragment uses this schema:
+
+```json
+{
+  "version": 1,
+  "provider": "hetzner-devbox",
+  "targets": {
+    "hetzner-build-17": {
+      "config": {
+        "backend": "ssh",
+        "ssh_host": "hetzner-dev-build-17",
+        "ssh_user": "dev",
+        "ssh_port": 443,
+        "cwd": "/workspace"
+      },
+      "owner_id": "build-17",
+      "generation": "provider-server-or-plan-id",
+      "state": "ready"
+    }
+  }
+}
+```
+
+Providers replace their whole fragment; `state` is `ready` or `draining`. Do not edit a fragment incrementally in place.
+
+The path follows the active profile, including multiplexed profile overrides. Provider names are filename-safe and canonicalized to lowercase everywhere (payloads, filenames, filters, and output). Writes use a bounded cross-process lock plus same-directory atomic replacement, and Hermes creates the directory and files with user-only permissions (`0700` and `0600`) where supported. Each state or provider JSON file is limited to 1 MiB, each provider to 1024 targets, and target config size/nesting/complexity is bounded before copying or backend use. A provider that exceeds a limit is isolated like any other malformed fragment while static and unrelated healthy targets continue working. Fragment records include `version`, `provider`, `owner_id`, `generation`, `state`, and the target `config`. Store SSH aliases and private-key paths only, never private-key contents. CLI JSON and human output expose an allowlisted routing summary rather than arbitrary config values.
+
+`generation` is the compare-and-swap token for an external resource. Registration is idempotent when ownership, generation, state, and effective config are unchanged. Repointing an existing alias requires `--replace`; `--if-generation` can additionally require the exact old generation. Drain and remove also accept `--if-generation`, preventing teardown for server A from disabling or deleting replacement server B.
+
+A legacy flat `terminal:` setup is activated without editing `config.yaml`: before the first provider fragment is published, Hermes atomically writes a small versioned activation marker containing no backend configuration or secrets. While static configuration remains flat, Hermes synthesizes the named `default` target in memory from the current effective static/profile configuration and that scope's legacy environment authority on each dispatch. Shared top-level terminal policy remains inherited, and later config-source updates refresh the default's effective spec and keyed identity. Every durable intermediate state is valid, including a crash between marker and fragment publication. The marker remains after the final runtime target is removed, so named mode and the `default` alias remain active.
+
+For a Hetzner devbox, use this control-plane ordering:
+
+```text
+provision -> publish managed SSH alias -> prove SSH/workspace ready -> register ready target
+
+drain target -> reconcile active/background work -> destroy compute -> CAS-remove exact generation
+```
+
+Draining and removed aliases reject new tool calls. Repointing changes the keyed effective-spec identity used by runtimes, cwd state, checkpoints, and scoped approvals, even when an SSH alias string stays the same but its provider generation changes. A dispatch that already started remains pinned to the generation it resolved. Existing background processes retain their immutable producing-runtime handle and can still be listed, polled, waited on, killed, or cleaned up in the same Hermes process after drain/remove. Remote/container handles still cannot be reattached after a Hermes process restart; the existing checkpoint behavior reports them unavailable instead of attaching to replacement compute.
+
 ### Backend Overview
 
 | Backend | Where commands run | Isolation | Best for |
@@ -316,7 +432,7 @@ Parallel subagents spawned via `delegate_task(tasks=[...])` share this one conta
 
 #### Environment variable overrides
 
-Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_UPPERCASE>`. The most useful ones for the Docker backend:
+Legacy single-backend terminal settings have `TERMINAL_*` environment-variable overrides. Named `default_target` / `targets` selection is config-only; environment variables do not switch targets. The most useful Docker overrides are:
 
 | Env var | Maps to | Notes |
 |---|---|---|
