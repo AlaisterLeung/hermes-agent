@@ -90,6 +90,19 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 | `search_files` | Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents. Content search (target='content'): Regex search inside files. Output modes: full matches with line… | — |
 | `write_file` | Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by the write are surfaced. | — |
 
+### File execution targets
+
+`read_file`, `write_file`, and `patch` accept an optional static string `target` selecting a configured `terminal.targets` entry. `search_files` preserves its existing `target="content"|"files"` argument and uses `execution_target` for environment selection:
+
+```text
+read_file(path="README.md", target="local")
+write_file(path="build.txt", content="ready\n", target="devbox")
+patch(mode="replace", path="app.py", old_string="old", new_string="new", target="devbox")
+search_files(pattern="TODO", target="content", execution_target="devbox")
+```
+
+Relative paths use the selected target's own session working directory and FileOperations adapter. Results include resolved `target` and `backend` metadata, plus `cwd` when available. See [Named Execution Targets](/user-guide/configuration#named-execution-targets) for configuration, default, and legacy behavior.
+
 ## `homeassistant` toolset
 
 | Tool | Description | Requires environment |
@@ -172,7 +185,7 @@ Tools for driving desktop [Projects](../user-guide/cli.md) — named, multi-fold
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
 | `process` | Manage background processes started with terminal(background=true). Actions: 'list' (show all), 'poll' (check status + new output), 'log' (full output with pagination), 'wait' (block until done or timeout), 'kill' (terminate), 'write' (sen… | — |
-| `terminal` | Execute shell commands on a Linux environment. Filesystem persists between calls. Set `background=true` for long-running servers. Set `notify_on_complete=true` (with `background=true`) to get an automatic notification when the process finishes — no polling needed. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
+| `terminal` | Execute shell commands on the selected execution target (using bash/Linux shell semantics). Filesystem persists between calls. Set `background=true` for long-running servers. Set `notify_on_complete=true` (with `background=true`) to get an automatic notification when the process finishes — no polling needed. Do NOT use cat/head/tail — use read_file. Do NOT use grep/rg/find — use search_files. | — |
 
 ## `desktop_ui` toolset
 
@@ -189,6 +202,23 @@ messaging, and cron sessions.
 | `read_window_below` | Identify the OS window directly underneath the Hermes desktop window — app name, title, bounds (metadata only, never pixels). On macOS, other apps' titles appear only when Screen Recording is already granted; the tool never prompts for it. | — |
 | `focus_pane` | Reveal and focus a pane in the Hermes desktop app (chat, files, terminal, review, sessions). | — |
 | `react_to_message` | React to a message with a single emoji, iMessage-tapback style. Opt-in via Settings → Appearance (`display.message_reactions`). | — |
+
+### Terminal and code-execution targets
+
+`terminal` and `execute_code` accept an optional static string `target`, for example:
+
+```text
+terminal(command="git status", target="devbox")
+execute_code(code="print('hello')", target="devbox")
+```
+
+Omitting the selector uses `terminal.default_target` when named targets exist. Without named targets, omission and `target="default"` preserve the legacy environment; other names fail. Successful results and approval prompts identify the resolved `target` and `backend`. Background process follow-ups need only their `session_id`; process results retain the spawn target/backend across poll, list, log, wait, and kill. Local checkpointed processes can recover after restart; remote/container handles are reported as unavailable rather than rebound to a different environment.
+
+Saved-output hints can include an opaque `runtime_scope`. Pass it back to `read_file` together with the shown `target`; this pins retrieval to the exact producing environment even if that target alias changes later.
+
+Inside `execute_code`, nested target-aware `hermes_tools` calls inherit and are bound to the script's selected target. A nested call that explicitly selects another target is rejected server-side; start a separate top-level `execute_code` call for cross-target orchestration. Python itself runs on the selected environment, and project mode resolves its cwd from that target's session/config state.
+
+See [Named Execution Targets](/user-guide/configuration#named-execution-targets) for the complete config shape and inheritance rules.
 
 ## `todo` toolset
 
@@ -287,5 +317,4 @@ Registered only on the `hermes-yuanbao` platform toolset. Yuanbao is Tencent's c
 | `yb_send_dm` | Send a private/direct message to a user in a group, with optional media files. | Yuanbao credentials |
 | `yb_search_sticker` | Search the built-in Yuanbao sticker (TIM face) catalogue by keyword. | Yuanbao credentials |
 | `yb_send_sticker` | Send a built-in sticker to the current Yuanbao chat. | Yuanbao credentials |
-
 
