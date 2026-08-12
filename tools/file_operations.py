@@ -884,7 +884,9 @@ class ShellFileOperations(FileOperations):
     This includes local, docker, singularity, ssh, modal, and daytona environments.
     """
     
-    def __init__(self, terminal_env, cwd: str = None):
+    def __init__(
+        self, terminal_env, cwd: str = None, *, fixed_cwd: str = None,
+    ):
         """
         Initialize file operations with a terminal environment.
 
@@ -895,11 +897,11 @@ class ShellFileOperations(FileOperations):
                  no cwd attribute (rare — most backends track cwd live).
 
         Note:
-            Every _exec() call prefers the LIVE ``terminal_env.cwd`` over
-            ``self.cwd`` so ``cd`` commands run via the terminal tool are
-            picked up immediately.  ``self.cwd`` is only used as a fallback
-            when the env has no cwd at all — it is NOT the authoritative
-            cwd, despite being settable at init time.
+            By default every _exec() call prefers the LIVE
+            ``terminal_env.cwd`` over ``self.cwd`` so ``cd`` commands run via
+            the terminal tool are picked up immediately. ``fixed_cwd`` pins
+            operations to a caller-owned runtime scope; named SSH targets use
+            it because their environment object is shared across sessions.
 
             Historical bug (fixed): prior versions of this class used the
             init-time cwd for every _exec() call, which caused relative
@@ -915,6 +917,7 @@ class ShellFileOperations(FileOperations):
         # If nothing provides a cwd, use "/" as a safe universal default.
         self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        self.fixed_cwd = fixed_cwd
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
@@ -929,8 +932,9 @@ class ShellFileOperations(FileOperations):
 
         Cwd resolution order (critical — see class docstring):
           1. Explicit ``cwd`` arg (if provided)
-          2. Live ``self.env.cwd`` (tracks ``cd`` commands run via terminal)
-          3. Init-time ``self.cwd`` (fallback when env has no cwd attribute)
+          2. Scope-pinned ``self.fixed_cwd`` (when configured)
+          3. Live ``self.env.cwd`` (tracks ``cd`` commands run via terminal)
+          4. Init-time ``self.cwd`` (fallback when env has no cwd attribute)
 
         This ordering ensures relative paths in file operations follow the
         terminal's current directory — not the directory this file_ops was
@@ -944,7 +948,9 @@ class ShellFileOperations(FileOperations):
 
         # Resolve cwd from the live env so `cd` commands are picked up.
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
-        effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
+        effective_cwd = (
+            cwd or self.fixed_cwd or getattr(self.env, 'cwd', None) or self.cwd
+        )
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         exit_code = result.get("returncode", 0)
         # A stdin write failure with an otherwise-clean child exit is still
