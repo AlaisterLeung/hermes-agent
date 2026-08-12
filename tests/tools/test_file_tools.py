@@ -318,8 +318,11 @@ class TestWindowsMsysPathResolution:
         to ``ntpath``/``Path``, and only a real Windows ``Path`` renders
         ``C:\\Users\\...`` — faking ``sys.platform`` left PosixPath in place."""
         import tools.file_tools as file_tools
+        import tools.environments.local as local_mod
 
-        monkeypatch.setattr(file_tools, "_uses_container_paths", lambda task_id="default": False)
+        monkeypatch.setattr(file_tools.sys, "platform", "win32")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(file_tools, "_uses_container_paths", lambda task_id="default", execution_target=None, _resolution=None: False)
 
         resolved = file_tools._resolve_path_for_task("/c/Users/Mark/project/app.py")
         assert str(resolved) == r"C:\Users\Mark\project\app.py"
@@ -333,12 +336,15 @@ class TestWindowsMsysPathResolution:
         the host really is Windows, so the negative is only meaningful there.
         """
         import tools.file_tools as file_tools
+        import tools.environments.local as local_mod
 
-        monkeypatch.setattr(file_tools, "_uses_container_paths", lambda task_id="default": True)
+        monkeypatch.setattr(file_tools.sys, "platform", "win32")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(file_tools, "_uses_container_paths", lambda task_id="default", execution_target=None, _resolution=None: True)
         monkeypatch.setattr(
             file_tools,
             "_authoritative_workspace_root",
-            lambda task_id="default": "/home/don/project",
+            lambda task_id="default", execution_target=None, _resolution=None: "/home/don/project",
         )
 
         resolved = file_tools._resolve_path_for_task("/home/don/.env")
