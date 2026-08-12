@@ -36,10 +36,12 @@ jobs:
         id: tags
         run: |
           branch="${{ github.ref_name }}"
-          sha7="${GITHUB_SHA::7}"
+          # Docker tags cannot contain '/'; sanitize ref names like
+          # "feat/named-execution-targets" into "feat-named-execution-targets".
+          branch="${branch//\//-}"
           repo="${IMAGE_REPO}"
-          base="${repo}:${branch},${repo}:${branch}-${sha7}"
-          extra="${repo}:${branch}-extra,${repo}:${branch}-${sha7}-extra"
+          base="${repo}:${branch}"
+          extra="${repo}:${branch}-extra"
           if [ "${branch}" = "main" ]; then
             extra="${extra},${repo}:latest"
           fi
