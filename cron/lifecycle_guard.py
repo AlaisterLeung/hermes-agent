@@ -464,7 +464,8 @@ _BINARY_SNIFF_BYTES = 4096
 
 
 
-_ReadRemoteScriptFn = Callable[[str], Optional[str]]
+_ReadRemoteScriptResult = Optional[str] | tuple[Optional[str], bool]
+_ReadRemoteScriptFn = Callable[[str], _ReadRemoteScriptResult]
 
 
 def _split_logical_lines(text: str) -> list[str]:
@@ -1106,7 +1107,7 @@ def _read_referenced_script(
 
 
 def _sanitize_remote_script_text(
-    text: Optional[str], *, max_bytes: Optional[int] = None
+    result: _ReadRemoteScriptResult, *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
     """Apply the local-read contract to text from a ``read_remote_script`` callback.
 
@@ -1124,8 +1125,18 @@ def _sanitize_remote_script_text(
     callback so the guarantee holds for every callback, not just the ones
     we hardened.
     """
+    if isinstance(result, tuple):
+        if len(result) != 2 or not isinstance(result[1], bool):
+            return None, True
+        text, unsafe = result
+        if unsafe:
+            return None, True
+    else:
+        text = result
     if not text:
         return None, False
+    if not isinstance(text, str):
+        return None, True
     if "\x00" in text:
         return None, False
     byte_limit = _capped_read_limit(max_bytes)
@@ -1200,24 +1211,25 @@ def _contains_unsafe_gateway_action(
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file
         # larger than the remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(
-            script_path, max_bytes=budget.bytes_remaining
-        )
-        if unsafe:
-            return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
+        if read_remote_script is not None:
+            # A supplied reader represents the selected execution target and
+            # is authoritative. Consulting the Hermes host first would let a
+            # coincidentally matching local path shadow the remote script (or
+            # falsely block a safe remote script based on unsafe host bytes).
+            # Sanitize callback output at the same bounded, binary-safe trust
+            # boundary as local reads.
             if not budget.charge_remote_read():
                 return _budget_exhausted("remote reads", depth)
-            # The callback's output crosses the same trust boundary as a
-            # local read — sanitize it identically before it enters the
-            # recursion (binary skip + size fail-closed).
             script_text, unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)),
                 max_bytes=budget.bytes_remaining,
             )
-            if unsafe:
-                return True
+        else:
+            script_text, unsafe = _read_referenced_script(
+                script_path, max_bytes=budget.bytes_remaining
+            )
+        if unsafe:
+            return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's

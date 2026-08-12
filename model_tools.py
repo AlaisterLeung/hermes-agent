@@ -801,6 +801,7 @@ _LEGACY_TOOL_ALIASES = {
     "tip": "show_tip",
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+_TARGET_SELECTOR_TOOLS = {"terminal", "write_file", "patch", "execute_code"}
 
 
 # =========================================================================
@@ -1530,7 +1531,14 @@ def handle_function_call(
         if function_name not in _READ_SEARCH_TOOLS:
             try:
                 from tools.file_tools import notify_other_tool_call
-                notify_other_tool_call(task_id or "default")
+                notify_other_tool_call(
+                    task_id or "default",
+                    (
+                        function_args.get("target")
+                        if function_name in _TARGET_SELECTOR_TOOLS
+                        else None
+                    ),
+                )
             except Exception:
                 pass  # file_tools may not be loaded yet
 
