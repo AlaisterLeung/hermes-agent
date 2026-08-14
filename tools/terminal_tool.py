@@ -2499,6 +2499,7 @@ def _build_environment_constructor_configs(
             "port": config.get("ssh_port", 22),
             "key": config.get("ssh_key", ""),
             "persistent": config.get("ssh_persistent", False),
+            "file_sync": config.get("file_sync", True),
             "runtime_scope": resolution.security_scope if resolution.named else "",
         }
 
@@ -3073,6 +3074,7 @@ def _create_environment(
             cwd=cwd,
             timeout=timeout,
             runtime_scope=ssh_config.get("runtime_scope", ""),
+            file_sync=ssh_config.get("file_sync", True),
         )
 
     else:
