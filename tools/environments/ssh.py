@@ -67,7 +67,8 @@ class SSHEnvironment(BaseEnvironment):
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
                  probe_only: bool = False,
-                 runtime_scope: str = "", profile_name: str | None = None):
+                 runtime_scope: str = "", profile_name: str | None = None,
+                 file_sync: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
@@ -75,6 +76,9 @@ class SSHEnvironment(BaseEnvironment):
         self.key_path = key_path
         self.runtime_scope = str(runtime_scope or "")
         self.profile_name = str(profile_name or _active_profile_identity())
+        # When False, skip the ~/.hermes mirror (init mkdir + FileSyncManager):
+        # for self-managed remote hosts the sync is redundant or harmful.
+        self.file_sync = bool(file_sync)
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
@@ -113,12 +117,19 @@ class SSHEnvironment(BaseEnvironment):
             self._sync_manager = None
             return
         self._remote_home = self._detect_remote_home()
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
-        self._sync_manager.sync(force=True)
+
+        self._sync_manager: FileSyncManager | None = None
+        if self.file_sync:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
+
         self.init_session()
 
     def _control_socket_for(self, send_env: tuple[str, ...]) -> Path:
@@ -292,8 +303,9 @@ class SSHEnvironment(BaseEnvironment):
                               f"Remote file cleanup on {self.host}")
 
     def _before_execute(self) -> None:
+        """Sync files to remote via FileSyncManager (rate-limited internally)."""
         if self._sync_manager is not None:
-            self._sync_manager.sync()  # rate-limited internally
+            self._sync_manager.sync()
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -308,7 +320,7 @@ class SSHEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
 
     def cleanup(self):
-        if self._sync_manager:
+        if self._sync_manager is not None:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
         for socket in self._control_sockets():

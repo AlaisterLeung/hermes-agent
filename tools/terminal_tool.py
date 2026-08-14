@@ -3421,6 +3421,7 @@ def _build_environment_constructor_configs(
             "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
             "docker_shared_container_key": config.get("docker_shared_container_key", ""),
             "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+            "file_sync": config.get("file_sync", True),
             "lifetime_seconds": config.get("lifetime_seconds", 300),
             "storage_task_id": resolution.storage_task_id(base_task_id),
             "legacy_storage_task_id": resolution.legacy_backend_task_id(base_task_id),
@@ -4098,6 +4099,7 @@ def _create_environment(
             cwd=cwd,
             timeout=timeout,
             runtime_scope=ssh_config.get("runtime_scope", ""),
+            file_sync=ssh_config.get("file_sync", True),
         )
 
     else:
