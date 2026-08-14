@@ -191,6 +191,45 @@ class TestSSHPreflight:
         assert env.user == "alice"
 
 
+    def test_file_sync_false_skips_sync_manager_and_remote_dirs(self, monkeypatch):
+        """file_sync=False must not build a FileSyncManager nor create the
+        ~/.hermes dir tree — real self-managed hosts shouldn't be mirrored."""
+        import tools.environments.ssh as ssh_mod
+        sync_created = {"count": 0}
+        mkdir_called = {"count": 0}
+
+        monkeypatch.setattr(ssh_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "init_session", lambda self: None)
+
+        def _fake_ensure_remote_dirs(self):
+            mkdir_called["count"] += 1
+
+        def _fake_syncmanager(**kw):
+            sync_created["count"] += 1
+            class _M:
+                def sync(self, **k): return None
+                def sync_back(self): return None
+            return _M()
+
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_ensure_remote_dirs", _fake_ensure_remote_dirs)
+        monkeypatch.setattr(ssh_mod, "FileSyncManager", _fake_syncmanager)
+
+        off = ssh_mod.SSHEnvironment(host="example.com", user="alice", file_sync=False)
+        assert off._sync_manager is None
+        assert off.file_sync is False
+        assert sync_created["count"] == 0
+        assert mkdir_called["count"] == 0
+        off._before_execute()   # must be a no-op with no manager
+        off.cleanup()           # must not call sync_back
+
+        on = ssh_mod.SSHEnvironment(host="example.com", user="bob", file_sync=True)
+        assert on.file_sync is True
+        assert sync_created["count"] == 1
+        assert mkdir_called["count"] == 1
+
+
 def _setup_ssh_env(monkeypatch, persistent: bool):
     monkeypatch.setenv("TERMINAL_ENV", "ssh")
     monkeypatch.setenv("TERMINAL_SSH_HOST", _SSH_HOST)

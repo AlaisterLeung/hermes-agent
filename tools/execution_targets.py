@@ -43,7 +43,7 @@ _TARGET_BACKEND_SETTINGS = {
     "local": frozenset({"local_persistent"}),
     "ssh": frozenset({
         "ssh_host", "ssh_user", "ssh_port", "ssh_key",
-        "ssh_persistent", "persistent_shell",
+        "ssh_persistent", "persistent_shell", "file_sync",
     }),
     "docker": _TARGET_CONTAINER_SETTINGS | frozenset({
         "docker_image", "docker_forward_env", "docker_env",
@@ -62,9 +62,9 @@ _TARGET_ENTRY_SETTINGS = frozenset().union(
 )
 _TARGET_BOOLEAN_SETTINGS = frozenset({
     "container_persistent", "local_persistent", "ssh_persistent",
-    "persistent_shell", "docker_mount_cwd_to_workspace", "docker_network",
-    "docker_run_as_host_user", "docker_persist_across_processes",
-    "docker_orphan_reaper",
+    "persistent_shell", "file_sync", "docker_mount_cwd_to_workspace",
+    "docker_network", "docker_run_as_host_user",
+    "docker_persist_across_processes", "docker_orphan_reaper",
 })
 _TARGET_LIST_SETTINGS = frozenset({
     "docker_forward_env", "docker_volumes", "docker_extra_args",
