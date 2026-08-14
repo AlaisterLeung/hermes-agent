@@ -360,6 +360,7 @@ terminal:
 #       ssh_host: "devbox.example.com"
 #       ssh_user: "bruno"
 #       cwd: "/home/bruno/project"
+#       # file_sync: false  # Skip the ~/.hermes mirror for real, self-managed hosts
 
 # -----------------------------------------------------------------------------
 # OPTION 2: SSH remote execution
