@@ -48,6 +48,8 @@ jobs:
           echo "base=${base}" >> "$GITHUB_OUTPUT"
           echo "extra=${extra}" >> "$GITHUB_OUTPUT"
           echo "runtime_image=${repo}:${branch}" >> "$GITHUB_OUTPUT"
+          echo "cache_base=${repo}:${branch}-buildcache" >> "$GITHUB_OUTPUT"
+          echo "cache_extra=${repo}:${branch}-extra-buildcache" >> "$GITHUB_OUTPUT"
 
       - name: Build base image (Dockerfile)
         uses: docker/build-push-action@v7
@@ -57,8 +59,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.base }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.tags.outputs.cache_base }}
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cache_base }},mode=max
 
       - name: Build extra image (Dockerfile.extra)
         uses: docker/build-push-action@v7
@@ -70,5 +72,5 @@ jobs:
           build-args: |
             RUNTIME_IMAGE=${{ steps.tags.outputs.runtime_image }}
           tags: ${{ steps.tags.outputs.extra }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ steps.tags.outputs.cache_extra }}
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cache_extra }},mode=max
