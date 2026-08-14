@@ -1,30 +1,36 @@
 ARG RUST_VERSION=1.97.1
+ARG HIMALAYA_VERSION=2.0.0
 ARG GH_CLI_VERSION=2.97.0
 ARG RUNTIME_IMAGE=docker.io/alaisterleung/hermes-agent:main
 
 FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS builder
 
-# Build Himalaya v2
-RUN cargo install himalaya
+# Himalaya v2
+ARG HIMALAYA_VERSION
+RUN curl -fsSL -o /tmp/himalaya.tgz \
+      "https://github.com/pimalaya/himalaya/releases/download/v${HIMALAYA_VERSION}/himalaya.x86_64-linux.tgz" \
+    && tar -C /tmp -xzf /tmp/himalaya.tgz \
+    && cp /tmp/himalaya /usr/local/bin/himalaya \
+    && himalaya --version
 
-# Build Buzz CLI
-RUN git clone --depth 1 https://github.com/block/buzz /tmp/buzz \
+# GitHub CLI (gh)
+ARG GH_CLI_VERSION
+RUN curl -fsSL -o /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+    && tar -C /tmp -xzf /tmp/gh.tar.gz \
+    && cp /tmp/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && gh --version
+
+# Buzz CLI
+RUN git clone --depth 1 --branch main https://github.com/block/buzz.git /tmp/buzz \
     && cd /tmp/buzz \
     && cargo build --release -p buzz-cli \
-    && cp target/release/buzz /usr/local/cargo/bin/buzz
-
-# Download GitHub CLI: gh binary from release
-ARG GH_CLI_VERSION
-ARG TARGETARCH
-RUN curl -fsSL -o /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}.tar.gz" \
-    && tar -C /tmp -xzf /tmp/gh.tar.gz \
-    && cp /tmp/gh_${GH_CLI_VERSION}_linux_${TARGETARCH}/bin/gh /usr/local/bin/gh \
-    && gh --version
+    && cp target/release/buzz /usr/local/bin/buzz \
+    && buzz --help
 
 # Extend the base Dockerfile
 FROM ${RUNTIME_IMAGE} AS runtime
 
 # Copy executables from builder stage
-COPY --from=builder /usr/local/cargo/bin/himalaya /usr/local/bin/himalaya
-COPY --from=builder /usr/local/cargo/bin/buzz /usr/local/bin/buzz
+COPY --from=builder /usr/local/bin/himalaya /usr/local/bin/himalaya
 COPY --from=builder /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=builder /usr/local/bin/buzz /usr/local/bin/buzz
