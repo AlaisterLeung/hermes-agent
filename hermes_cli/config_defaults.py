@@ -1874,6 +1874,12 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Deterministic recall indicator: when an external provider auto-recalls
+        # memory before a turn, Hermes shows a status line (e.g.
+        # "👁️ Hindsight — recalled 3 memories") so you SEE memory was used.
+        # Set false to keep recall internal: memory still injects into context,
+        # but the status line is suppressed on every surface (CLI + gateway).
+        "recall_indicator": True,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

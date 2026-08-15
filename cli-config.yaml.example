@@ -856,6 +856,13 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # Deterministic recall indicator: when an external memory provider
+  # (memory.provider) auto-recalls memory before a turn, Hermes shows a status
+  # line (e.g. "👁️ Hindsight — recalled 3 memories") on the CLI and messaging
+  # platforms so you SEE memory was used. Set false to keep recall internal —
+  # memory still injects into context, but the status line is suppressed.
+  recall_indicator: true
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

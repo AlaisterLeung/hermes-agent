@@ -1296,11 +1296,16 @@ def build_turn_context(
         # Deterministic, model-independent recall indicator: when memory was
         # actually injected this turn, tell the user — don't rely on the model
         # to surface it. Rendered by Hermes (via _emit_status), so it always
-        # shows and can't be silently dropped by the model.
+        # shows and can't be silently dropped by the model. Gate: the
+        # memory.recall_indicator config flag (agent._recall_indicator_enabled,
+        # set at init, default true) lets users keep recall internal — memory
+        # still injects into context, but the status line is suppressed.
         if ext_prefetch_cache:
             try:
                 _recall_indicator = agent._memory_manager.describe_recall()
-                if _recall_indicator:
+                if _recall_indicator and getattr(
+                    agent, "_recall_indicator_enabled", True
+                ):
                     agent._emit_status(_recall_indicator)
             except Exception:
                 pass
