@@ -709,12 +709,19 @@ def _memory_turn_start_and_prefetch(agent: Any, original_user_message: Any) -> s
     with suppress(Exception):
         if not is_trivial_prompt(_query):
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
-    # Deterministic recall indicator via _emit_status so the model can't silently
-    # drop injected memory.
+    # Deterministic, model-independent recall indicator: when memory was
+    # actually injected this turn, tell the user — don't rely on the model
+    # to surface it. Rendered by Hermes (via _emit_status), so it always
+    # shows and can't be silently dropped by the model. Gate: the
+    # memory.recall_indicator config flag (agent._recall_indicator_enabled,
+    # set at init, default true) lets users keep recall internal — memory
+    # still injects into context, but the status line is suppressed.
     if ext_prefetch_cache:
         with suppress(Exception):
             _recall_indicator = agent._memory_manager.describe_recall()
-            if _recall_indicator:
+            if _recall_indicator and getattr(
+                agent, "_recall_indicator_enabled", True
+            ):
                 agent._emit_status(_recall_indicator)
     return ext_prefetch_cache
 

@@ -1206,6 +1206,12 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "hindsight", "holographic", "retaindb", "byterover".
         "provider": "",
+        # Deterministic recall indicator: when an external provider auto-recalls
+        # memory before a turn, Hermes shows a status line (e.g.
+        # "👁️ Hindsight — recalled 3 memories") so you SEE memory was used.
+        # Set false to keep recall internal: memory still injects into context,
+        # but the status line is suppressed on every surface (CLI + gateway).
+        "recall_indicator": True,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so

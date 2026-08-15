@@ -1275,7 +1275,20 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                 )
                 agent._memory_store.load_from_disk()
 
-    # External memory provider plugin (one at a time, alongside built-in): memory.provider.
+
+    # Memory provider plugin (external — one at a time, alongside built-in)
+    # Reads memory.provider from config to select which plugin to activate.
+    # memory.recall_indicator gates the deterministic recall status line
+    # ("👁️ Hindsight — recalled 3 memories") emitted when external memory is
+    # auto-recalled before a turn. Default true preserves current behaviour;
+    # false keeps recall internal (context still injected, status suppressed).
+    agent._recall_indicator_enabled = True
+    try:
+        agent._recall_indicator_enabled = bool(
+            ((_agent_cfg or {}).get("memory") or {}).get("recall_indicator", True)
+        )
+    except Exception:
+        agent._recall_indicator_enabled = True
     agent._memory_manager = None
     if not skip_memory:
         try:
