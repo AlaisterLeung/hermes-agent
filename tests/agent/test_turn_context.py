@@ -365,6 +365,27 @@ def test_recall_indicator_skipped_when_nothing_injected():
         assert "👁️" not in str(call)
 
 
+def test_recall_indicator_suppressed_when_config_disabled():
+    """memory.recall_indicator: false keeps recall internal — no status line.
+
+    Memory still injects into context (prefetch_all runs and returns content),
+    but the deterministic indicator must not be emitted on any surface.
+    """
+    agent = _FakeAgent()
+    agent._emit_status = MagicMock()
+    agent._recall_indicator_enabled = False
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "- recalled fact"
+    mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
+    agent._memory_manager = mm
+
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    mm.describe_recall.assert_called_once()
+    for call in agent._emit_status.call_args_list:
+        assert "👁️" not in str(call)
+
+
 def test_ensure_db_session_runs_after_system_prompt_restore():
     """Regression for #45499.
 
