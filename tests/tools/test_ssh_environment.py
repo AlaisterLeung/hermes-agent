@@ -384,3 +384,74 @@ def test_cleanup_of_one_scoped_ssh_socket_does_not_terminate_sibling(
     assert len(calls) == 1
     assert f"ControlPath={first.control_socket}" in calls[0]
     assert f"ControlPath={second.control_socket}" not in calls[0]
+
+
+class TestRunBashQuoting:
+    """Guards _run_bash quoting for remote login shells that are not bash.
+    The double-quote escaping keeps the payload a single intact argument."""
+
+    @staticmethod
+    def _bare_env() -> SSHEnvironment:
+        """SSHEnvironment without __init__'s connection handshake (which
+        would spawn a real ssh process in tests)."""
+        from pathlib import Path
+        env = SSHEnvironment.__new__(SSHEnvironment)
+        env.host, env.user, env.port, env.key_path = "h", "u", 22, ""
+        env.control_socket = Path("/tmp/hermes-ssh/test.sock")
+        return env
+
+    def test_double_quote_roundtrip(self):
+        """_double_quote must produce a shell-string that round-trips the
+        original content through a POSIX shell exactly."""
+        samples = [
+            "echo hello",
+            "echo 'a'b'",
+            "echo \"double\"",
+            "x=$(echo hi); echo $x",
+            "echo `date`",
+            "back\\slash",
+            "no_quotes_here",
+            "$HOME/ûnïcode  space",
+        ]
+        for s in samples:
+            quoted = ssh_env._double_quote(s)
+            assert quoted.startswith('"') and quoted.endswith('"')
+            # Round-trip through bash.
+            out = subprocess.run(
+                ["bash", "-c", "printf '%s' " + quoted],
+                capture_output=True, text=True,
+            )
+            assert out.returncode == 0, (s, quoted, out.stderr)
+            assert out.stdout == s
+
+    def test_run_bash_uses_double_quote_escaping(self, monkeypatch):
+        """_run_bash must quote with _double_quote so the argv stays
+        parseable by non-bash login shells."""
+        import shlex
+        real_popen = subprocess.Popen
+        calls = []
+        monkeypatch.setattr(
+            ssh_env.subprocess, "Popen",
+            lambda cmd, *a, **k: (calls.append(cmd), MagicMock())[1],
+        )
+        env = self._bare_env()
+        env._run_bash("echo 'a'")
+        assert calls, "Popen was not invoked"
+        argv = calls[0]
+        assert argv[0] == "ssh"
+        # find the bash -c argument
+        assert argv[-2] == "-c"
+        payload = argv[-1]
+        assert payload.startswith('"') and payload.endswith('"')
+        # the payload must be exactly the original string as ONE argument
+        assert shlex.split(payload) == ["echo 'a'"]
+        # No single-quote splice may remain in the payload.
+        assert "\"'\"" not in payload
+        # Round-trip through bash using the real Popen.
+        monkeypatch.setattr(ssh_env.subprocess, "Popen", real_popen)
+        out = subprocess.run(
+            ["bash", "-c", "printf '%s' " + payload],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 0
+        assert out.stdout == "echo 'a'"
