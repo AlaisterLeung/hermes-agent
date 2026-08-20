@@ -411,3 +411,38 @@ def test_docker_forward_env_is_bridged_everywhere():
     assert "docker_forward_env" in _gateway_env_map_keys()
     assert "docker_forward_env" in _save_config_env_sync_keys()
     assert "TERMINAL_DOCKER_FORWARD_ENV" in _terminal_tool_env_var_names()
+
+
+def test_file_sync_ssh_pipeline_preserves_false():
+    """Pins the per-target SSH file_sync toggle through the config pipeline.
+    A false value must reach the SSHEnvironment constructor config; the
+    setting flows per-target via _get_env_config, not through flat env maps."""
+    from tools.terminal_tool import (
+        _build_environment_constructor_configs,
+        _get_env_config,
+    )
+    from tools.execution_targets import ExecutionTargetResolution
+
+    # Named-target path: resolves the target's config dict, which
+    # _get_env_config reads directly (no env bridge).
+    target_config = {
+        "backend": "ssh",
+        "env_type": "ssh",
+        "ssh_host": "example.com",
+        "ssh_user": "alice",
+        "file_sync": False,
+    }
+    canonical = _get_env_config(dict(target_config))
+    assert canonical.get("file_sync") is False
+
+    resolution = ExecutionTargetResolution(
+        target="devbox",
+        config=target_config,
+        backend="ssh",
+        named=True,
+    )
+    _, ssh_config, _ = _build_environment_constructor_configs(
+        canonical, resolution, base_task_id="t1",
+    )
+    assert ssh_config is not None
+    assert ssh_config["file_sync"] is False
