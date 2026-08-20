@@ -31,6 +31,19 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
+def _double_quote(cmd_string: str) -> str:
+    """Escape a string for use as a single double-quoted shell argument.
+
+    The result is parseable by POSIX and non-POSIX login shells alike, so
+    ``bash -c`` receives the exact original content.
+    """
+    escaped = cmd_string.replace("\\", "\\\\")
+    escaped = escaped.replace('"', '\\"')
+    escaped = escaped.replace("$", "\\$")
+    escaped = escaped.replace("`", "\\`")
+    return f'"{escaped}"'
+
+
 def _active_profile_identity() -> str:
     """Return the current Hermes profile without exposing it in socket paths."""
     try:
@@ -436,12 +449,18 @@ class SSHEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
-        """Spawn an SSH process that runs bash on the remote host."""
+        """Spawn an SSH process that runs bash on the remote host.
+
+        The command is double-quote escaped: the remote login shell parses
+        it first and may not be bash, but ``bash -c`` still receives the
+        exact original content.
+        """
         cmd = self._build_ssh_command()
+        quoted = _double_quote(cmd_string)
         if login:
-            cmd.extend(["bash", "-l", "-c", shlex.quote(cmd_string)])
+            cmd.extend(["bash", "-l", "-c", quoted])
         else:
-            cmd.extend(["bash", "-c", shlex.quote(cmd_string)])
+            cmd.extend(["bash", "-c", quoted])
 
         return _popen_bash(cmd, stdin_data)
 
