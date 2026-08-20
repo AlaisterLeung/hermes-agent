@@ -2251,6 +2251,9 @@ def _get_env_config(terminal_config: Optional[Dict[str, Any]] = None) -> Dict[st
         "ssh_user": str(_get("ssh_user", "TERMINAL_SSH_USER", "")),
         "ssh_port": _coerce(_get("ssh_port", "TERMINAL_SSH_PORT", 22), int, "integer", "ssh_port"),
         "ssh_key": str(_get("ssh_key", "TERMINAL_SSH_KEY", "")),
+        # Per-target file_sync toggle (default True): when False the
+        # SSHEnvironment skips the ~/.hermes remote mirror entirely.
+        "file_sync": _bool("file_sync", "TERMINAL_SSH_FILE_SYNC", True),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
