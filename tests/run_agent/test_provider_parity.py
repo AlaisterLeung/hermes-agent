@@ -830,6 +830,83 @@ class TestProviderRouting:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["provider"]["sort"] == "throughput"
 
+    def test_preferred_min_throughput_bare_number(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_min_throughput = 50
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["preferred_min_throughput"] == {"p50": 50.0}
+
+    def test_preferred_min_throughput_percentile_object(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_min_throughput = {"p50": 40, "p90": 50, "p99": 60}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["preferred_min_throughput"] == {
+            "p50": 40.0,
+            "p90": 50.0,
+            "p99": 60.0,
+        }
+
+    def test_preferred_max_latency_bare_number(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_max_latency = 2.5
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["preferred_max_latency"] == {"p50": 2.5}
+
+    def test_preferred_max_latency_percentile_object(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_max_latency = {"p50": 1.0, "p75": 2.0}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["preferred_max_latency"] == {"p50": 1.0, "p75": 2.0}
+
+    def test_preferred_both_combined_with_sort(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_sort = "price"
+        agent.provider_preferred_min_throughput = {"p90": 50}
+        agent.provider_preferred_max_latency = 3
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["sort"] == "price"
+        assert provider["preferred_min_throughput"] == {"p90": 50.0}
+        assert provider["preferred_max_latency"] == {"p50": 3.0}
+
+    def test_preferred_invalid_value_omitted(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_min_throughput = "fast"
+        agent.provider_preferred_max_latency = {"p9x": 1}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = (kwargs.get("extra_body") or {}).get("provider", {})
+        assert "preferred_min_throughput" not in provider
+        assert "preferred_max_latency" not in provider
+
+    def test_preferred_unknown_percentile_dropped(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_min_throughput = {"p50": 10, "p9x": 20, "p99": 30}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = kwargs["extra_body"]["provider"]
+        assert provider["preferred_min_throughput"] == {"p50": 10.0, "p99": 30.0}
+
+    def test_preferred_nonpositive_rejected(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_preferred_min_throughput = 0
+        agent.provider_preferred_max_latency = {"p50": -1}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        provider = (kwargs.get("extra_body") or {}).get("provider", {})
+        assert "preferred_min_throughput" not in provider
+        assert "preferred_max_latency" not in provider
+
+    def test_preferred_not_sent_for_direct_providers(self, monkeypatch):
+        """Performance prefs must not leak onto direct (non-aggregator) providers."""
+        agent = _make_agent(monkeypatch, "anthropic")
+        agent.provider_preferred_min_throughput = 50
+        agent.provider_preferred_max_latency = {"p90": 2}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "provider" not in (kwargs.get("extra_body") or {})
+
+
 
 
 
