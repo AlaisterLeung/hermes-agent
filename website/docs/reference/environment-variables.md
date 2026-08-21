@@ -931,6 +931,8 @@ These go in `~/.hermes/config.yaml` under the `provider_routing` section:
 | `order` | List of provider slugs to try in order |
 | `require_parameters` | Only use providers supporting all request params (`true`/`false`) |
 | `data_collection` | `"allow"` (default) or `"deny"` to exclude data-storing providers |
+| `preferred_min_throughput` | Min throughput pref in tok/s — number (p50) or `{p50,p75,p90,p99}` |
+| `preferred_max_latency` | Max latency pref in seconds — number (p50) or `{p50,p75,p90,p99}` |
 
 :::tip
 Use `hermes config set` to set environment variables — it automatically saves them to the right file (`.env` for secrets, `config.yaml` for everything else).

@@ -560,6 +560,101 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
+# Percentile keys OpenRouter accepts for performance-threshold preferences
+# (preferred_min_throughput / preferred_max_latency). Values are tokens/sec
+# and seconds respectively. Any subset may be present.
+_OPENROUTER_PERF_PERCENTILES = {"p50", "p75", "p90", "p99"}
+
+
+def _validated_openrouter_perf_value(
+    raw: Any, *, label: str
+) -> Optional[Dict[str, Any]]:
+    """Validate a performance-threshold pref into OpenRouter's wire shape.
+
+    Accepts either a bare number (applies to the p50 percentile) or an object
+    with any subset of p50/p75/p90/p99 cutoffs. Returns None (pref omitted)
+    when the value is absent, malformed, or non-resolvable — mirroring the
+    fail-open behavior of the other routing preferences. Unknown keys are
+    dropped, never forwarded.
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):  # bool is an int subclass — reject early
+        logger.warning(
+            "Ignoring invalid OpenRouter %s value %r (expected number or {p50,p75,p90,p99})",
+            label,
+            raw,
+        )
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            logger.warning(
+                "Ignoring invalid OpenRouter %s value %r (must be positive)",
+                label,
+                raw,
+            )
+            return None
+        return {"p50": value}
+    if isinstance(raw, dict):
+        cutoffs: Dict[str, Any] = {}
+        for key, val in raw.items():
+            if key not in _OPENROUTER_PERF_PERCENTILES:
+                logger.warning(
+                    "Ignoring unknown percentile %r in OpenRouter %s "
+                    "(allowed: %s)",
+                    key,
+                    label,
+                    ", ".join(sorted(_OPENROUTER_PERF_PERCENTILES)),
+                )
+                continue
+            if isinstance(val, bool):
+                logger.warning(
+                    "Ignoring invalid OpenRouter %s percentile %s value %r",
+                    label,
+                    key,
+                    val,
+                )
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring invalid OpenRouter %s percentile %s value %r",
+                    label,
+                    key,
+                    val,
+                )
+                continue
+            if num <= 0:
+                logger.warning(
+                    "Ignoring non-positive OpenRouter %s percentile %s value %r",
+                    label,
+                    key,
+                    val,
+                )
+                continue
+            cutoffs[key] = num
+        if not cutoffs:
+            logger.warning(
+                "Ignoring OpenRouter %s object with no resolvable percentile values: %r",
+                label,
+                raw,
+            )
+            return None
+        return cutoffs
+    logger.warning(
+        "Ignoring invalid OpenRouter %s value %r (must be a number or an object "
+        "with p50/p75/p90/p99)",
+        label,
+        raw,
+    )
+    return None
+
+
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths."""
     preferences: Dict[str, Any] = {}
@@ -576,6 +671,16 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
+    min_throughput = _validated_openrouter_perf_value(
+        agent.provider_preferred_min_throughput, label="preferred_min_throughput"
+    )
+    if min_throughput is not None:
+        preferences["preferred_min_throughput"] = min_throughput
+    max_latency = _validated_openrouter_perf_value(
+        agent.provider_preferred_max_latency, label="preferred_max_latency"
+    )
+    if max_latency is not None:
+        preferences["preferred_max_latency"] = max_latency
     return preferences
 
 
