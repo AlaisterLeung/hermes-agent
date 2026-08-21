@@ -5356,6 +5356,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
+        self._provider_preferred_min_throughput = pr.get("preferred_min_throughput")
+        self._provider_preferred_max_latency = pr.get("preferred_max_latency")
 
         # OpenRouter Pareto Code router knob — coding-score floor (0.0-1.0).
         # Only applied when model.model == "openrouter/pareto-code".

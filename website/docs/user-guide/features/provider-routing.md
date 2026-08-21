@@ -27,6 +27,8 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  preferred_min_throughput: 50   # tokens/sec — number (p50) or {p50,p75,p90,p99} cutoffs
+  preferred_max_latency: 2.0     # seconds — number (p50) or {p50,p75,p90,p99} cutoffs
 ```
 
 :::info
@@ -102,6 +104,23 @@ provider_routing:
   data_collection: "deny"
 ```
 
+### `preferred_min_throughput`
+
+Preferred minimum throughput in tokens per second. Providers/models that meet the threshold are preferred; those that don't are deprioritized, never excluded — the request always executes. Accepts a bare number (applies to the p50 percentile) or an object with any subset of the four percentiles:
+
+```yaml
+provider_routing:
+  preferred_min_throughput: 50            # p50 cutoff
+  preferred_max_latency: {p50: 1.5, p90: 3.0}   # or percentile cutoffs
+```
+
+| Key | Description |
+|-----|-------------|
+| `preferred_min_throughput` | Number (tokens/sec, p50) or `{p50, p75, p90, p99}` cutoffs |
+| `preferred_max_latency` | Number (seconds, p50) or `{p50, p75, p90, p99}` cutoffs |
+
+Both follow OpenRouter's performance-threshold semantics: endpoints failing the thresholds are moved to the end of the routing list rather than excluded, so a request is never blocked by an unmet preference. Unknown percentile keys are ignored.
+
 ## Practical Examples
 
 ### Optimize for Cost
@@ -129,6 +148,8 @@ Best for long-form generation where tokens-per-second matters:
 ```yaml
 provider_routing:
   sort: "throughput"
+  preferred_min_throughput: {p50: 40, p90: 50}
+  preferred_max_latency: 2.5
 ```
 
 ### Lock to Specific Providers
@@ -181,6 +202,8 @@ providers_order    ← from provider_routing.order
 provider_sort      ← from provider_routing.sort
 provider_require_parameters ← from provider_routing.require_parameters
 provider_data_collection    ← from provider_routing.data_collection
+provider_preferred_min_throughput ← from provider_routing.preferred_min_throughput
+provider_preferred_max_latency    ← from provider_routing.preferred_max_latency
 ```
 
 :::tip
