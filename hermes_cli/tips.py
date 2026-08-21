@@ -374,6 +374,7 @@ TIPS = [
     'use_gateway: true per-tool routes web, image, tts, or browser through your Nous subscription — no extra keys.',
     'provider_routing.data_collection: deny excludes data-storing providers on OpenRouter.',
     'provider_routing.require_parameters: true only routes to providers that support every param in your request.',
+    'provider_routing.preferred_min_throughput / preferred_max_latency: prefer providers meeting throughput/latency thresholds (number = p50, or p50/p75/p90/p99 cutoffs).',
 
     # --- TUI & Dashboard ---
     'HERMES_TUI_RESUME=1 auto-re-attaches to the most recent TUI session on launch — handy after SSH drops.',
