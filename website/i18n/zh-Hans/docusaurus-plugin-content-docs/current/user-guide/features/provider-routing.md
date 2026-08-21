@@ -17,12 +17,14 @@ OpenRouter 将请求路由到多个 provider（例如 Anthropic、Google、AWS B
 
 ```yaml
 provider_routing:
-  sort: "price"           # 如何对 provider 排序
-  only: []                # 白名单：仅使用这些 provider
-  ignore: []              # 黑名单：永不使用这些 provider
-  order: []               # 显式 provider 优先级顺序
-  require_parameters: false  # 仅使用支持所有参数的 provider
+  sort: "price"           # 如何排序提供商
+  only: []                # 白名单：仅使用这些提供商
+  ignore: []              # 黑名单：绝不使用这些提供商
+  order: []               # 显式提供商优先级顺序
+  require_parameters: false  # 仅使用支持所有参数的提供商
   data_collection: null   # 控制数据收集（"allow" 或 "deny"）
+  preferred_min_throughput: 50   # tokens/sec — 数字 (p50) 或 {p50,p75,p90,p99} cutoffs
+  preferred_max_latency: 2.0     # 秒 — 数字 (p50) 或 {p50,p75,p90,p99} cutoffs
 ```
 
 :::info
