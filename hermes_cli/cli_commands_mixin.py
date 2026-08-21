@@ -2241,6 +2241,8 @@ class CLICommandsMixin:
                     provider_sort=self._provider_sort,
                     provider_require_parameters=self._provider_require_params,
                     provider_data_collection=self._provider_data_collection,
+                    provider_preferred_min_throughput=self._provider_preferred_min_throughput,
+                    provider_preferred_max_latency=self._provider_preferred_max_latency,
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
                 )

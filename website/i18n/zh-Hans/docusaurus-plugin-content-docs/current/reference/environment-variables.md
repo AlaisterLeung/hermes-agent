@@ -672,6 +672,8 @@ fallback_providers:
 | `order` | 按顺序尝试的提供商 slug 列表 |
 | `require_parameters` | 仅使用支持所有请求参数的提供商（`true`/`false`） |
 | `data_collection` | `"allow"`（默认）或 `"deny"` 以排除存储数据的提供商 |
+| `preferred_min_throughput` | 首选最低吞吐量 (tokens/sec) — 数字 (p50) 或 `{p50,p75,p90,p99}` cutoffs |
+| `preferred_max_latency` | 首选最大延迟 (秒) — 数字 (p50) 或 `{p50,p75,p90,p99}` cutoffs |
 
 :::tip
 使用 `hermes config set` 设置环境变量——它会自动将其保存到正确的文件（密钥保存到 `.env`，其他所有内容保存到 `config.yaml`）。

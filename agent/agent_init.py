@@ -536,6 +536,8 @@ def init_agent(
     provider_sort: str = None,
     provider_require_parameters: bool = False,
     provider_data_collection: str = None,
+    provider_preferred_min_throughput: Any = None,
+    provider_preferred_max_latency: Any = None,
     openrouter_min_coding_score: Optional[float] = None,
     session_id: str = None,
     tool_progress_callback: callable = None,
@@ -613,6 +615,12 @@ def init_agent(
         providers_ignored (List[str]): OpenRouter providers to ignore (optional)
         providers_order (List[str]): OpenRouter providers to try in order (optional)
         provider_sort (str): Sort providers by price/throughput/latency (optional)
+        provider_require_parameters (bool): Only route to providers supporting all request params
+        provider_data_collection (str): \"allow\" or \"deny\" — exclude data-storing providers
+        provider_preferred_min_throughput (number | dict): Preferred min throughput in
+            tokens/sec — bare number applies to p50, or {p50,p75,p90,p99} cutoffs
+        provider_preferred_max_latency (number | dict): Preferred max latency in seconds —
+            bare number applies to p50, or {p50,p75,p90,p99} cutoffs
         openrouter_min_coding_score (float): Coding-score floor (0.0-1.0) for the
             openrouter/pareto-code router. Only applied when model == "openrouter/pareto-code".
             None or empty = let OpenRouter pick the strongest available coder.
@@ -924,6 +932,8 @@ def init_agent(
     agent.provider_sort = provider_sort
     agent.provider_require_parameters = provider_require_parameters
     agent.provider_data_collection = provider_data_collection
+    agent.provider_preferred_min_throughput = provider_preferred_min_throughput
+    agent.provider_preferred_max_latency = provider_preferred_max_latency
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
     # Store toolset filtering options

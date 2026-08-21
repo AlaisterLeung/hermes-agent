@@ -6729,6 +6729,12 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
             agent, "provider_require_parameters", False
         ),
         "provider_data_collection": getattr(agent, "provider_data_collection", None),
+        "provider_preferred_min_throughput": getattr(
+            agent, "provider_preferred_min_throughput", None
+        ),
+        "provider_preferred_max_latency": getattr(
+            agent, "provider_preferred_max_latency", None
+        ),
         "openrouter_min_coding_score": getattr(agent, "openrouter_min_coding_score", None),
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
@@ -7222,6 +7228,8 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
+        provider_preferred_min_throughput=_pr.get("preferred_min_throughput"),
+        provider_preferred_max_latency=_pr.get("preferred_max_latency"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
