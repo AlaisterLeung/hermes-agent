@@ -1876,6 +1876,12 @@ def _build_child_agent(
     child_provider_data_collection = getattr(
         parent_agent, "provider_data_collection", None
     ) or ""
+    child_provider_preferred_min_throughput = getattr(
+        parent_agent, "provider_preferred_min_throughput", None
+    )
+    child_provider_preferred_max_latency = getattr(
+        parent_agent, "provider_preferred_max_latency", None
+    )
     child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
     if override_provider:
         child_providers_allowed = None
@@ -1884,6 +1890,8 @@ def _build_child_agent(
         child_provider_sort = None
         child_provider_require_parameters = False
         child_provider_data_collection = ""
+        child_provider_preferred_min_throughput = None
+        child_provider_preferred_max_latency = None
         # Note: openrouter_min_coding_score is model-gated (only emitted on
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
@@ -1965,6 +1973,8 @@ def _build_child_agent(
                 provider_sort=child_provider_sort,
                 provider_require_parameters=child_provider_require_parameters,
                 provider_data_collection=child_provider_data_collection,
+                provider_preferred_min_throughput=child_provider_preferred_min_throughput,
+                provider_preferred_max_latency=child_provider_preferred_max_latency,
                 request_overrides=(
                     dict(override_request_overrides or {})
                     if override_provider
