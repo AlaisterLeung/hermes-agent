@@ -2251,6 +2251,82 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return SendResult(success=True, message_id=last_event_id)
 
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a fresh Matrix thread rooted in ``parent_chat_id``.
+
+        Implements the base-class handoff hook so continuable cron
+        deliveries can open a dedicated thread instead of falling back to
+        the flat-room mirror.
+
+        The root is a minimal plain-text event whose body is ``name``;
+        the scheduler delivers the brief into the thread afterwards via
+        :meth:`send` with ``metadata.thread_id`` set to the returned id,
+        then seeds the thread-keyed session once delivery is confirmed.
+
+        Accepts a ``!room:server`` room id directly, or a ``#alias:server``
+        room alias which is resolved through the directory API first.
+
+        Returns the thread-root event id, or ``None`` when the client is
+        disconnected, the target cannot be resolved, or the homeserver
+        rejects the send — callers treat ``None`` as "fall back to flat
+        delivery" and never fail the run.
+        """
+        if not self._client:
+            logger.debug("Matrix: create_handoff_thread skipped — client not connected")
+            return None
+
+        room_id = str(parent_chat_id or "").strip()
+        if not room_id:
+            return None
+
+        try:
+            if room_id.startswith("#"):
+                # Room alias → resolve via /directory/room/{alias}. The alias
+                # must be URL-quoted: '#' and ':' are reserved characters.
+                from urllib.parse import quote
+
+                resolved = await asyncio.wait_for(
+                    self._client.api.request(
+                        "GET",
+                        f"/_matrix/client/v3/directory/room/{quote(room_id, safe='')}",
+                    ),
+                    timeout=30,
+                )
+                room_id = str((resolved or {}).get("room_id") or "").strip()
+                if not room_id:
+                    logger.debug(
+                        "Matrix: create_handoff_thread — alias %s resolved to no room",
+                        parent_chat_id,
+                    )
+                    return None
+
+            msg_content: Dict[str, Any] = {"msgtype": "m.text", "body": name}
+            event_id = await asyncio.wait_for(
+                self._client.send_message_event(
+                    RoomID(room_id),
+                    EventType.ROOM_MESSAGE,
+                    msg_content,
+                ),
+                timeout=30,
+            )
+            root = str(event_id)
+            logger.info(
+                "Matrix: opened continuable thread root %s in %s (%s)",
+                root, room_id, name,
+            )
+            return root
+        except Exception as exc:
+            logger.warning(
+                "Matrix: create_handoff_thread failed for %s (%s) — falling "
+                "back to flat delivery: %s",
+                parent_chat_id, name, exc,
+            )
+            return None
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return room name and type (dm/group)."""
         identity = await self._resolve_room_identity(chat_id)
