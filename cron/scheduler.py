@@ -37,7 +37,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Optional, Protocol, cast
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -1790,6 +1790,7 @@ def _seed_cron_thread_session(
     chat_name: Optional[str] = None,
     is_dm: bool = False,
     scope_id: Optional[str] = None,
+    loop=None,
 ) -> None:
     """Seed the freshly-opened cron thread's session with the brief.
 
@@ -1810,11 +1811,24 @@ def _seed_cron_thread_session(
     ``chat_type="dm"`` because the user's in-thread DM reply arrives with
     chat_type="dm" and ``build_session_key`` routes DM threads through the DM
     arm (``...:dm:<chat>:<thread>``) — a "thread"-typed seed lands in
-    ``...:thread:<chat>:<thread>``, a row no DM reply ever resolves to
-    (continuation amnesia, Alice live 2026-08-20, job 8e21a957b77b). Channel
-    threads keep ``chat_type="thread"`` (their replies really do arrive as
-    threads). Same sibling-lane class as the flat seed's ``is_dm``
-    (dcca9d8cfe).
+    ``...:thread:<chat>:<thread>``, a row no DM reply ever resolves to.
+    Channel threads keep ``chat_type="thread"`` (their replies really do
+    arrive as threads).
+
+    Matrix rooms are the third lane: an inbound in-thread ROOM reply arrives
+    with chat_type="group" and NO user component, while the historical default
+    here seeds chat_type="thread" + user_id="system:cron" — divergent keys, so
+    the reply lands in a fresh empty session. For matrix ORIGINS we therefore
+    seed chat_type="group" without the synthetic user.
+
+    The dm/group split must reflect how the ADAPTER classifies the target at
+    runtime, not job metadata: Matrix classifies rooms live via
+    ``_is_dm_room`` (member count + m.direct), so a small named room can be a
+    group to metadata but a DM to the adapter. When the two disagree, the
+    seeded key lands in the wrong arm and the reply amnesias. For matrix we
+    therefore re-resolve is_dm through the adapter (direct await when a loop
+    is running on this thread, a fresh event loop when not); every other
+    platform keeps the caller's value.
 
     Mirrors ``GatewayRunner._process_handoff``'s seed step, but standalone:
     cron reaches the live ``SessionStore`` through the adapter's
@@ -1828,6 +1842,53 @@ def _seed_cron_thread_session(
         from gateway.config import Platform
         from gateway.session import SessionSource
 
+        # Re-resolve DM-ness from the adapter for matrix: job metadata and the
+        # adapter's live room classification (member count + m.direct) can
+        # disagree, and the seed key must match the arm the REPLY will take.
+        try:
+            if Platform(platform_name.lower()) == Platform.MATRIX:
+                resolve_dm = getattr(adapter, "_is_dm_room", None)
+                if callable(resolve_dm):
+                    import asyncio as _asyncio
+
+                    probe = cast(Any, resolve_dm(str(chat_id)))
+
+                    async def _probe_dm() -> bool:
+                        return bool(
+                            await _asyncio.wait_for(probe, timeout=15)
+                        )
+
+                    on_loop: Any = None
+                    try:
+                        on_loop = _asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    if on_loop is not None:
+                        # Running on the loop's own thread — blocking on it
+                        # would deadlock; keep the metadata value.
+                        logger.debug(
+                            "Job '%s': skipping live DM re-resolution on %s:%s "
+                            "(called from loop thread)",
+                            job.get("id", "?"), platform_name, chat_id,
+                        )
+                    elif (
+                        loop is not None
+                        and not loop.is_closed()
+                    ):
+                        is_dm = bool(
+                            _asyncio.run_coroutine_threadsafe(
+                                _probe_dm(), loop
+                            ).result(timeout=25)
+                        )
+                    else:
+                        is_dm = bool(_asyncio.run(_probe_dm()))
+        except Exception:
+            logger.debug(
+                "Job '%s': live DM re-resolution failed for %s:%s — using "
+                "metadata value (%s)",
+                job.get("id", "?"), platform_name, chat_id, is_dm,
+            )
+
         seeded_session_id: Optional[str] = None
         session_store = getattr(adapter, "_session_store", None)
         if session_store is not None:
@@ -1835,6 +1896,11 @@ def _seed_cron_thread_session(
                 platform_enum = Platform(platform_name.lower())
             except (ValueError, KeyError):
                 platform_enum = None
+            # Matrix room threads: participant-shared key (group, no user).
+            # Computed BEFORE the Discord chat_id branch so both compose.
+            _matrix_room_seed = (
+                platform_enum == Platform.MATRIX and not is_dm
+            )
             if platform_enum is not None:
                 # Discord thread destinations must key on the thread's OWN id
                 # to match how the Discord adapter keys organic in-thread
@@ -1852,9 +1918,14 @@ def _seed_cron_thread_session(
                     chat_name=chat_name,
                     # DM threads key through the DM arm (see docstring); the
                     # reply's chat_type is what the seed must reproduce.
-                    chat_type="dm" if is_dm else "thread",
-                    user_id="system:cron",
-                    user_name="Cron",
+                    # Matrix ROOM threads key "group" with no user (see
+                    # docstring) — everything else keeps the historical
+                    # "thread" + system:cron shape byte-for-byte.
+                    chat_type=(
+                        "dm" if is_dm else ("group" if _matrix_room_seed else "thread")
+                    ),
+                    user_id=None if _matrix_room_seed else "system:cron",
+                    user_name=None if _matrix_room_seed else "Cron",
                     thread_id=str(thread_id),
                     scope_id=str(scope_id) if scope_id else None,
                 )
@@ -3476,6 +3547,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                             is_dm=is_dm_target,
                             scope_id=origin.get("scope_id"),
+                            loop=loop,
                         )
                         thread_seeded = True
                     # in_channel surface: CREATE + seed the flat channel/DM
@@ -3518,6 +3590,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 chat_name=origin.get("chat_name"),
                                 is_dm=is_dm_target,
                                 scope_id=origin.get("scope_id"),
+                                loop=loop,
                             )
                     elif in_channel_surface and not origin_target:
                         logger.warning(
