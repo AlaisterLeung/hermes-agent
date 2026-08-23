@@ -268,53 +268,42 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
-    """Tick the cron scheduler from inside the desktop dashboard backend.
+    """Watch for due cron jobs from inside the dashboard backend — forward only.
 
-    The scheduler tick loop normally lives in ``hermes gateway run`` — but the
-    desktop app spawns a ``hermes dashboard`` backend, not a gateway, so a cron
-    a user creates in the app would never fire. We run the resolved cron
-    scheduler provider here (no live adapters; delivery falls back to the
-    per-platform send path).
+    The dashboard process owns no live platform adapters, so it must not
+    execute cron jobs locally: the standalone send path cannot serve E2EE
+    rooms or relay-fronted logical platforms, and without the gateway's
+    session context a continuable delivery (thread open + brief seed) is
+    impossible — user replies would land in empty sessions. This ticker
+    therefore never runs jobs itself; each sweep forwards every due job to
+    the gateway api_server's cron-fire endpoint, which claims (store CAS,
+    at-most-once preserved even against a racing gateway tick) and executes
+    with live adapters. An unreachable gateway leaves jobs due and stamps
+    ``last_fire_error`` so the miss surfaces in ``cronjob list``.
 
-    Every local profile's store is ticked, not just this backend's own
-    (#69377's desktop sibling): the desktop pools per-profile backends and
-    reaps them after ~10 idle minutes, so a secondary profile's ticker dies
-    with its backend and that profile's jobs silently stop firing until the
-    user next opens it ("tasks on the sleeping profile could be idle" —
-    community report, Aug 2026). The primary backend outlives the pool, so it
-    owns every profile's tick, exactly like a multiplex gateway. External
-    providers keep the single-store behavior — their registries are not
-    profile-scoped (see _notify_cron_provider_for_profile).
-
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the per-store ``cron/.tick.lock`` file lock, so this never double-fires
-    alongside a real gateway or a live pool backend on the same profile home —
-    whichever process grabs the lock first wins the tick.
+    Upstream #69377 later added a multi-profile in-process ticker so a
+    sleeping desktop profile's jobs keep firing. That local-execution
+    contract is incompatible with adapter-less dashboard delivery; the
+    fork keeps gateway-forwarding. Multiplex profile coverage belongs on
+    the gateway ticker (which owns live adapters), not here.
     """
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    from cron.scheduler_provider import GatewayForwardingCronScheduler
 
-    provider = resolve_cron_scheduler()
+    def _fire_url() -> str:
+        _profile_name, home = _cron_profile_home(None)
+        return _gateway_fire_endpoint(_profile_name, home)
 
-    start_kwargs: dict = {"interval": interval}
-    if isinstance(provider, InProcessCronScheduler):
-        try:
-            from hermes_cli.profiles import profiles_to_serve
+    def _api_key() -> str:
+        from agent.secret_scope import get_secret
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
-                start_kwargs["profile_homes"] = profile_homes
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
-        except Exception:
-            # Fail open to the single-store ticker — the active profile's
-            # jobs must keep firing even if profile enumeration breaks.
-            _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
+        return get_secret("API_SERVER_KEY", "") or ""
 
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, **start_kwargs)
+    provider = GatewayForwardingCronScheduler(_fire_url, _api_key)
+    _log.info(
+        "Desktop cron scheduler started (provider=%s, interval=%ds)",
+        provider.name, interval,
+    )
+    provider.start(stop_event, interval=interval)
 
 
 def _warm_gateway_module() -> None:
@@ -13129,37 +13118,46 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
+    """Run a job NOW on behalf of the dashboard's trigger button.
+
+    Execution belongs to the GATEWAY process (live platform adapters, session
+    context) — the same rule the desktop ticker and the Chronos webhook door
+    already follow. The dashboard never executes the job locally: it forwards
+    the fire to the gateway api_server, which claims via the store CAS (so a
+    concurrent ticker or retry cannot double-run) and runs with live adapters.
+    Paused jobs pass ``force`` so the claim resumes-and-fires atomically; an
+    unreachable gateway surfaces as 503 to the dashboard caller instead of a
+    silent standalone-path delivery from this process.
+    """
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Do not expose the job as due before claiming it: the built-in ticker and
-    # external/manual fire paths share the same durable claim, so only one can
-    # execute this selected run even if they race across processes. Active jobs
-    # keep the legacy provider call shape; paused jobs need the explicit force
-    # flag to resume and claim atomically.
     force = not job.get("enabled", True) or job.get("state") == "paused"
-    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
-    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
-    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
-        return refreshed
-    if not ran:
+    forwarded = _forward_cron_fire_to_gateway_sync(selected, job["id"], force=force)
+    if forwarded is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway is unreachable; the job stays due — start the "
+            "gateway (or its api_server adapter) and trigger again",
+        )
+    status_code, gateway_body = forwarded
+    if status_code == 503:
+        raise HTTPException(status_code=503, detail=gateway_body.get("error", "cron fire admission failed"))
+    if status_code == 200 and gateway_body.get("status") in ("duplicate", "gone"):
+        # The gateway's CAS claim was already held (a ticker fire, a retry,
+        # or the job vanished) — surface it like a lost claim instead of
+        # reporting success on a run this trigger did not cause.
         raise HTTPException(
             status_code=409,
             detail="Job is already running or was claimed by another scheduler",
         )
+    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
     if refreshed:
         return refreshed
-    # A one-shot may remove itself after exhausting repeat=1. Keep the response
-    # shape compatible without inventing an outcome that is no longer present
-    # in the job store; authoritative list refresh removes the completed row.
-    return {
-        **job,
-        "enabled": False,
-        "state": "completed",
-    }
+    return {"ok": True, "gateway_status": status_code, "job_id": job["id"]}
 
 
 
@@ -13179,14 +13177,59 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
+def _forward_cron_fire_to_gateway_sync(
+    profile: str,
+    job_id: str,
+    *,
+    force: bool = False,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Forward a manual dashboard trigger to the gateway (blocking variant).
+
+    Same destination and auth as :func:`_forward_cron_fire_to_gateway` — the
+    gateway api_server's cron-fire route, authenticated with API_SERVER_KEY —
+    but synchronous so the existing cron-dashboard threadpool wrapper can call
+    it like the other ``*_sync`` workers. ``force`` rides in the body for
+    paused-job triggers; the gateway's claim path resumes-and-claims
+    atomically. Returns ``(status_code, body)`` or ``None`` when the gateway
+    is unreachable; the caller maps that to 503 rather than executing here.
+    """
+    _profile_name, home = _cron_profile_home(profile)
+    url = _gateway_fire_endpoint(_profile_name, home)
+    from agent.secret_scope import get_secret
+
+    api_key = get_secret("API_SERVER_KEY", "") or ""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url,
+                json={"job_id": job_id, "force": force},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception as exc:
+        _log.warning(
+            "manual cron trigger for %s could not reach the gateway fire "
+            "endpoint %s (%s: %s)",
+            job_id, url, type(exc).__name__, exc,
+        )
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": (resp.text or "")[:500]}
+    if not isinstance(body, dict):
+        body = {"raw": body}
+    return resp.status_code, body
+
+
 def _fire_cron_job_for_profile(
     profile: str,
     job_id: str,
     *,
     force: bool = False,
 ) -> bool:
-    """DEPRECATED for NAS webhook fires (superseded by gateway forwarding);
-    retained for the dashboard trigger path — do not add new uses.
+    """DEPRECATED — superseded by gateway forwarding on every fire path.
 
     Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
