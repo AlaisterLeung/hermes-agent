@@ -6797,6 +6797,9 @@ class APIServerAdapter(BasePlatformAdapter):
             job_id = (body or {}).get("job_id")
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
+            # Manual dashboard triggers ride the same endpoint and pass
+            # force=True for paused jobs; scheduled fires never send it.
+            force_claim = bool((body or {}).get("force"))
 
             from cron.scheduler_provider import (
                 provider_supports_split_fire,
@@ -6852,7 +6855,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Persist the attempt and exact store owner before acknowledging NAS.
             # A failure here is retryable and the reservation remains attached.
             try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                claimed_job = await asyncio.to_thread(
+                    provider.claim_fire, job_id, force=force_claim
+                )
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response(

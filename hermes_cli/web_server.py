@@ -12937,37 +12937,46 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
+    """Run a job NOW on behalf of the dashboard's trigger button.
+
+    Execution belongs to the GATEWAY process (live platform adapters, session
+    context) — the same rule the desktop ticker and the Chronos webhook door
+    already follow. The dashboard never executes the job locally: it forwards
+    the fire to the gateway api_server, which claims via the store CAS (so a
+    concurrent ticker or retry cannot double-run) and runs with live adapters.
+    Paused jobs pass ``force`` so the claim resumes-and-fires atomically; an
+    unreachable gateway surfaces as 503 to the dashboard caller instead of a
+    silent standalone-path delivery from this process.
+    """
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Do not expose the job as due before claiming it: the built-in ticker and
-    # external/manual fire paths share the same durable claim, so only one can
-    # execute this selected run even if they race across processes. Active jobs
-    # keep the legacy provider call shape; paused jobs need the explicit force
-    # flag to resume and claim atomically.
     force = not job.get("enabled", True) or job.get("state") == "paused"
-    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
-    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
-    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
-        return refreshed
-    if not ran:
+    forwarded = _forward_cron_fire_to_gateway_sync(selected, job["id"], force=force)
+    if forwarded is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway is unreachable; the job stays due — start the "
+            "gateway (or its api_server adapter) and trigger again",
+        )
+    status_code, gateway_body = forwarded
+    if status_code == 503:
+        raise HTTPException(status_code=503, detail=gateway_body.get("error", "cron fire admission failed"))
+    if status_code == 200 and gateway_body.get("status") in ("duplicate", "gone"):
+        # The gateway's CAS claim was already held (a ticker fire, a retry,
+        # or the job vanished) — surface it like a lost claim instead of
+        # reporting success on a run this trigger did not cause.
         raise HTTPException(
             status_code=409,
             detail="Job is already running or was claimed by another scheduler",
         )
+    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
     if refreshed:
         return refreshed
-    # A one-shot may remove itself after exhausting repeat=1. Keep the response
-    # shape compatible without inventing an outcome that is no longer present
-    # in the job store; authoritative list refresh removes the completed row.
-    return {
-        **job,
-        "enabled": False,
-        "state": "completed",
-    }
+    return {"ok": True, "gateway_status": status_code, "job_id": job["id"]}
 
 
 
@@ -12987,14 +12996,59 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
+def _forward_cron_fire_to_gateway_sync(
+    profile: str,
+    job_id: str,
+    *,
+    force: bool = False,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Forward a manual dashboard trigger to the gateway (blocking variant).
+
+    Same destination and auth as :func:`_forward_cron_fire_to_gateway` — the
+    gateway api_server's cron-fire route, authenticated with API_SERVER_KEY —
+    but synchronous so the existing cron-dashboard threadpool wrapper can call
+    it like the other ``*_sync`` workers. ``force`` rides in the body for
+    paused-job triggers; the gateway's claim path resumes-and-claims
+    atomically. Returns ``(status_code, body)`` or ``None`` when the gateway
+    is unreachable; the caller maps that to 503 rather than executing here.
+    """
+    _profile_name, home = _cron_profile_home(profile)
+    url = _gateway_fire_endpoint(_profile_name, home)
+    from agent.secret_scope import get_secret
+
+    api_key = get_secret("API_SERVER_KEY", "") or ""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url,
+                json={"job_id": job_id, "force": force},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception as exc:
+        _log.warning(
+            "manual cron trigger for %s could not reach the gateway fire "
+            "endpoint %s (%s: %s)",
+            job_id, url, type(exc).__name__, exc,
+        )
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": (resp.text or "")[:500]}
+    if not isinstance(body, dict):
+        body = {"raw": body}
+    return resp.status_code, body
+
+
 def _fire_cron_job_for_profile(
     profile: str,
     job_id: str,
     *,
     force: bool = False,
 ) -> bool:
-    """DEPRECATED for NAS webhook fires (superseded by gateway forwarding);
-    retained for the dashboard trigger path — do not add new uses.
+    """DEPRECATED — superseded by gateway forwarding on every fire path.
 
     Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
