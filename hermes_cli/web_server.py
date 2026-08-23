@@ -263,23 +263,35 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
-    """Tick the cron scheduler from inside the desktop dashboard backend.
+    """Watch for due cron jobs from inside the dashboard backend — forward only.
 
-    The scheduler tick loop normally lives in ``hermes gateway run`` — but the
-    desktop app spawns a ``hermes dashboard`` backend, not a gateway, so a cron
-    a user creates in the app would never fire. We run the resolved cron
-    scheduler provider here (no live adapters; delivery falls back to the
-    per-platform send path).
-
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    The dashboard process owns no live platform adapters, so it must not
+    execute cron jobs locally: the standalone send path cannot serve E2EE
+    rooms or relay-fronted logical platforms, and without the gateway's
+    session context a continuable delivery (thread open + brief seed) is
+    impossible — user replies would land in empty sessions. This ticker
+    therefore never runs jobs itself; each sweep forwards every due job to
+    the gateway api_server's cron-fire endpoint, which claims (store CAS,
+    at-most-once preserved even against a racing gateway tick) and executes
+    with live adapters. An unreachable gateway leaves jobs due and stamps
+    ``last_fire_error`` so the miss surfaces in ``cronjob list``.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import GatewayForwardingCronScheduler
 
-    provider = resolve_cron_scheduler()
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
+    def _fire_url() -> str:
+        _profile_name, home = _cron_profile_home(None)
+        return _gateway_fire_endpoint(_profile_name, home)
+
+    def _api_key() -> str:
+        from agent.secret_scope import get_secret
+
+        return get_secret("API_SERVER_KEY", "") or ""
+
+    provider = GatewayForwardingCronScheduler(_fire_url, _api_key)
+    _log.info(
+        "Desktop cron scheduler started (provider=%s, interval=%ds)",
+        provider.name, interval,
+    )
     provider.start(stop_event, interval=interval)
 
 

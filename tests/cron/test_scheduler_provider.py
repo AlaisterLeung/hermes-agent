@@ -18,6 +18,7 @@ drives it and stops promptly.
 """
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -71,20 +72,35 @@ def test_ticker_calls_tick_at_least_once_then_stops():
     assert calls[0].get("sync") is False
 
 
-def test_desktop_ticker_calls_tick_then_stops():
-    """The desktop dashboard ticker loop calls cron.scheduler.tick and exits
-    once the stop_event is set. Desktop has no live adapters, so it ticks with
-    no adapters/loop."""
+def test_desktop_ticker_forwards_due_jobs_to_gateway_then_stops():
+    """The desktop dashboard ticker never executes jobs locally: it forwards
+    every due job to the gateway api_server's cron-fire endpoint (the gateway
+    owns the live adapters and the session context that continuable delivery
+    needs) and exits once the stop_event is set."""
+    import httpx
     from hermes_cli.web_server import _start_desktop_cron_ticker
 
-    calls = []
+    forwarded = []
     stop = threading.Event()
 
-    def fake_tick(*args, **kwargs):
-        calls.append(kwargs)
-        return 0
+    def fake_post(self, url, json=None, headers=None, **kwargs):
+        forwarded.append({"url": url, "job_id": (json or {}).get("job_id")})
+        return httpx.Response(202, request=httpx.Request("POST", url))
 
-    with patch("cron.scheduler.tick", side_effect=fake_tick):
+    with patch.object(httpx.Client, "post", fake_post), \
+         patch("cron.jobs.get_due_jobs", return_value=[{"id": "job-1"}]), \
+         patch(
+             "hermes_cli.web_server._cron_profile_home",
+             return_value=("default", Path("/tmp/hermes-test-home")),
+         ), \
+         patch(
+             "hermes_cli.web_server._gateway_fire_endpoint",
+             return_value="http://127.0.0.1:8642/api/cron/fire",
+         ), \
+         patch(
+             "agent.secret_scope.get_secret",
+             return_value="test-key",
+         ):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
             args=(stop,),
@@ -92,13 +108,15 @@ def test_desktop_ticker_calls_tick_then_stops():
             daemon=True,
         )
         t.start()
-        assert _wait_until(lambda: len(calls) >= 1), "desktop ticker never called tick()"
+        assert _wait_until(lambda: len(forwarded) >= 1), (
+            "desktop ticker never forwarded a due fire"
+        )
         stop.set()
         t.join(timeout=5)
 
     assert not t.is_alive(), "desktop ticker did not exit after stop_event was set"
-    assert len(calls) >= 1, "desktop ticker never called tick()"
-    assert calls[0].get("sync") is False
+    assert forwarded[0]["job_id"] == "job-1"
+    assert forwarded[0]["url"].endswith("/api/cron/fire")
 
 
 # ── Phase 1: CronScheduler ABC + InProcessCronScheduler ──────────────────────

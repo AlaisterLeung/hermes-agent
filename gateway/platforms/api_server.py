@@ -6738,30 +6738,47 @@ class APIServerAdapter(BasePlatformAdapter):
         auth = request.headers.get("Authorization", "")
         token = auth[7:].strip() if auth.startswith("Bearer ") else ""
 
-        cfg = load_config()
-        verifier = get_fire_verifier()
-        verify_kwargs = dict(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
-        )
-        try:
-            if asyncio.iscoroutinefunction(verifier):
-                claims = await verifier(**verify_kwargs)
-            else:
-                # The verifier resolves the NAS signing key from a JWKS URL,
-                # which is a synchronous HTTP GET on a cache miss (cold client
-                # or a rotated kid) — keep that blocking I/O off the event loop
-                # so a slow or rate-limited portal can't stall every other
-                # adapter sharing this loop. Same hardening the platform HTTP
-                # event verifier already got.
-                claims = await asyncio.to_thread(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire — this
-            # is the only inbound that can trigger remote job execution.
-            logger.exception("cron fire: verifier crashed; rejecting token")
-            claims = None
+        # Two legitimate callers hit this endpoint: the external scheduler
+        # (NAS JWT below) and co-located Hermes processes that own no live
+        # adapters — the desktop dashboard's cron ticker forwards due fires
+        # here so execution happens in THIS process, with live adapters and
+        # session context. Those peers authenticate with API_SERVER_KEY, the
+        # same credential every other api_server call already requires.
+        # Constant-time comparison: the token is client-supplied.
+        import hmac as _hmac
+
+        expected_key = self._expected_api_key()
+        if (
+            token
+            and expected_key
+            and _hmac.compare_digest(token.encode(), expected_key.encode())
+        ):
+            claims = {"subject": "api-server-key"}
+        else:
+            cfg = load_config()
+            verifier = get_fire_verifier()
+            verify_kwargs = dict(
+                token=token,
+                expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
+                jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
+                issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
+            )
+            try:
+                if asyncio.iscoroutinefunction(verifier):
+                    claims = await verifier(**verify_kwargs)
+                else:
+                    # The verifier resolves the NAS signing key from a JWKS URL,
+                    # which is a synchronous HTTP GET on a cache miss (cold client
+                    # or a rotated kid) — keep that blocking I/O off the event loop
+                    # so a slow or rate-limited portal can't stall every other
+                    # adapter sharing this loop. Same hardening the platform HTTP
+                    # event verifier already got.
+                    claims = await asyncio.to_thread(verifier, **verify_kwargs)
+            except Exception:
+                # Fail closed: a crashing verifier must never admit a fire — this
+                # is the only inbound that can trigger remote job execution.
+                logger.exception("cron fire: verifier crashed; rejecting token")
+                claims = None
         if claims is None:
             logger.warning(
                 "cron fire: rejected invalid token: %s",

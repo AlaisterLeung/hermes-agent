@@ -87,7 +87,7 @@ async def test_create_handoff_thread_returns_root_event_id():
     client.send_message_event = AsyncMock(return_value="$rootEvent1")
     adapter._client = client
 
-    root = await adapter.create_handoff_thread(ROOM, "Hermes — Nightly Digest")
+    root = await adapter.create_handoff_thread(ROOM, "[Cron] Nightly Digest")
 
     assert root == "$rootEvent1"
     client.send_message_event.assert_awaited_once()
@@ -95,7 +95,7 @@ async def test_create_handoff_thread_returns_root_event_id():
     assert str(args.args[0]) == ROOM
     content = args.args[2]
     assert content["msgtype"] == "m.text"
-    assert content["body"] == "Hermes — Nightly Digest"
+    assert content["body"] == "[Cron] Nightly Digest"
 
 
 @pytest.mark.asyncio
@@ -154,7 +154,7 @@ def test_scheduler_picks_up_matrix_handoff_thread():
     coro = sched.call_args.args[0]
     coro.close()  # never awaited — close to silence the warning
     adapter.create_handoff_thread.assert_called_once_with(
-        ROOM, "Hermes — Nightly Digest"
+        ROOM, "[Cron] Nightly Digest"
     )
 
 
