@@ -511,7 +511,7 @@ async def test_blueprint_instantiation_notifies_selected_profile_provider(
 
 
 @pytest.mark.asyncio
-async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_state(
+async def test_trigger_cron_job_forwards_to_gateway_and_returns_refreshed_state(
     isolated_profiles,
     monkeypatch,
 ):
@@ -532,23 +532,18 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
         schedule="every 1h",
         name="sibling-job",
     )
-    fired = []
+    forwarded = []
 
-    class RecordingProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
-            fired.append(
-                {
-                    "job_id": job_id,
-                    "jobs_file": cron_jobs._current_cron_store().jobs_file,
-                    "force": force,
-                }
-            )
+    def fake_forward(profile, job_id, *, force=False):
+        forwarded.append({"profile": profile, "job_id": job_id, "force": force})
+        # Mirror the gateway-side execution against the same profile-scoped
+        # store the dashboard reads back from.
+        with cron_jobs.use_cron_store(isolated_profiles[profile]):
             cron_jobs.mark_job_run(job_id, success=True)
-            return True
+        return 202, {"status": "accepted", "job_id": job_id}
 
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: RecordingProvider(),
+        web_server, "_forward_cron_fire_to_gateway_sync", fake_forward
     )
     monkeypatch.setattr(
         cron_jobs,
@@ -563,10 +558,10 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
         profile="worker_alpha",
     )
 
-    assert fired == [
+    assert forwarded == [
         {
+            "profile": "worker_alpha",
             "job_id": selected["id"],
-            "jobs_file": isolated_profiles["worker_alpha"] / "cron" / "jobs.json",
             "force": False,
         }
     ]
@@ -578,6 +573,62 @@ async def test_trigger_cron_job_fires_only_selected_job_and_returns_refreshed_st
         sibling["id"],
     )
     assert untouched["last_run_at"] is None
+
+
+def test_trigger_forward_uses_gateway_endpoint_key_and_force_body(
+    isolated_profiles,
+    monkeypatch,
+):
+    """The blocking forwarder targets the gateway api_server's cron-fire
+    route with API_SERVER_KEY auth and carries ``force`` in the body."""
+    from hermes_cli import web_server
+
+    default_home = isolated_profiles["default"]
+    captured = {}
+
+    class FakeResponse:
+        status_code = 202
+        text = ""
+
+        def json(self):
+            return {"status": "accepted", "job_id": "worker-job"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["body"] = json
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        web_server, "_gateway_fire_endpoint",
+        lambda profile_name, home: (
+            f"file://{home}/api/cron/fire"
+            if home is default_home else "wrong-home"
+        ),
+    )
+    import httpx as _httpx
+
+    monkeypatch.setattr(_httpx, "Client", FakeClient)
+    monkeypatch.setattr(web_server, "_cron_profile_home", lambda p: (p, default_home))
+
+    result = web_server._forward_cron_fire_to_gateway_sync(
+        "default", "worker-job", force=True
+    )
+
+    assert result == (202, {"status": "accepted", "job_id": "worker-job"})
+    assert captured["url"] == f"file://{default_home}/api/cron/fire"
+    assert captured["body"] == {"job_id": "worker-job", "force": True}
+    assert captured["headers"]["Authorization"].startswith("Bearer ")
 
 
 @pytest.mark.asyncio
@@ -595,13 +646,13 @@ async def test_trigger_cron_job_reports_lost_claim_as_conflict(
         name="claimed-trigger-job",
     )
 
-    class ClaimLostProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
-            return False
-
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: ClaimLostProvider(),
+        web_server,
+        "_forward_cron_fire_to_gateway_sync",
+        lambda profile, job_id, *, force=False: (
+            200,
+            {"status": "duplicate", "job_id": job_id},
+        ),
     )
 
     with pytest.raises(HTTPException) as exc:
@@ -612,7 +663,7 @@ async def test_trigger_cron_job_reports_lost_claim_as_conflict(
 
 
 @pytest.mark.asyncio
-async def test_trigger_cron_job_forces_paused_job_atomically(
+async def test_trigger_cron_job_forwards_force_for_paused_job(
     isolated_profiles,
     monkeypatch,
 ):
@@ -629,16 +680,17 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
     web_server._call_cron_for_profile("worker_alpha", "pause_job", job["id"])
     observed = {}
 
-    class ForceProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
-            observed["force"] = force
-            assert cron_jobs.claim_job_for_fire(job_id, force=force) is True
+    def fake_forward(profile, job_id, *, force=False):
+        observed["force"] = force
+        # Mirror the gateway's atomic resume-and-claim under force, scoped
+        # to the same profile store the dashboard reads back from.
+        with cron_jobs.use_cron_store(isolated_profiles[profile]):
+            cron_jobs.claim_job_for_fire(job_id, force=force)
             cron_jobs.mark_job_run(job_id, success=True)
-            return True
+        return 202, {"status": "accepted", "job_id": job_id}
 
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: ForceProvider(),
+        web_server, "_forward_cron_fire_to_gateway_sync", fake_forward
     )
 
     triggered = await web_server.trigger_cron_job(
@@ -653,50 +705,82 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
 
 
 @pytest.mark.asyncio
-async def test_trigger_paused_job_rejects_legacy_provider_without_mutating_job(
+async def test_trigger_cron_job_reports_unreachable_gateway_as_unavailable(
     isolated_profiles,
     monkeypatch,
 ):
-    from fastapi import HTTPException
+    """Gateway down → 503 and NO local-execution fallback: delivering from
+    the wrong process is worse than a failed trigger."""
+    from cron import jobs as cron_jobs
     from hermes_cli import web_server
 
     job = web_server._call_cron_for_profile(
         "worker_alpha",
         "create_job",
-        prompt="stay paused",
+        prompt="gateway is down",
         schedule="every 1h",
-        name="legacy-paused-trigger-job",
+        name="unreachable-trigger-job",
     )
-    web_server._call_cron_for_profile("worker_alpha", "pause_job", job["id"])
-    calls = []
+    local_executions = []
 
-    class LegacyProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None):
-            calls.append(job_id)
-            return True
+    def spy_local_provider():
+        class LocalExecProvider:
+            def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+                local_executions.append(job_id)
+                return True
+
+        return LocalExecProvider()
 
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: LegacyProvider(),
+        "cron.scheduler_provider.resolve_cron_scheduler", spy_local_provider
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_forward_cron_fire_to_gateway_sync",
+        lambda profile, job_id, *, force=False: None,
     )
 
     with pytest.raises(HTTPException) as exc:
         await web_server.trigger_cron_job(job["id"], profile="worker_alpha")
 
-    assert exc.value.status_code == 409
-    assert "forced" in exc.value.detail.lower()
-    assert calls == []
-    persisted = web_server._call_cron_for_profile(
-        "worker_alpha",
-        "get_job",
-        job["id"],
-    )
-    assert persisted["state"] == "paused"
-    assert persisted["enabled"] is False
+    assert exc.value.status_code == 503
+    assert local_executions == []
+    persisted = web_server._call_cron_for_profile("worker_alpha", "get_job", job["id"])
+    assert persisted["last_run_at"] is None
 
 
 @pytest.mark.asyncio
-async def test_trigger_cron_job_returns_refreshed_execution_failure(
+async def test_trigger_cron_job_maps_admission_failure_to_unavailable(
+    isolated_profiles,
+    monkeypatch,
+):
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="admission failed",
+        schedule="every 1h",
+        name="admission-trigger-job",
+    )
+
+    monkeypatch.setattr(
+        web_server,
+        "_forward_cron_fire_to_gateway_sync",
+        lambda profile, job_id, *, force=False: (
+            503,
+            {"error": "cron fire admission failed", "job_id": job_id},
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await web_server.trigger_cron_job(job["id"], profile="worker_alpha")
+
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_trigger_cron_job_returns_refreshed_state_after_accepted_fire(
     isolated_profiles,
     monkeypatch,
 ):
@@ -711,14 +795,15 @@ async def test_trigger_cron_job_returns_refreshed_execution_failure(
         name="failed-trigger-job",
     )
 
-    class FailedProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+    def accepted_but_failed(profile, job_id, *, force=False):
+        with cron_jobs.use_cron_store(isolated_profiles[profile]):
             cron_jobs.mark_job_run(job_id, success=False, error="expected failure")
-            return False
+        return 202, {"status": "accepted", "job_id": job_id}
 
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: FailedProvider(),
+        web_server,
+        "_forward_cron_fire_to_gateway_sync",
+        accepted_but_failed,
     )
 
     triggered = await web_server.trigger_cron_job(
@@ -731,7 +816,7 @@ async def test_trigger_cron_job_returns_refreshed_execution_failure(
 
 
 @pytest.mark.asyncio
-async def test_trigger_cron_job_returns_completed_snapshot_for_retained_oneshot(
+async def test_trigger_cron_job_returns_refreshed_completed_oneshot(
     isolated_profiles,
     monkeypatch,
 ):
@@ -746,14 +831,15 @@ async def test_trigger_cron_job_returns_completed_snapshot_for_retained_oneshot(
         name="completed-trigger-job",
     )
 
-    class SuccessfulProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None, force=False):
+    def accepted_and_ran(profile, job_id, *, force=False):
+        with cron_jobs.use_cron_store(isolated_profiles[profile]):
             cron_jobs.mark_job_run(job_id, success=True)
-            return True
+        return 202, {"status": "accepted", "job_id": job_id}
 
     monkeypatch.setattr(
-        "cron.scheduler_provider.resolve_cron_scheduler",
-        lambda: SuccessfulProvider(),
+        web_server,
+        "_forward_cron_fire_to_gateway_sync",
+        accepted_and_ran,
     )
 
     triggered = await web_server.trigger_cron_job(
@@ -768,13 +854,6 @@ async def test_trigger_cron_job_returns_completed_snapshot_for_retained_oneshot(
     # record, not a synthetic pre-removal snapshot.
     assert triggered["last_status"] == "ok"
     assert triggered["last_run_at"] is not None
-    retained = web_server._call_cron_for_profile(
-        "worker_alpha",
-        "get_job",
-        job["id"],
-    )
-    assert retained is not None
-    assert retained["state"] == "completed"
 
 
 @pytest.mark.asyncio
