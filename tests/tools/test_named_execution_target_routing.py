@@ -1900,14 +1900,17 @@ def test_gateway_script_guard_reads_selected_named_target_cwd(
         "_load_merged_config",
         lambda: _named_config({"alpha": str(alpha), "beta": str(beta)}),
     )
-    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(
+        "tools.process_registry._is_supervised_gateway_process",
+        lambda: True,
+    )
 
     result = json.loads(terminal_mod.terminal_tool(
         "bash restart.sh", task_id="gateway-guard", target="beta",
     ))
 
     assert result["status"] == "error"
-    assert "cannot restart or stop the gateway" in result["error"]
+    assert "cannot restart, stop, or uninstall the gateway" in result["error"]
 
 
 def test_checkpoint_alias_flip_pins_dispatch_generation(monkeypatch, tmp_path):
