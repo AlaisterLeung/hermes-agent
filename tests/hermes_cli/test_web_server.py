@@ -4823,7 +4823,10 @@ class TestValidateProviderCredential:
 
 
 class TestDesktopCronTicker:
-    """The dashboard backend fires cron jobs itself only when desktop-spawned."""
+    """Under HERMES_DESKTOP=1 the dashboard starts a cron ticker that
+    FORWARDS due fires to the gateway api_server (PR #7): execution lives
+    in the gateway process, which owns the live platform adapters. The
+    standalone in-process tick loop must not run there."""
 
     def _client(self):
         try:
@@ -4836,14 +4839,36 @@ class TestDesktopCronTicker:
 
     def test_ticker_runs_when_desktop(self, monkeypatch, _isolate_hermes_home):
         import threading
+
         import cron.scheduler as sched
 
-        called = threading.Event()
-        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        from cron.scheduler_provider import GatewayForwardingCronScheduler
+
+        started = threading.Event()
+        ticked = threading.Event()
+
+        class SpyForwardingScheduler(GatewayForwardingCronScheduler):
+            def start(self, stop_event, **kwargs):
+                started.set()
+                # Block until shutdown instead of sweeping: the spy proves
+                # startup wiring; no real fires are forwarded here.
+                stop_event.wait(timeout=5)
+
+        monkeypatch.setattr(
+            "cron.scheduler_provider.GatewayForwardingCronScheduler",
+            SpyForwardingScheduler,
+        )
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: ticked.set())
         monkeypatch.setenv("HERMES_DESKTOP", "1")
 
         with self._client():
-            assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
+            assert started.wait(3.0), (
+                "expected the gateway-forwarding cron scheduler under "
+                "HERMES_DESKTOP=1"
+            )
+            assert not ticked.is_set(), (
+                "desktop must not execute cron jobs in-process (sched.tick)"
+            )
 
 
 class TestServeIndexMissingIndex:

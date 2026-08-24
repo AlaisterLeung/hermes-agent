@@ -45,6 +45,7 @@ import concurrent.futures
 import errno
 import hashlib
 import hmac
+import inspect
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
@@ -6954,9 +6955,20 @@ class APIServerAdapter(BasePlatformAdapter):
             # Persist the attempt and exact store owner before acknowledging NAS.
             # A failure here is retryable and the reservation remains attached.
             try:
-                claimed_job = await asyncio.to_thread(
-                    provider.claim_fire, job_id, force=force_claim
-                )
+                # ``force`` rides only to providers that accept it; minimal
+                # test doubles (and older providers) expose plain
+                # claim_fire(job_id), which must keep working unchanged.
+                accepts_force = "force" in inspect.signature(
+                    provider.claim_fire
+                ).parameters
+                if accepts_force:
+                    claimed_job = await asyncio.to_thread(
+                        provider.claim_fire, job_id, force=force_claim
+                    )
+                else:
+                    claimed_job = await asyncio.to_thread(
+                        provider.claim_fire, job_id
+                    )
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response(
