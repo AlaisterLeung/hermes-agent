@@ -1995,10 +1995,15 @@ def execute_code(
     if not sandbox_tools:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
-    if _get_kernel_mode() == "session":
+    if _get_kernel_mode() == "session" and inherited_target is None:
         # Session kernels keep one interpreter alive across calls; the guards
         # above already ran for this cell, and the kernel path reuses the
         # same env builder, RPC server, and output redaction as below.
+        # Named execution targets keep the per-call path below: the kernel's
+        # RPC loop (per-cell CellAuthority) does not carry the inherited
+        # target/scope/frozen-config threading, and the kernel identity does
+        # not incorporate the target's runtime scope — mirroring how remote
+        # backends stay per-call.
         from tools.code_kernel import execute_in_session_kernel
 
         _mode = _get_execution_mode()
