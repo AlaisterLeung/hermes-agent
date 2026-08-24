@@ -389,6 +389,11 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
+    return _inline_truncation(content, preview)
+
+
+def _inline_truncation(content: str, preview: str) -> str:
+    """Final fallback replacement when nothing can be persisted anywhere."""
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
@@ -433,15 +438,34 @@ def enforce_turn_budget(
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
 
-        message_env = env_resolver(msg) if callable(env_resolver) else env
-        replacement = maybe_persist_tool_result(
-            content=content,
-            tool_name=_BUDGET_TOOL_NAME,
-            tool_use_id=tool_use_id,
-            env=message_env if callable(env_resolver) else env,
-            config=config,
-            threshold=0,
-        )
+        if callable(env_resolver):
+            message_env = env_resolver(msg)
+            if message_env is None:
+                # Named execution target whose producing environment is gone:
+                # its saved outputs must never spill into another environment
+                # (host spillover included), so inline-truncate instead.
+                preview, _ = generate_preview(
+                    content, max_chars=config.preview_size
+                )
+                replacement = _inline_truncation(content, preview)
+            else:
+                replacement = maybe_persist_tool_result(
+                    content=content,
+                    tool_name=_BUDGET_TOOL_NAME,
+                    tool_use_id=tool_use_id,
+                    env=message_env,
+                    config=config,
+                    threshold=0,
+                )
+        else:
+            replacement = maybe_persist_tool_result(
+                content=content,
+                tool_name=_BUDGET_TOOL_NAME,
+                tool_use_id=tool_use_id,
+                env=env,
+                config=config,
+                threshold=0,
+            )
         if replacement != content:
             total_size -= size
             total_size += len(replacement)
