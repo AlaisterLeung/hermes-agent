@@ -74,6 +74,27 @@ hermes acp --version
 hermes acp --check
 ```
 
+### Execution target (remote backends)
+
+By default, ACP tool dispatch (terminal, file, code-exec) uses the profile's
+configured `terminal.default_target`. Pass a named execution target — defined
+under `terminal.targets` in `config.yaml` — to route all tool work to that
+backend instead:
+
+```bash
+hermes acp --target devbox
+hermes acp -t devbox             # short form
+```
+
+This overrides `terminal.default_target` for the lifetime of this ACP
+process, without changing the profile-wide config. It is useful when the ACP
+server runs centrally but the editor workspace lives on another machine the
+server can reach over SSH.
+
+An unknown or unavailable target is rejected at launch (exit code 2) with the
+list of available targets. `hermes acp --check` also prints the target it
+would dispatch under.
+
 ### Browser tools (optional)
 
 Browser tools (`browser_navigate`, `browser_click`, etc.) depend on the
