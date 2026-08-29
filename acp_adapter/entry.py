@@ -146,6 +146,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Accept all prompts (currently used by --setup-browser to skip the "
              "~400 MB Chromium download confirmation).",
     )
+    parser.add_argument(
+        "--target",
+        "-t",
+        dest="acp_target",
+        default=None,
+        metavar="TARGET",
+        help="Named execution target for terminal/file/code-exec tools "
+             "(defined under terminal.targets in config.yaml). Defaults to "
+             "terminal.default_target.",
+    )
     return parser.parse_args(argv)
 
 
@@ -155,11 +165,26 @@ def _print_version() -> None:
     print(hermes_version)
 
 
-def _run_check() -> None:
+def _run_check(target: str | None = None) -> None:
     import acp  # noqa: F401
     from acp_adapter.server import HermesACPAgent  # noqa: F401
 
     print("Hermes ACP check OK")
+    # Surface which target a launched server would dispatch under, so
+    # `hermes acp --check -t <name>` verifies resolution before an editor
+    # depends on it. An invalid target fails closed here too (exit 2).
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        resolution = resolve_execution_target(target)
+        print(f"Execution target: {resolution.target} (backend={resolution.backend})")
+    except Exception as exc:
+        # Non-fatal for dependency verification, EXCEPT an explicitly
+        # requested target that cannot resolve: fail closed so a broken
+        # editor command is caught at check time.
+        if target:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
 
 
 def _run_setup() -> None:
@@ -217,6 +242,63 @@ def _run_setup_browser(assume_yes: bool = False) -> int:
         return 1
 
 
+def _apply_execution_target(target: str | None) -> None:
+    """Pin the process-wide execution target for this ACP server.
+
+    ``hermes acp -t <name>`` overrides ``terminal.default_target`` for every
+    tool dispatch in this process (terminal, file, code-exec, delegation).
+    Validation happens here, before the JSON-RPC loop starts, so editors
+    surface a clean launch error instead of per-tool failures mid-session.
+
+    The registration path mirrors the classic CLI (``cli.py``):
+    ``set_execution_target_config_source`` is the entry-point authority hook
+    that ``tools.execution_targets`` resolves against. Without it, ACP is the
+    one entry point whose default resolution can't be overridden per launch.
+    """
+    if not target:
+        return
+
+    from hermes_cli.config import load_config
+    from tools.execution_targets import (
+        ExecutionTargetError,
+        resolve_execution_target,
+        set_execution_target_config_source,
+    )
+
+    # Fail fast with the available-targets message before anything else runs.
+    try:
+        resolution = resolve_execution_target(target)
+    except ExecutionTargetError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    effective = load_config()
+    terminal = effective.setdefault("terminal", {})
+    if not isinstance(terminal, dict):
+        raise SystemExit(
+            "Error: config.yaml 'terminal' section is not a mapping; "
+            "cannot apply execution target."
+        )
+    terminal["default_target"] = target
+
+    # Re-validate the merged config (in case load_config() flattened or
+    # normalized terminal settings differently from the raw read) and register
+    # it as the dispatch authority. resolve_execution_target on the merged
+    # view must succeed for the same target before the server accepts work.
+    try:
+        resolve_execution_target(target, config=effective)
+    except ExecutionTargetError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    set_execution_target_config_source(effective)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        "ACP execution target pinned to %r (backend=%s)",
+        target, resolution.backend,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
     args = _parse_args(argv)
@@ -224,7 +306,7 @@ def main(argv: list[str] | None = None) -> None:
         _print_version()
         return
     if args.check:
-        _run_check()
+        _run_check(getattr(args, "acp_target", None))
         return
     if args.setup:
         _run_setup()
@@ -237,6 +319,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _setup_logging()
     _load_env()
+    _apply_execution_target(getattr(args, "acp_target", None))
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")
