@@ -1,9 +1,11 @@
-ARG RUST_VERSION=1.97.1
-ARG HIMALAYA_VERSION=2.0.0
-ARG GH_CLI_VERSION=2.97.0
+ARG ALPINE_VERSION=3.24
+ARG HIMALAYA_VERSION=2.1.0
+ARG GH_CLI_VERSION=2.98.0
 ARG RUNTIME_IMAGE=docker.io/alaisterleung/hermes-agent:main
 
-FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS builder
+FROM docker.io/library/alpine:${ALPINE_VERSION} AS builder
+
+RUN apk add --no-cache curl ca-certificates
 
 # Himalaya v2
 ARG HIMALAYA_VERSION
@@ -20,17 +22,9 @@ RUN curl -fsSL -o /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v
     && cp /tmp/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
     && gh --version
 
-# Buzz CLI
-RUN git clone --depth 1 --branch main https://github.com/block/buzz.git /tmp/buzz \
-    && cd /tmp/buzz \
-    && cargo build --release -p buzz-cli \
-    && cp target/release/buzz /usr/local/bin/buzz \
-    && buzz --help
-
 # Extend the base Dockerfile
 FROM ${RUNTIME_IMAGE} AS runtime
 
 # Copy executables from builder stage
 COPY --from=builder /usr/local/bin/himalaya /usr/local/bin/himalaya
 COPY --from=builder /usr/local/bin/gh /usr/local/bin/gh
-COPY --from=builder /usr/local/bin/buzz /usr/local/bin/buzz
