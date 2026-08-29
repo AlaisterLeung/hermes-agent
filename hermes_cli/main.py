@@ -13075,6 +13075,8 @@ def cmd_acp(args):
             acp_argv.append("--setup-browser")
         if getattr(args, "assume_yes", False):
             acp_argv.append("--yes")
+        if getattr(args, "acp_target", None):
+            acp_argv.extend(["--target", args.acp_target])
         acp_main(acp_argv)
     except ImportError:
         print("ACP dependencies not installed.", file=sys.stderr)

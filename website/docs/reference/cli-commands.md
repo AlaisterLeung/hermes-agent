@@ -1391,6 +1391,8 @@ hermes acp
 
 Starts Hermes as an ACP (Agent Client Protocol) stdio server for editor integration.
 
+Pass `--target <name>` / `-t <name>` to route terminal/file/code-exec tool dispatch through a named execution target, overriding `terminal.default_target` for this process.
+
 Related entrypoints:
 
 ```bash
