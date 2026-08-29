@@ -49,4 +49,14 @@ def build_acp_parser(subparsers, *, cmd_acp: Callable) -> None:
         help="Accept all prompts (used by --setup-browser to skip the "
              "~400 MB Chromium download confirmation).",
     )
+    acp_parser.add_argument(
+        "--target",
+        "-t",
+        dest="acp_target",
+        default=None,
+        metavar="TARGET",
+        help="Named execution target for terminal/file/code-exec tools "
+             "(defined under terminal.targets in config.yaml). Defaults to "
+             "terminal.default_target.",
+    )
     acp_parser.set_defaults(func=cmd_acp)
