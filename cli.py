@@ -9684,8 +9684,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if announce:
                 _cprint(f"  {_DIM}👁️  analyzing {img_path.name} ({size_kb}KB)...{_RST}")
             try:
+                # target="local": attached images are read from THIS host's
+                # filesystem. An omitted target would follow
+                # terminal.default_target — which `hermes acp -t <name>` pins
+                # to a remote backend process-wide — and the read would fail
+                # with "File not found inside the backend".
                 result_json = _asyncio.run(
-                    vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt)
+                    vision_analyze_tool(
+                        image_url=str(img_path), user_prompt=analysis_prompt, target="local"
+                    )
                 )
                 result = json.loads(result_json)
                 if result.get("success"):

@@ -319,7 +319,7 @@ See [Named Execution Targets](/user-guide/configuration#named-execution-targets)
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `vision_analyze` | Analyze images using AI vision. On vision-capable main models, returns the raw image pixels as a multimodal tool result so the model sees them natively on its next turn. On text-only main models, falls back to an auxiliary vision model that describes the image and returns the description as text. Tool signature is identical either way. | — |
+| `vision_analyze` | Analyze images using AI vision. On vision-capable main models, returns the raw image pixels as a multimodal tool result so the model sees them natively on its next turn. On text-only main models, falls back to an auxiliary vision model that describes the image and returns the description as text. Tool signature is identical either way. Path-like `image_url` values resolve through the selected execution target: the optional `target` argument names a `terminal.targets` entry, and omission follows `terminal.default_target`. Under a non-local target, non-cache paths are read inside that backend — so a file that exists only on the remote host loads directly, without fetching it first. | — |
 
 ## `video` toolset
 
@@ -327,7 +327,7 @@ Opt-in toolset (not loaded in the default `hermes-cli` set). Add via `--toolsets
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `video_analyze` | Analyze video content from a URL or file path — captions, scene breakdowns, key timestamps, and visual descriptions. | — |
+| `video_analyze` | Analyze video content from a URL or file path — captions, scene breakdowns, key timestamps, and visual descriptions. Accepts the same optional `target` argument as `vision_analyze`. | — |
 
 ## `video_gen` toolset
 
