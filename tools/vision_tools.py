@@ -1233,6 +1233,7 @@ async def _vision_analyze_native(
     question: str,
     task_id: Optional[str] = None,
     region: Optional[list] = None,
+    target: Optional[str] = None,
 ) -> Any:
     """Fast path for vision-capable main models.
 
@@ -1267,7 +1268,9 @@ async def _vision_analyze_native(
         )
 
         try:
-            resolved = await resolve_image_source(image_url, ResolveContext(task_id=task_id))
+            resolved = await resolve_image_source(
+                image_url, ResolveContext(task_id=task_id, target=target)
+            )
         except ImageResolutionError as exc:
             return tool_error(str(exc), success=False)
 
@@ -1397,6 +1400,7 @@ async def vision_analyze_tool(
     model: str = None,
     task_id: Optional[str] = None,
     region: Optional[list] = None,
+    target: Optional[str] = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1470,7 +1474,9 @@ async def vision_analyze_tool(
         )
 
         try:
-            resolved = await resolve_image_source(image_url, ResolveContext(task_id=task_id))
+            resolved = await resolve_image_source(
+                image_url, ResolveContext(task_id=task_id, target=target)
+            )
         except ImageResolutionError as exc:
             raise ValueError(str(exc))
 
@@ -1841,6 +1847,10 @@ VISION_ANALYZE_SCHEMA = {
                     "re-call with a region to zoom into small text or fine "
                     "detail."
                 )
+            },
+            "target": {
+                "type": "string",
+                "description": "Optional named execution target, for example 'local' or 'devbox'. Uses terminal.default_target when omitted."
             }
         },
         "required": ["image_url", "question"]
@@ -1852,6 +1862,7 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     region = args.get("region")
+    target = args.get("target")
     task_id = kw.get("task_id")
 
     # The fan-out cap lives inside the encode/resize step (offloaded to the
@@ -1867,7 +1878,9 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # information loss, no extra latency.
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
-        return await _vision_analyze_native(image_url, question, task_id=task_id, region=region)
+        return await _vision_analyze_native(
+            image_url, question, task_id=task_id, region=region, target=target
+        )
 
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
@@ -1886,7 +1899,9 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
+    return await vision_analyze_tool(
+        image_url, full_prompt, model, task_id=task_id, region=region, target=target
+    )
 
 
 registry.register(
@@ -1945,7 +1960,27 @@ def _is_path_like_video_source(value: str) -> bool:
     return not lowered.startswith(("http://", "https://", "data:"))
 
 
-async def _materialize_video_from_terminal_backend(video_source: str, task_id: Optional[str]) -> Path:
+def _video_backend_is_local(target: Optional[str] = None) -> bool:
+    """True when the governing execution target runs directly on the host.
+
+    Target-aware replacement for the legacy ``TERMINAL_ENV`` sniff: an explicit
+    named target (or ``terminal.default_target``) decides, matching the image
+    resolver's confinement logic.
+    """
+    if not target:
+        return _terminal_backend_is_local()
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        resolution = resolve_execution_target(target)
+        return resolution.backend == "local"
+    except Exception:
+        return False
+
+
+async def _materialize_video_from_terminal_backend(
+    video_source: str, task_id: Optional[str], target: Optional[str] = None,
+) -> Path:
     """Read a path via the shared media resolver into a local temp video file.
 
     Routes through :func:`tools.image_source.resolve_image_source` with
@@ -1970,7 +2005,8 @@ async def _materialize_video_from_terminal_backend(video_source: str, task_id: O
 
     try:
         resolved = await resolve_image_source(
-            video_source, ResolveContext(task_id=task_id), permitted=("video",)
+            video_source, ResolveContext(task_id=task_id, target=target),
+            permitted=("video",)
         )
     except ImageResolutionError as exc:
         raise ValueError(f"Could not read video from terminal backend: {exc}") from exc
@@ -2047,6 +2083,7 @@ async def video_analyze_tool(
     user_prompt: str,
     model: str = None,
     task_id: Optional[str] = None,
+    target: Optional[str] = None,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     if not isinstance(user_prompt, str):
@@ -2081,9 +2118,11 @@ async def video_analyze_tool(
             resolved_url = resolved_url[len("file://"):]
         local_path = Path(os.path.expanduser(resolved_url))
 
-        if not _terminal_backend_is_local() and _is_path_like_video_source(video_url):
+        if not _video_backend_is_local(target) and _is_path_like_video_source(video_url):
             logger.info("Reading video source via terminal backend: %s", video_url)
-            temp_video_path = await _materialize_video_from_terminal_backend(video_url, task_id)
+            temp_video_path = await _materialize_video_from_terminal_backend(
+                video_url, task_id, target
+            )
             should_cleanup = True
         elif local_path.is_file():
             from agent.file_safety import raise_if_read_blocked
@@ -2276,6 +2315,10 @@ VIDEO_ANALYZE_SCHEMA = {
                 "type": "string",
                 "description": "Your specific question about the video. The AI will describe what happens in the video and answer your question.",
             },
+            "target": {
+                "type": "string",
+                "description": "Optional named execution target, for example 'local' or 'devbox'. Uses terminal.default_target when omitted.",
+            },
         },
         "required": ["video_url", "question"],
     },
@@ -2285,6 +2328,7 @@ VIDEO_ANALYZE_SCHEMA = {
 def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     video_url = args.get("video_url", "")
     question = args.get("question", "")
+    target = args.get("target")
     full_prompt = (
         "Fully describe and explain everything happening in this video, "
         "including visual content, motion, audio cues, text overlays, and scene "
@@ -2303,7 +2347,7 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         pass
     if not model:
         model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model, task_id=kw.get("task_id"))
+    return video_analyze_tool(video_url, full_prompt, model, task_id=kw.get("task_id"), target=target)
 
 
 registry.register(

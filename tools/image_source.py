@@ -24,6 +24,16 @@ but vision read images host-side. This resolver enforces the same boundary:
                                  this stays within the sandbox boundary and never
                                  reaches the host's ``/etc/passwd`` / ``~/.ssh``).
 
+The governing backend comes from the execution-target resolver (named targets
+included): an explicit ``ResolveContext.target`` selects that named target, an
+omitted target follows ``terminal.default_target`` (same semantics as the file
+tools). Legacy deployments without ``terminal.targets`` keep the historical
+``TERMINAL_ENV``-driven behavior — the resolver's legacy flat mode preserves
+that precedence. In-sandbox reads delegate to the file tools'
+``ShellFileOperations.read_file_bytes`` (stat probe, non-regular-file
+rejection, byte cap, terminal-fence-leak stripping, validated base64), which
+already knows how to look up or lazily create the environment for any target.
+
 So a prompt-injected ``vision_analyze('/etc/passwd')`` under Docker reads the
 *container's* file (what every other tool sees), not the host's — no escape —
 while container-only images (tmpfs ``/workspace``, root-owned) are still
@@ -38,7 +48,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Raw-bytes INGEST budget — what the resolver will load before handing off.
 # This is deliberately the 50MB download cap (tools/vision_tools._VISION_MAX_DOWNLOAD_BYTES),
@@ -78,6 +88,34 @@ class NotAnImage(ImageResolutionError):
 @dataclass
 class ResolveContext:
     task_id: Optional[str] = None
+    # Optional named execution target (tools/execution_targets.py). None
+    # follows ``terminal.default_target`` — the same semantics the file tools
+    # apply to an omitted ``target`` argument.
+    target: Optional[str] = None
+
+
+@dataclass
+class _BackendPlan:
+    """Resolved execution target + the confinement decision it implies."""
+
+    resolution: Any
+    host_reads_any_path: bool
+
+
+def _resolve_backend_plan(ctx: ResolveContext) -> _BackendPlan:
+    """Resolve the governing execution target for this media read.
+
+    ``resolve_execution_target`` reads configuration lazily (importing tool
+    schemas never touches user config), so calling it per read is cheap and
+    always current — live reloads and ACP/CLI target pinning are honored.
+    Host path reads are permitted only when the resolved backend actually
+    runs on this host (``backend == "local"``), whatever route selected it.
+    """
+    from tools.execution_targets import resolve_execution_target
+
+    resolution = resolve_execution_target(ctx.target)
+    host_reads_any_path = resolution.backend == "local"
+    return _BackendPlan(resolution=resolution, host_reads_any_path=host_reads_any_path)
 
 
 @dataclass
@@ -125,8 +163,11 @@ async def resolve_image_source(
     # a path is host-readable ONLY if it lands in a media cache (after
     # translating a container-visible cache path back to its host mount);
     # every other path is read inside the sandbox via exec-read, so a host
-    # path outside the caches never yields the host's bytes.
-    host_target = _permitted_host_read_target(p, ctx)
+    # path outside the caches never yields the host's bytes. The governing
+    # backend comes from the execution-target resolution (named targets and
+    # ``terminal.default_target`` included), not from a legacy env sniff.
+    plan = _resolve_backend_plan(ctx)
+    host_target = _permitted_host_read_target(p, ctx, plan)
     if host_target is not None and host_target.is_file():
         # Shared credential-read guard (agent.file_safety, #57698): refuse
         # secret-bearing files (.env, auth.json, ...) with an intentional,
@@ -146,14 +187,14 @@ async def resolve_image_source(
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s, permitted)
-    if _is_local_terminal_backend():
+    if plan.host_reads_any_path:
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
         raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
     # Not a permitted host read (or the host file is absent) -> read the
-    # bytes inside the sandbox. Under a sandbox this reads the container's
+    # bytes inside the backend. Under a sandbox this reads that backend's
     # filesystem, never the host's.
-    return await _resolve_container_fallback(p, ctx, s, permitted)
+    return await _resolve_container_fallback(p, ctx, s, permitted, plan)
 
 
 def _resolve_data_url(s: str) -> tuple[bytes, str]:
@@ -210,10 +251,13 @@ async def _download_to_bytes(url: str) -> bytes:
 
 
 def _is_local_terminal_backend() -> bool:
-    """True when the terminal backend runs directly on the host.
+    """True when the default terminal backend runs directly on the host.
 
-    Mirrors ``tools.browser_tool._is_local_backend`` and terminal_tool's own
-    dispatch, which key off ``TERMINAL_ENV``.
+    Legacy default-target sniff only — kept for tests and external callers.
+    The resolver itself keys confinement off the execution-target resolution
+    (see :func:`_resolve_backend_plan`), which honors named targets and
+    ``terminal.default_target``; the legacy flat mode preserves the historical
+    ``TERMINAL_ENV`` precedence.
     """
     return os.getenv("TERMINAL_ENV", "local").strip().lower() in ("local", "")
 
@@ -239,7 +283,9 @@ def _media_cache_roots() -> list:
     ]
 
 
-def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
+def _permitted_host_read_target(
+    p: Path, ctx: ResolveContext, plan: Optional[_BackendPlan] = None,
+) -> Optional[Path]:
     """Return the host path to read, or ``None`` if a host read is not permitted.
 
     - Local backend: any path is permitted (chosen posture). Returns ``p``.
@@ -249,7 +295,9 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
       is not under a cache returns ``None`` so the caller routes it to the
       in-sandbox exec-read instead of reading the host filesystem.
     """
-    if _is_local_terminal_backend():
+    if plan is None:
+        plan = _resolve_backend_plan(ctx)
+    if plan.host_reads_any_path:
         try:
             return p.resolve()
         except Exception:  # noqa: BLE001 — unresolved path: let is_file() fail downstream
@@ -271,113 +319,80 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     return None
 
 
-def _get_active_env(task_id: Optional[str]):
-    if not task_id:
-        return None
-    try:
-        from tools.terminal_tool import get_active_env
+def _backend_file_ops(
+    task_id: Optional[str], resolution: Any, target: Optional[str] = None,
+) -> Any:
+    """Fetch (or lazily create) the backend's ShellFileOperations.
 
-        return get_active_env(task_id)
-    except Exception:
-        return None
-
-
-def _ensure_container_env(task_id: Optional[str]) -> None:
-    """Lazily bring up the sandbox (SSH/Docker/…) before an in-sandbox read.
-
-    Unlike the terminal tool, vision never triggered environment creation, so a
-    session whose first action is ``vision_analyze`` on a container-only path
-    under a non-local backend found no active env and failed — until a terminal
-    command happened to create one (issue #62825). Best-effort: any failure just
-    leaves the env absent and the caller hits the existing fail-closed error.
+    Module-level indirection so tests can stub the delegation without touching
+    ``tools.file_tools`` internals. ``_get_file_ops`` shares the terminal
+    tool's per-task creation locks, so a vision-triggered bring-up (issue
+    #62825 behavior, now target-aware) can't race a concurrent terminal call.
+    ``target`` must accompany ``resolution``: the create-time publish guard
+    re-resolves the *named target* to detect config edits mid-creation, and
+    omitting the name makes it re-resolve the default target instead (scope
+    mismatch -> "Execution target changed while its environment was being
+    created").
     """
-    if not task_id:
-        return
-    try:
-        from tools.terminal_tool import ensure_task_env
+    from tools.file_tools import _get_file_ops
 
-        ensure_task_env(task_id)
-    except Exception:
-        pass
+    return _get_file_ops(
+        task_id or "default", target, _resolution=resolution,
+    )
 
 
 async def _resolve_container_fallback(
-    p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",)
+    p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",),
+    plan: Optional[_BackendPlan] = None,
 ) -> ResolvedImage:
-    """Read the image bytes inside the sandbox (fail-closed when none exists).
+    """Read the image bytes inside the backend (fail-closed when none exists).
 
     Reached when a host read is not permitted or the host file is absent. The
-    agent can already ``cat`` any container file (file_operations.py reads
+    agent can already ``cat`` any file on the backend (file_tools reads
     root-owned mode-600 files this way), so this stays within the same sandbox
-    boundary and never touches the host filesystem. ``--`` stops a leading-dash
-    path from being parsed as a ``base64`` option; ``base64 -w0`` is GNU-only,
-    so pipe through ``tr -d`` for BusyBox.
+    boundary and never touches the host filesystem.
 
-    Fail-closed: if there is no active sandbox env we refuse rather than falling
-    back to a host read, so a non-cache host path under a sandbox never leaks.
+    The read delegates to the file tools' ``ShellFileOperations.read_file_bytes``
+    via ``tools.file_tools._get_file_ops`` — the same mechanism the ACP adapter
+    uses to inline attachments through a pinned execution target. That path
+    already knows how to look up or lazily create the environment for any
+    execution target (named or default), probes the file with ``stat`` (so
+    directories and special files are rejected before a read is attempted),
+    caps the read, strips terminal-fence leaks from the stream, and validates
+    the base64. ``max_bytes`` bounds the transfer just like the historical
+    in-line ``head -c`` pipeline it replaces.
 
-    Cold-start retry: under Docker the very first exec against a freshly
-    started container can fail (empty pipe / partial setup) while an identical
-    second call succeeds. We retry once with a short delay before giving up,
-    so callers don't see "could not read inside the sandbox" on a file that is
-    verifiably readable on the immediate retry. See #76566.
-
-    Diagnostic: when every attempt fails, the container's own output (stderr
-    + stdout) is folded into the raised error so the user can distinguish
-    "no such file" from "permission denied" from "container never came up"
-    instead of staring at one opaque message.
+    Fail-closed: if the backend env cannot be brought up we refuse rather than
+    falling back to a host read, so a non-cache host path under a sandbox never
+    leaks.
     """
-    import asyncio
-    import shlex
+    if plan is None:
+        plan = _resolve_backend_plan(ctx)
 
-    # Bring the sandbox up on demand: without this, the first vision_analyze of
-    # a session (before any terminal command) has no active env to read from
-    # under a non-local backend (issue #62825).
-    _ensure_container_env(ctx.task_id)
+    # _backend_file_ops looks up (or lazily creates, issue #62825) the
+    # environment for this task under the resolved target. Blocking backend
+    # I/O — keep it off the event loop so a multi-MB base64 read doesn't stall
+    # every other coroutine.
+    def _read() -> Any:
+        ops = _backend_file_ops(
+            ctx.task_id, plan.resolution, target=ctx.target,
+        )
+        return ops.read_file_bytes(str(p), max_bytes=_MAX_INGEST_BYTES)
 
-    env = _get_active_env(ctx.task_id)
-    if env is None:
+    result = await asyncio.to_thread(_read)
+    if getattr(result, "error", None):
         raise SourceNotFound(
-            f"'{p}' is not reachable inside the sandbox and no active sandbox "
-            f"session is available to read it",
+            f"could not read '{p}' inside the backend: {result.error}",
             src=src, origin="container")
-
-    # Bound the read INSIDE the sandbox: head -c caps at ingest-limit+1 bytes
-    # so a huge file (or /dev/zero) can't stream unbounded base64 into host
-    # memory — the +1 byte lets us distinguish "exactly at the cap" from
-    # "over the cap" after decode. The input redirect (< path) avoids argv
-    # entirely, so leading-dash paths can't be parsed as options; base64
-    # -w0 is GNU-only, so pipe through tr -d for BusyBox.
-    # env.execute is a blocking backend exec; keep it off the event loop so a
-    # multi-MB base64 read doesn't stall every other coroutine.
-    qp = shlex.quote(str(p))
-    cmd = f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
-
-    last_res: dict = {"returncode": 1, "output": ""}
-    for attempt in range(2):
-        last_res = await asyncio.to_thread(env.execute, cmd)
-        if last_res.get("returncode", 1) == 0:
-            break
-        if attempt == 0:
-            # Cold-start: give the container a moment to settle its pipes
-            # before retrying. 150ms covers Docker exec warm-up in practice
-            # without making a real failure feel sluggish.
-            await asyncio.sleep(0.15)
-    if last_res.get("returncode", 1) != 0:
-        diag = (last_res.get("output") or "").strip().splitlines()
-        # Keep the diagnostic small and noise-free: first non-empty line,
-        # trimmed to a sane length so it slots into the agent's error UI.
-        first = next((ln.strip() for ln in diag if ln.strip()), "")
-        suffix = f" ({first[:200]})" if first else ""
+    b64 = getattr(result, "base64_content", None)
+    if not b64:
         raise SourceNotFound(
-            f"could not read '{p}' inside the sandbox{suffix}",
+            f"backend returned no data for '{p}'",
             src=src, origin="container")
     try:
-        data = base64.b64decode(last_res.get("output", ""), validate=True)
+        data = base64.b64decode(b64, validate=True)
     except Exception as exc:
-        raise NotAnImage(f"sandbox returned non-image data for '{p}': {exc}", src=src)
-    if len(data) > _MAX_INGEST_BYTES:
-        raise SourceTooLarge("media exceeds size limit", src=src, origin="container")
+        raise NotAnImage(f"backend returned non-image data for '{p}': {exc}", src=src)
     return _finalize(data, "", "container", src, permitted)
 
 
