@@ -4,6 +4,11 @@ Provides ``resolve_display_setting()`` — the single entry-point for reading
 display settings with platform-specific overrides and sensible defaults.
 
 Resolution order (first non-None wins):
+    0. ``display.platforms.<platform>.chats.<chat_id>.<key>``  — per-chat user
+       override (#31488), only consulted when the caller passes ``chat=``.
+       Threads inherit their parent chat's entry: lookup keys are
+       ``chat_id`` → ``thread_id`` → ``parent_chat_id`` (same order as
+       ``channel_overrides``).
     1. ``display.platforms.<platform>.<key>``  — explicit per-platform user override
     2. ``display.<key>``                       — global user setting
     3. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
@@ -195,11 +200,77 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
+def _chat_lookup_keys(chat: Any) -> list:
+    """Ordered chat-id candidates for per-chat display overrides.
+
+    ``chat`` is either a plain chat-id string or a ``SessionSource``-like
+    object.  Mirrors ``_channel_override_lookup_keys`` semantics: the exact
+    chat/thread id first, then the parent channel (threads inherit the
+    parent chat's override).
+    """
+    if chat is None:
+        return []
+    if isinstance(chat, str):
+        return [chat] if chat else []
+    keys: list = []
+    for attr in ("chat_id", "thread_id", "parent_chat_id"):
+        val = getattr(chat, attr, None)
+        if val is None or val == "":
+            continue
+        sk = str(val)
+        if sk not in keys:
+            keys.append(sk)
+    return keys
+
+
+def _chat_override_entries(user_config: dict, platform_key: str, chat: Any):
+    """Yield chat-override mappings matching ``chat`` (most specific first)."""
+    display_cfg = user_config.get("display") or {}
+    platforms = display_cfg.get("platforms") or {}
+    plat_overrides = platforms.get(platform_key)
+    if not isinstance(plat_overrides, dict):
+        return
+    chats = plat_overrides.get("chats")
+    if not isinstance(chats, dict) or not chats:
+        return
+    # Normalise keys to strings: numeric platform chat ids (e.g. Telegram's
+    # -100… group ids) parse as YAML ints while lookup keys are strings.
+    norm: dict = {}
+    for k, v in chats.items():
+        try:
+            norm.setdefault(str(k), v)
+        except Exception:
+            continue
+    for key in _chat_lookup_keys(chat):
+        entry = norm.get(key)
+        if entry is not None:
+            yield entry
+
+
+def has_chat_display_override(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    chat: Any = None,
+) -> bool:
+    """True when ``display.platforms.<platform>.chats.<chat_id>`` explicitly
+    sets ``setting`` for ``chat``.  Used by the per-chat display resolution
+    (#31488) and by the "explicit override required" gates in gateway/run.py.
+    """
+    if chat is None:
+        return False
+    for entry in _chat_override_entries(user_config, platform_key, chat):
+        if isinstance(entry, dict) and setting in entry:
+            return True
+    return False
+
+
 def resolve_display_setting(
     user_config: dict,
     platform_key: str,
     setting: str,
     fallback: Any = None,
+    chat: Any = None,
 ) -> Any:
     """Resolve a display setting with per-platform override support.
 
@@ -214,12 +285,25 @@ def resolve_display_setting(
         Display setting name (e.g. ``"tool_progress"``, ``"show_reasoning"``).
     fallback : Any
         Fallback value when the setting isn't found anywhere.
+    chat : Any, optional
+        Chat context for per-chat overrides (#31488): a chat-id string or a
+        ``SessionSource``-like object.  When given,
+        ``display.platforms.<platform>.chats.<chat_id>.<setting>`` is
+        consulted first; threads inherit their parent chat's entry.
 
     Returns
     -------
     The resolved value, or *fallback* if nothing is configured.
     """
     display_cfg = user_config.get("display") or {}
+
+    # 0. Per-chat override (display.platforms.<platform>.chats.<chat_id>.<key>)
+    if chat is not None:
+        for entry in _chat_override_entries(user_config, platform_key, chat):
+            if isinstance(entry, dict):
+                val = entry.get(setting)
+                if val is not None:
+                    return _normalise(setting, val)
 
     # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
     platforms = display_cfg.get("platforms") or {}

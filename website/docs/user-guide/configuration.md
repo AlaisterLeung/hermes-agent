@@ -2173,6 +2173,26 @@ display:
 
 Platforms without an override fall back to the global `tool_progress` value. Valid platform keys: `telegram`, `discord`, `slack`, `signal`, `whatsapp`, `matrix`, `mattermost`, `email`, `sms`, `homeassistant`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`. The legacy `display.tool_progress_overrides` key still loads for backward compatibility but is deprecated and migrated into `display.platforms` on first load.
 
+### Per-chat display overrides
+
+Any per-platform display setting can also be scoped to a single chat (room/channel/DM) with a `chats` map. Chat ids use the same identifiers the gateway sees elsewhere (Matrix room IDs, Telegram chat IDs, Discord channel IDs, Slack channel IDs):
+
+```yaml
+display:
+  tool_progress: all            # global default
+  platforms:
+    matrix:
+      tool_progress: new        # platform-wide default
+      chats:
+        "!noisyRoom:example.org":
+          tool_progress: 'off'  # quiet this one room
+          interim_assistant_messages: false
+        "!devRoom:example.org":
+          tool_progress: verbose
+```
+
+The `chats` key only affects display settings — per-room model/provider/persona overrides live under `platforms.<name>.channel_overrides`. Threads and forum topics inherit their parent chat's entry; an explicit entry for the thread id wins over the parent. All overridable keys work here, including `interim_assistant_messages`, `show_reasoning`, `streaming`, `long_running_notifications`, and `busy_ack_detail`.
+
 Signal is listed as a valid platform key because the setting can be saved per platform, but the current Signal adapter cannot edit sent messages and does not render tool-progress bubbles. Keep Signal `tool_progress` set to `off`; use the CLI or an editing-capable messaging platform if you need to watch each tool call live.
 
 `interim_assistant_messages` is gateway-only. When enabled, Hermes sends completed mid-turn assistant updates as separate chat messages. This is independent from `tool_progress` and does not require gateway streaming. When disabled, ordinary mid-turn updates stay hidden; decision-critical prose emitted immediately before a `clarify` prompt is still delivered so the interactive choices remain understandable.
