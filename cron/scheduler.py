@@ -1677,6 +1677,30 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _cron_session_id_from_origin(job: dict) -> Optional[str]:
+    """Best-effort cron session id for the digest seed, from job metadata.
+
+    Secondary fallback only: the primary source is the ``HERMES_SESSION_ID``
+    session ContextVar, which the agent binds for the current run and which
+    survives compression-tip rotation. Job metadata carries the id in three
+    legacy/manual shapes:
+      - ``session_id`` key (dashboards / API-created jobs),
+      - a dict-valued ``origin`` (some tooling stamps the origin session),
+      - the historical ``cron_<job_id>_<YYYYmmdd_HHMMSS>`` id embedded in
+        ``last_session_id``.
+    Returns ``None`` when nothing resolvable is present.
+    """
+    direct = job.get("session_id") or job.get("last_session_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    origin = job.get("origin")
+    if isinstance(origin, dict):
+        origin_session = origin.get("session_id")
+        if isinstance(origin_session, str) and origin_session.strip():
+            return origin_session.strip()
+    return None
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery should also be mirrored into the target chat's
     gateway session transcript.
@@ -3398,6 +3422,36 @@ def _deliver_result(
     # live failure reproduced three times on Alice (job ef7bd2869d15).
     _, mirror_text = BasePlatformAdapter.extract_media(content)
     mirror_text = (mirror_text or "").strip()
+
+    # Digest enrichment for mirror-eligible deliveries: when mirroring is on,
+    # seed the continuation session with a bounded digest of the run's own
+    # cron session transcript (tool calls + steps + final response + a
+    # pointer at the original session id) instead of the bare final response,
+    # so a follow-up reply continues from the full context of the run. Off
+    # whenever mirroring is off — the plain mirror_text flows unchanged. The
+    # id comes from the session ContextVar the agent bound for this run
+    # (compression-proof; fallback chain mirrors _final_cron_session_id).
+    _cron_session_id_for_digest: Optional[str] = None
+    if mirror_enabled:
+        try:
+            from gateway.session_context import get_session_env
+            from cron.digest import build_cron_digest
+
+            _cron_session_id_for_digest = (
+                get_session_env("HERMES_SESSION_ID")
+                or _cron_session_id_from_origin(job)
+            )
+            _digest_seed = build_cron_digest(
+                job, _cron_session_id_for_digest, mirror_text
+            )
+            if _digest_seed:
+                mirror_text = _digest_seed
+        except Exception as e:
+            # Digest is pure enrichment — a failure must never gate delivery.
+            logger.debug(
+                "Job '%s': cron digest build failed, seeding plain final "
+                "response: %s", job.get("id", "?"), e,
+            )
 
     try:
         config = load_gateway_config()
