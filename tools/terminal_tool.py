@@ -2294,7 +2294,13 @@ def _get_env_config(terminal_config: Optional[Dict[str, Any]] = None) -> Dict[st
 
     def _get(key: str, env_name: str, default: Any) -> Any:
         if terminal_config is None:
-            return os.getenv(env_name, str(default) if not isinstance(default, (list, dict)) else json.dumps(default))
+            # Scope-aware read (``_tenv``): under a per-turn terminal scope
+            # (gateway multiplexing) values resolve ONLY from the active
+            # profile's policy — a raw ``os.getenv`` here re-created the
+            # first-writer-wins cross-profile leak (#68559) because the
+            # launch profile's TERMINAL_* env stays pinned in os.environ.
+            # With no scope bound this is byte-identical to os.getenv.
+            return _tenv(env_name, str(default) if not isinstance(default, (list, dict)) else json.dumps(default))
         return terminal_config.get(key, default)
 
     def _coerce(value: Any, converter: Any, label: str, key: str) -> Any:
@@ -2418,7 +2424,7 @@ def _get_env_config(terminal_config: Optional[Dict[str, Any]] = None) -> Dict[st
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = (
-            (os.getenv("TERMINAL_CWD") or _safe_getcwd())
+            (_tenv("TERMINAL_CWD") or _safe_getcwd())
             if terminal_config is None
             else (cwd or _safe_getcwd())
         )

@@ -2,6 +2,7 @@
 
 import hashlib
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
@@ -86,10 +87,27 @@ def _patch_gateway_discovery():
     conftest live-system guard and turns into a spurious ``sys.exit(1)``.
     Discovery returning nothing makes the phase a clean no-op for every test
     in this module (none of them assert on gateway restarts).
+
+    ``update_cmd`` late-imports ``find_gateway_pids`` at several call sites
+    (after ``_purge_stale_hermes_modules()`` has evicted mocked modules), and
+    the systemd branch additionally consults ``_get_service_pids`` whose
+    ``systemctl show --property=MainPID`` can return a live PID on machines
+    running real units (observed on CI: PID 16785 outside the test subtree
+    tripped the live-system guard). Patch the module attributes ``update_cmd``
+    reads at call time, plus the service-PID source, so no foreign PID ever
+    enters the restart phase regardless of module-cache state.
     """
+    import hermes_cli.update_cmd as _update_cmd
+    import hermes_cli.image_provenance as _ip
+
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway._get_service_pids", return_value=set()), \
+         patch.object(_update_cmd, "_surviving_gateway_pids_after_failed_restart",
+                      return_value=[]), \
+         patch.object(_ip, "IMAGE_PROVENANCE_PATH",
+                      Path("/nonexistent/hermes-image-provenance.json")):
         yield
 
 

@@ -13,6 +13,7 @@ Two halves:
 """
 import asyncio
 import threading
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -105,35 +106,47 @@ def test_multiplex_ticker_profile_gate_skips_rejected_profile(tmp_path):
     assert (orphan / "cron" / "ticker_last_success").exists()
 
 
-def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch):
-    """The desktop ticker wires the gate to ``_check_gateway_running``."""
+def test_desktop_ticker_gates_on_profile_gateway_running(monkeypatch):
+    """The desktop ticker's per-profile stand-down contract.
+
+    Fork note (b6b03bb643, #7): the desktop ticker is a
+    ``GatewayForwardingCronScheduler`` and no longer resolves a provider via
+    ``resolve_cron_scheduler`` — the upstream doubles here (resolve_cron_
+    scheduler / InProcessCronScheduler) never engage, and the real forwarding
+    scheduler blocks in its sweep loop until the per-file watchdog kills the
+    subprocess (300s, 3 tests lost). The same reason
+    tests/hermes_cli/conftest.py skips test_desktop_cron_ticker_profiles.py.
+    Spy the GatewayForwardingCronScheduler class instead so start() records
+    its kwargs and returns immediately.
+
+    Contract under the forwarding ticker: profile stand-down is NOT wired on
+    the desktop — due fires are forwarded to the owning gateway's
+    /api/cron/fire (which claims via store CAS, so a racing gateway tick
+    cannot double-run the job). Assert the forwarding sweep contract instead
+    of the retired profile_gate kwarg.
+    """
+    import cron.scheduler_provider as sp
     from hermes_cli import web_server
 
-    homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")]
-    monkeypatch.setattr(
-        "hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes)
-    )
-    monkeypatch.setattr(
-        "hermes_cli.profiles._check_gateway_running", lambda home: home.name == "ops"
-    )
     captured = {}
 
-    class _Provider:
-        name = "fake"
-
+    class _SpyForwarding(sp.GatewayForwardingCronScheduler):
         def start(self, stop_event, **kwargs):
             captured.update(kwargs)
 
-    from cron import scheduler_provider as sp
-
-    monkeypatch.setattr(web_server, "resolve_cron_scheduler", lambda: _Provider(), raising=False)
-    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: _Provider())
-    monkeypatch.setattr(sp, "InProcessCronScheduler", _Provider)
+    monkeypatch.setattr(
+        sp, "GatewayForwardingCronScheduler", _SpyForwarding
+    )
     monkeypatch.setattr("hermes_logging.enable_profile_log_routing", lambda homes: None)
 
-    web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
+    web_server._start_desktop_cron_ticker(threading.Event(), interval=7)
 
-    gate = captured.get("profile_gate")
-    assert gate is not None, "desktop ticker did not install a profile gate"
-    assert gate("default", tmp_path / "default") is True
-    assert gate("ops", tmp_path / "ops") is False
+    assert captured.get("interval") == 7, (
+        "the desktop ticker must pass the sweep interval through to the "
+        "forwarding scheduler"
+    )
+    assert captured.get("profile_homes") is None, (
+        "the adapter-less desktop ticker must not tick profile stores locally "
+        "— due fires are forwarded to the gateways' /api/cron/fire, which "
+        "claims them via store CAS (no profile_gate needed)"
+    )

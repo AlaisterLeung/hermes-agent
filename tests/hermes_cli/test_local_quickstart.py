@@ -17,6 +17,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _plentiful_machine(monkeypatch):
+    """The quickstart preflight prices the catalog against REAL hardware
+    (`probe_budget`); on a CI runner with no GPU and little RAM every
+    entry refuses to fit and the POST 409s before reaching the legs under
+    test. Pin a generous budget so the fit gate is deterministic on any
+    machine — the fit decision itself is covered by the recommendation
+    tests, not here."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    roomy = HardwareBudget(usable_vram_bytes=1 << 40,
+                           total_device_bytes=1 << 40,
+                           ram_available_bytes=1 << 40, uma=True)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget", lambda **kw: roomy)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

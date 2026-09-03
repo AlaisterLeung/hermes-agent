@@ -410,9 +410,9 @@ _TOOL_STUBS = {
     ),
     "search_files": (
         "search_files",
-        'pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, execution_target: str = None',
+        'pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, order: str = "discovery", execution_target: str = None',
         '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
-        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "execution_target": execution_target}',
+        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "order": order, "execution_target": execution_target}',
     ),
     "patch": (
         "patch",
