@@ -327,3 +327,245 @@ class TestLiveStatusSetting:
         assert resolve_display_setting({}, "slack", "live_status") == "full"
 
 
+# ---------------------------------------------------------------------------
+# per-chat overrides (#31488) — display.platforms.<plat>.chats.<chat_id>.<key>
+# ---------------------------------------------------------------------------
+
+
+class _FakeSource:
+    """Minimal SessionSource stand-in for resolver tests."""
+
+    def __init__(self, chat_id, thread_id=None, parent_chat_id=None):
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+        self.parent_chat_id = parent_chat_id
+
+
+class TestPerChatDisplayOverrides:
+    """display.platforms.<plat>.chats.<chat_id>.<key> per-chat layer."""
+
+    def test_chat_override_beats_platform_override(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "tool_progress": "new",
+                        "chats": {
+                            "!noisy:example.org": {"tool_progress": "off"},
+                        },
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "matrix", "tool_progress", chat="!noisy:example.org"
+            )
+            == "off"
+        )
+
+    def test_other_chats_fall_through_to_platform_setting(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "tool_progress": "new",
+                        "chats": {
+                            "!noisy:example.org": {"tool_progress": "off"},
+                        },
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "matrix", "tool_progress", chat="!quiet:example.org"
+            )
+            == "new"
+        )
+
+    def test_no_chat_argument_ignores_chats_layer(self):
+        """Legacy call shape (no chat=) must behave exactly as before."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "chats": {"!noisy:example.org": {"tool_progress": "off"}},
+                    },
+                }
+            }
+        }
+        # Built-in matrix default (Tier 2) wins — chats layer is invisible.
+        assert resolve_display_setting(config, "matrix", "tool_progress") == "new"
+
+    def test_interim_assistant_messages_per_chat(self):
+        """The #31488-known gap: interim_assistant_messages resolves per chat."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "chats": {
+                            "-1001234567890": {
+                                "interim_assistant_messages": False,
+                            },
+                        },
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "telegram", "interim_assistant_messages",
+                chat="-1001234567890",
+            )
+            is False
+        )
+        # A different chat in the same platform keeps the default (True).
+        assert (
+            resolve_display_setting(
+                config, "telegram", "interim_assistant_messages",
+                chat="-1009999999999",
+            )
+            is True
+        )
+
+    def test_numeric_chat_ids_match_string_lookups(self):
+        """Telegram numeric ids parse as YAML ints; lookups are strings."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "chats": {
+                            -1001234567890: {"tool_progress": "verbose"},
+                        },
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "telegram", "tool_progress", chat="-1001234567890"
+            )
+            == "verbose"
+        )
+
+    def test_chat_string_values_are_normalised(self):
+        """YAML 1.1 'off' → False coercion applies inside chat entries too."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "slack": {
+                        "chats": {
+                            "C123": {"interim_assistant_messages": "false"},
+                        },
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(
+                config, "slack", "interim_assistant_messages", chat="C123"
+            )
+            is False
+        )
+
+    def test_source_object_thread_inherits_parent_chat(self):
+        """A thread chat falls back to its parent chat's override."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "chats": {
+                            "!room:example.org": {"tool_progress": "off"},
+                        },
+                    },
+                }
+            }
+        }
+        src = _FakeSource(
+            chat_id="$threadevt:example.org",
+            thread_id="$threadevt:example.org",
+            parent_chat_id="!room:example.org",
+        )
+        assert (
+            resolve_display_setting(config, "matrix", "tool_progress", chat=src)
+            == "off"
+        )
+
+    def test_thread_exact_key_beats_parent(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {
+                        "chats": {
+                            "111": {"tool_progress": "verbose"},
+                            "222": {"tool_progress": "off"},
+                        },
+                    },
+                }
+            }
+        }
+        src = _FakeSource(chat_id="222", thread_id="222", parent_chat_id="111")
+        assert (
+            resolve_display_setting(config, "discord", "tool_progress", chat=src)
+            == "off"
+        )
+
+    def test_has_chat_display_override(self):
+        from gateway.display_config import has_chat_display_override
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "chats": {"!room:example.org": {"tool_progress": "off"}},
+                    },
+                }
+            }
+        }
+        assert has_chat_display_override(
+            config, "matrix", "tool_progress", chat="!room:example.org"
+        )
+        assert not has_chat_display_override(
+            config, "matrix", "show_reasoning", chat="!room:example.org"
+        )
+        assert not has_chat_display_override(
+            config, "matrix", "tool_progress", chat="!other:example.org"
+        )
+        assert not has_chat_display_override(config, "matrix", "tool_progress")
+
+    def test_null_entry_is_ignored(self):
+        """A chat entry that is not a mapping (e.g. empty YAML value) is skipped."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "chats": {"!room:example.org": None},
+                    },
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(config, "matrix", "tool_progress", chat="!room:example.org")
+            == "new"
+        )
+
+

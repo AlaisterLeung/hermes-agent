@@ -785,8 +785,14 @@ def _resolve_progress_thread_id(
     return None
 
 
-def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
-    """Return True when display.platforms.<platform> explicitly sets setting."""
+def _has_platform_display_override(
+    user_config: dict, platform_key: str, setting: str, chat: Any = None
+) -> bool:
+    """Return True when display.platforms.<platform> explicitly sets setting.
+
+    With ``chat`` given, also matches the per-chat layer
+    ``display.platforms.<platform>.chats.<chat_id>`` (#31488).
+    """
     display = user_config.get("display") if isinstance(user_config, dict) else None
     if not isinstance(display, dict):
         return False
@@ -794,26 +800,44 @@ def _has_platform_display_override(user_config: dict, platform_key: str, setting
     if not isinstance(platforms, dict):
         return False
     platform_cfg = platforms.get(platform_key)
-    return isinstance(platform_cfg, dict) and setting in platform_cfg
+    if not isinstance(platform_cfg, dict):
+        return False
+    if setting in platform_cfg:
+        return True
+    if chat is not None:
+        from gateway.display_config import has_chat_display_override
+
+        return has_chat_display_override(user_config, platform_key, setting, chat)
+    return False
 
 
 def _resolve_gateway_display_bool(
     user_config: dict, platform_key: str, setting: str, *, default: bool = False,
-    platform: Any = None, require_platform_override_for: set[Any] | None = None) -> bool:
+    platform: Any = None, chat: Any = None,
+    require_platform_override_for: set[Any] | None = None) -> bool:
     """Resolve a boolean display setting with optional platform-only opt-in.
 
-    Scratch-text is too noisy for threaded surfaces (Mattermost): they need an explicit per-platform override.
+    Some display features expose assistant scratch text rather than deliberate
+    user-facing output.  For high-noise threaded chat surfaces such as
+    Mattermost, a global opt-in is too broad: they must be enabled with an
+    explicit display.platforms.<platform>.<setting> override (a per-chat
+    ``chats.<id>.<setting>`` override satisfies the gate too, #31488).
     """
     current_platform = _gateway_platform_value(platform or platform_key)
     platform_only = {_gateway_platform_value(c) for c in (require_platform_override_for or set())}
     if (
         current_platform in platform_only
-        and not _has_platform_display_override(user_config, platform_key, setting)):
+        and not _has_platform_display_override(
+            user_config, platform_key, setting, chat
+        )
+    ):
         return False
 
     from gateway.display_config import resolve_display_setting
 
-    value = resolve_display_setting(user_config, platform_key, setting, default)
+    value = resolve_display_setting(
+        user_config, platform_key, setting, default, chat=chat
+    )
     if isinstance(value, bool):
         return value
     if isinstance(value, str):

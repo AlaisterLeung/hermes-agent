@@ -1,10 +1,27 @@
 """Per-platform display/verbosity resolver (``resolve_display_setting``).
 
-Resolution order, first non-None wins: ``display.platforms.<platform>.<key>`` →
-``display.<key>`` → ``_PLATFORM_DEFAULTS[platform][key]`` → ``_GLOBAL_DEFAULTS[key]``.
-Exception: ``display.streaming`` is CLI-only; gateway streaming follows the top-level
-``streaming`` config unless a per-platform override sets it. Legacy
-``display.tool_progress_overrides`` is still read as a ``tool_progress`` fallback.
+Provides ``resolve_display_setting()`` — the single entry-point for reading
+display settings with platform-specific overrides and sensible defaults.
+
+Resolution order (first non-None wins):
+    0. ``display.platforms.<platform>.chats.<chat_id>.<key>``  — per-chat user
+       override (#31488), only consulted when the caller passes ``chat=``.
+       Threads inherit their parent chat's entry: lookup keys are
+       ``chat_id`` → ``thread_id`` → ``parent_chat_id`` (same order as
+       ``channel_overrides``).
+    1. ``display.platforms.<platform>.<key>``  — explicit per-platform user override
+    2. ``display.<key>``                       — global user setting
+    3. ``_PLATFORM_DEFAULTS[<platform>][<key>]``  — built-in sensible default
+    4. ``_GLOBAL_DEFAULTS[<key>]``              — built-in global default
+
+Exception: ``display.streaming`` is CLI-only.  Gateway streaming follows the
+top-level ``streaming`` config unless ``display.platforms.<platform>.streaming``
+sets an explicit per-platform override.
+
+Backward compatibility: ``display.tool_progress_overrides`` is still read as a
+fallback for ``tool_progress`` when no ``display.platforms`` entry exists.  A
+config migration (version bump) automatically moves the old format into the new
+``display.platforms`` structure.
 """
 
 from __future__ import annotations
@@ -78,17 +95,121 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 OVERRIDEABLE_KEYS = frozenset(_GLOBAL_DEFAULTS.keys())
 
 
-def resolve_display_setting(user_config: dict, platform_key: str, setting: str, fallback: Any = None) -> Any:
-    """Resolve a display setting with per-platform override support (see module docstring for order).
+def _chat_lookup_keys(chat: Any) -> list:
+    """Ordered chat-id candidates for per-chat display overrides.
 
-    ``platform_key`` is the platform config key (``"telegram"``; see ``_platform_config_key`` in
-    gateway/run.py). Returns *fallback* when nothing is configured.
+    ``chat`` is either a plain chat-id string or a ``SessionSource``-like
+    object.  Mirrors ``_channel_override_lookup_keys`` semantics: the exact
+    chat/thread id first, then the parent channel (threads inherit the
+    parent chat's override).
+    """
+    if chat is None:
+        return []
+    if isinstance(chat, str):
+        return [chat] if chat else []
+    keys: list = []
+    for attr in ("chat_id", "thread_id", "parent_chat_id"):
+        val = getattr(chat, attr, None)
+        if val is None or val == "":
+            continue
+        sk = str(val)
+        if sk not in keys:
+            keys.append(sk)
+    return keys
+
+
+def _chat_override_entries(user_config: dict, platform_key: str, chat: Any):
+    """Yield chat-override mappings matching ``chat`` (most specific first)."""
+    display_cfg = user_config.get("display") or {}
+    platforms = display_cfg.get("platforms") or {}
+    plat_overrides = platforms.get(platform_key)
+    if not isinstance(plat_overrides, dict):
+        return
+    chats = plat_overrides.get("chats")
+    if not isinstance(chats, dict) or not chats:
+        return
+    # Normalise keys to strings: numeric platform chat ids (e.g. Telegram's
+    # -100… group ids) parse as YAML ints while lookup keys are strings.
+    norm: dict = {}
+    for k, v in chats.items():
+        try:
+            norm.setdefault(str(k), v)
+        except Exception:
+            continue
+    for key in _chat_lookup_keys(chat):
+        entry = norm.get(key)
+        if entry is not None:
+            yield entry
+
+
+def has_chat_display_override(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    chat: Any = None,
+) -> bool:
+    """True when ``display.platforms.<platform>.chats.<chat_id>`` explicitly
+    sets ``setting`` for ``chat``.  Used by the per-chat display resolution
+    (#31488) and by the "explicit override required" gates in gateway/run.py.
+    """
+    if chat is None:
+        return False
+    for entry in _chat_override_entries(user_config, platform_key, chat):
+        if isinstance(entry, dict) and setting in entry:
+            return True
+    return False
+
+
+def resolve_display_setting(
+    user_config: dict,
+    platform_key: str,
+    setting: str,
+    fallback: Any = None,
+    chat: Any = None,
+) -> Any:
+    """Resolve a display setting with per-platform override support.
+
+    Parameters
+    ----------
+    user_config : dict
+        The full parsed config.yaml dict.
+    platform_key : str
+        Platform config key (e.g. ``"telegram"``, ``"slack"``).  Use
+        ``_platform_config_key(source.platform)`` from gateway/run.py.
+    setting : str
+        Display setting name (e.g. ``"tool_progress"``, ``"show_reasoning"``).
+    fallback : Any
+        Fallback value when the setting isn't found anywhere.
+    chat : Any, optional
+        Chat context for per-chat overrides (#31488): a chat-id string or a
+        ``SessionSource``-like object.  When given,
+        ``display.platforms.<platform>.chats.<chat_id>.<setting>`` is
+        consulted first; threads inherit their parent chat's entry.
+
+    Returns
+    -------
+    The resolved value, or *fallback* if nothing is configured.
     """
     display_cfg = user_config.get("display") or {}
-    plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
-    if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
-        return _normalise(setting, plat_overrides[setting])
-    if setting == "tool_progress":  # legacy display.tool_progress_overrides.<platform>
+
+    # 0. Per-chat override (display.platforms.<platform>.chats.<chat_id>.<key>)
+    if chat is not None:
+        for entry in _chat_override_entries(user_config, platform_key, chat):
+            if isinstance(entry, dict):
+                val = entry.get(setting)
+                if val is not None:
+                    return _normalise(setting, val)
+
+    # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
+    platforms = display_cfg.get("platforms") or {}
+    plat_overrides = platforms.get(platform_key)
+    if isinstance(plat_overrides, dict):
+        val = plat_overrides.get(setting)
+        if val is not None:
+            return _normalise(setting, val)
+
+    # 1b. Backward compat: display.tool_progress_overrides.<platform>
+    if setting == "tool_progress":
         legacy = display_cfg.get("tool_progress_overrides")
         if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
             return _normalise(setting, legacy[platform_key])

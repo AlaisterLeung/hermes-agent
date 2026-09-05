@@ -1437,6 +1437,7 @@ class GatewayTurnMixin:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
+                chat=source,
                 require_platform_override_for={Platform.MATTERMOST},
             )
         except Exception:
