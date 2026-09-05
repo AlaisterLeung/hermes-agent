@@ -137,6 +137,74 @@ def _attr(obj: Any, name: str) -> str | None:
     return str(getattr(obj, name, "") or "").strip() or None
 
 
+
+def _pinned_execution_target_resolution():
+    """Resolution of the process-pinned execution target, or None.
+
+    ``hermes acp -t NAME`` registers the pinned config via
+    ``set_execution_target_config_source`` (entry.py). Re-resolving the
+    default through that authority yields the same named resolution the
+    tool dispatch uses. Returns None when no target was pinned (plain
+    local ACP server) or when resolution fails.
+    """
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        resolution = resolve_execution_target()
+    except Exception:
+        return None
+    if resolution is None or not getattr(resolution, "named", False):
+        return None
+    return resolution
+
+
+def _resource_link_via_target(
+    uri: str,
+    path,
+    *,
+    name: str | None,
+    title: str | None,
+    mime_type: str | None,
+) -> list[dict[str, Any]]:
+    """Read an attachment through the pinned execution target's backend.
+
+    The editor attaches files by workspace path on the machine it runs on;
+    with a named SSH execution target that host is the target backend,
+    not the ACP server's local filesystem. Reuse ShellFileOperations
+    so the read follows the same path handling, binary detection, and
+    encoding rules as read_file.
+    """
+    from tools.file_tools import _get_file_ops
+
+    ident = dict(uri=uri, name=name, title=title)
+    try:
+        file_ops = _get_file_ops("default")
+    except Exception as exc:
+        logger.warning("ACP target-attachment environment failed: %s", uri, exc_info=True)
+        return _text_parts(**ident, body=f"[Could not open an execution-target environment to read the attachment: {exc}]")
+    env = getattr(file_ops, "env", None)
+    if env is None:
+        return _text_parts(**ident, body="[Execution-target environment unavailable to read the attachment.]")
+
+    image_mime = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
+    if image_mime and _is_image_resource(image_mime):
+        raw = file_ops.read_file_bytes(str(path), max_bytes=_MAX_ACP_RESOURCE_BYTES)
+        if raw.error or not raw.base64_content:
+            return _text_parts(**ident, body=f"[Could not read attached image via execution target: {raw.error or 'no data'}]")
+        import base64 as _b64
+
+        data = _b64.b64decode(raw.base64_content)
+        return _image_parts(uri, _resource_display_name(uri, name=name, title=title), data, image_mime)
+
+    result = file_ops.read_file(str(path))
+    if result.error:
+        return _text_parts(**ident, body=f"[Could not read attached file via execution target: {result.error}]")
+    note = None
+    if result.file_size and result.file_size > _MAX_ACP_RESOURCE_BYTES:
+        note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {result.file_size} bytes"
+    return _text_parts(**ident, body=result.content or "", note=note)
+
+
 def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]:
     """ACP resource_link -> OpenAI content parts: images become a text header + image_url,
     everything else a single text part with the inlined body (or a binary-omit note)."""
@@ -152,6 +220,15 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
         return _text_parts(
             **ident, body="[Resource link only; Hermes cannot read non-file ACP resource URIs directly.]"
         )
+
+    # Named execution targets: the URI path exists on the target backend
+    # (e.g. the SSH host where the editor's workspace lives), not on the
+    # ACP server's local filesystem. Route the read through the same
+    # file-operations layer the tools use so remote workspace files attach.
+    resolution = _pinned_execution_target_resolution()
+    if resolution is not None and resolution.backend != "local":
+        return _resource_link_via_target(uri, path, name=name, title=title,
+                                         mime_type=mime_type)
 
     image_mime = mime_type if _is_image_resource(mime_type) else _IMAGE_SUFFIX_MIME.get(path.suffix.lower())
     if image_mime and _is_image_resource(image_mime):
