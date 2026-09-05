@@ -135,6 +135,67 @@ class TestPrepareMessagesForNonVision:
         assert "[Image: thing]" in out[2]["content"]
 
 
+class TestFallbackAnalysisTarget:
+    """The pre-analysis fallback must read its materialized temp file from THIS
+    host (target="local").
+
+    `_describe_image_for_anthropic_fallback` materializes data: URLs to a local
+    /tmp file. The `vision_analyze` `target` argument follows
+    ``terminal.default_target`` when omitted — and ``hermes acp -t <name>``
+    pins that to a remote backend process-wide — so an omitted target routed
+    the host-local path to the remote backend and failed with "File not found
+    inside the backend" (ACP image attachments were unreadable, 2026-08-31).
+    """
+
+    def test_fallback_analysis_pins_target_local(self, tmp_path):
+        import base64
+        import asyncio as _asyncio
+
+        agent = _make_agent()
+        png = tmp_path / "probe.png"
+        png.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="))
+
+        captured = {}
+
+        async def fake_tool(**kwargs):
+            captured.update(kwargs)
+            return '{"success": true, "analysis": "ok"}'
+
+        # Patch vision_analyze_tool; run the real asyncio.run in the fallback.
+        # NOTE: the fallback imports the symbol lazily inside the function
+        # (`from tools.vision_tools import vision_analyze_tool`), so patch the
+        # source module attribute.
+        with patch("tools.vision_tools.vision_analyze_tool", fake_tool):
+            note = agent._describe_image_for_anthropic_fallback(str(png), "user")
+
+        assert captured["image_url"] == str(png)
+        # THE CONTRACT: the host-local temp file is analyzed on the local target,
+        # never routed to terminal.default_target.
+        assert captured["target"] == "local"
+        assert "ok" in note
+
+    def test_fallback_analysis_still_caches_result(self, tmp_path):
+        import base64
+
+        agent = _make_agent()
+        png = tmp_path / "probe.png"
+        png.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="))
+
+        calls = {"n": 0}
+
+        async def fake_tool(**kwargs):
+            calls["n"] += 1
+            return '{"success": true, "analysis": "cached?"}'
+
+        with patch("tools.vision_tools.vision_analyze_tool", side_effect=fake_tool):
+            first = agent._describe_image_for_anthropic_fallback(str(png), "user")
+            second = agent._describe_image_for_anthropic_fallback(str(png), "user")
+        assert calls["n"] == 1
+        assert first == second
+
+
 # ─── _model_supports_vision ──────────────────────────────────────────────────
 
 

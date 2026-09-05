@@ -579,7 +579,15 @@ async def _resize_prepared(prepared: _PreparedImage, scale_info: dict, **kwargs)
 
 
 async def _vision_analyze_native(
+<<<<<<< HEAD
     image_url: str, question: str, task_id: Optional[str] = None, region: Optional[list] = None,
+=======
+    image_url: str,
+    question: str,
+    task_id: Optional[str] = None,
+    region: Optional[list] = None,
+    target: Optional[str] = None,
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
 ) -> Any:
     """Fast path for vision-capable main models: a ``_multimodal`` envelope dict on success,
     or a JSON error string (the normal tool-result contract) on failure."""
@@ -591,8 +599,15 @@ async def _vision_analyze_native(
         if is_interrupted():
             return tool_error("Interrupted", success=False)
         try:
+<<<<<<< HEAD
             prepared = await _prepare_image(image_url, task_id, region, validate_decode=True)
         except _ImagePrepError as exc:
+=======
+            resolved = await resolve_image_source(
+                image_url, ResolveContext(task_id=task_id, target=target)
+            )
+        except ImageResolutionError as exc:
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
             return tool_error(str(exc), success=False)
         image_data_url = await _run_encode_on_cpu_executor(
             _image_to_base64_data_url, prepared.path, mime_type=prepared.mime)
@@ -624,6 +639,7 @@ async def _vision_analyze_native(
             _unlink_quietly(prepared.path)
 
 
+<<<<<<< HEAD
 def _aux_call_kwargs(messages: list, model: Optional[str], default_timeout: float, *,
                      min_timeout: Optional[float] = None) -> dict:
     """``async_call_llm`` kwargs with ``auxiliary.vision.timeout`` / ``.temperature`` from config.
@@ -709,6 +725,47 @@ async def _run_analysis(
     ``stage(user_prompt, debug_call_data, temp_paths)`` returns ``(analysis, scale_note)``; temp
     files it appends to ``temp_paths`` are deleted in ``finally``. Returns JSON
     ``{"success": bool, "analysis": str}`` (``analysis`` carries the error explanation on failure).
+=======
+async def vision_analyze_tool(
+    image_url: str,
+    user_prompt: str,
+    model: str = None,
+    task_id: Optional[str] = None,
+    region: Optional[list] = None,
+    target: Optional[str] = None,
+) -> str:
+    """
+    Analyze an image from a URL or local file path using vision AI.
+    
+    This tool accepts either an HTTP/HTTPS URL or a local file path. For URLs,
+    it downloads the image first. In both cases, the image is converted to base64
+    and processed using Gemini 3 Flash Preview via OpenRouter API.
+    
+    The user_prompt parameter is expected to be pre-formatted by the calling
+    function (typically model_tools.py) to include both full description
+    requests and specific questions.
+    
+    Args:
+        image_url (str): The URL or local file path of the image to analyze.
+                         Accepts http://, https:// URLs or absolute/relative file paths.
+        user_prompt (str): The pre-formatted prompt for the vision model
+        model (str): The vision model to use (default: google/gemini-3-flash-preview)
+    
+    Returns:
+        str: JSON string containing the analysis results with the following structure:
+             {
+                 "success": bool,
+                 "analysis": str (defaults to error message if None)
+             }
+    
+    Raises:
+        Exception: If download fails, analysis fails, or API key is not set
+        
+    Note:
+        - For URLs, temporary images are stored under $HERMES_HOME/cache/vision/ and cleaned up
+        - For local file paths, the file is used directly and NOT deleted
+        - Supports common image formats (JPEG, PNG, GIF, WebP, etc.)
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
     """
     tool_name, rules = _ANALYSIS_KINDS[kind]
     if not isinstance(user_prompt, str):
@@ -727,6 +784,7 @@ async def _run_analysis(
             return tool_error("Interrupted", success=False)
         logger.info("Analyzing %s: %s", kind, source[:60])
         logger.info("User prompt: %s", user_prompt[:100])
+<<<<<<< HEAD
         analysis, scale_note = await stage(user_prompt, debug_call_data, temp_paths)
         analysis_length = len(analysis) if analysis else 0
         logger.info("%s analysis completed (%s characters)", kind.capitalize(), analysis_length)
@@ -749,6 +807,47 @@ async def _run_analysis(
     finally:
         for path in temp_paths:
             if path and path.exists():
+=======
+
+        # Resolve the source to raw bytes through the single resolver (unifies
+        # data:/http/file/local/container and enforces terminal-backend
+        # confinement). Materialize to a temp file so the existing path-based
+        # encode/resize pipeline below is reused verbatim.
+        from tools.image_source import (
+            ImageResolutionError,
+            ResolveContext,
+            resolve_image_source,
+        )
+
+        try:
+            resolved = await resolve_image_source(
+                image_url, ResolveContext(task_id=task_id, target=target)
+            )
+        except ImageResolutionError as exc:
+            raise ValueError(str(exc))
+
+        detected_mime_type = resolved.mime
+        temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
+        await asyncio.to_thread(temp_image_path.write_bytes, resolved.data)
+        should_cleanup = True
+
+        # Get image file size for logging
+        image_size_bytes = len(resolved.data)
+        image_size_kb = image_size_bytes / 1024
+        logger.info("Image ready (%.1f KB)", image_size_kb)
+        # Normalize unsupported formats (SVG, BMP, ...) to PNG. Vision providers
+        # reject these media types; convert before encoding. Offloaded — the
+        # rasterizers/Pillow are blocking.
+        normalized_path, detected_mime_type, _norm_err = await asyncio.to_thread(
+            _normalize_to_supported_image, temp_image_path, detected_mime_type,
+        )
+        if _norm_err or normalized_path is None:
+            raise ValueError(_norm_err or "Image normalization failed.")
+        if normalized_path != temp_image_path:
+            if should_cleanup and temp_image_path.exists():
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
                 try:
                     path.unlink()
                     logger.debug("Cleaned up temporary %s file", kind)
@@ -854,6 +953,10 @@ VISION_ANALYZE_SCHEMA = {
                     "re-call with a region to zoom into small text or fine "
                     "detail."
                 )
+            },
+            "target": {
+                "type": "string",
+                "description": "Optional named execution target, for example 'local' or 'devbox'. Uses terminal.default_target when omitted."
             }
         },
         "required": ["image_url", "question"]
@@ -861,6 +964,7 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+<<<<<<< HEAD
 def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
     """First non-empty ``auxiliary.<section>.model`` from config.yaml, else the first non-empty
     env var (legacy override), else None."""
@@ -871,6 +975,14 @@ def _configured_aux_model(sections: tuple, env_vars: tuple) -> Optional[str]:
                 return str(_vmodel).strip()
             break
     return next((v for v in (os.getenv(e, "").strip() for e in env_vars) if v), None)
+=======
+async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
+    image_url = args.get("image_url", "")
+    question = args.get("question", "")
+    region = args.get("region")
+    target = args.get("target")
+    task_id = kw.get("task_id")
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
 
 
 async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
@@ -880,14 +992,36 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # encode/resize step, so multi-image fan-out keeps full request concurrency.
     if _should_use_native_vision_fast_path():
         logger.info("vision_analyze: native fast path")
-        return await _vision_analyze_native(image_url, question, task_id=task_id, region=region)
+        return await _vision_analyze_native(
+            image_url, question, task_id=task_id, region=region, target=target
+        )
 
     # Legacy path: aux LLM describes the image and we return its text.
     full_prompt = (
         "Fully describe and explain everything about this image, then answer the "
+<<<<<<< HEAD
         f"following question:\n\n{question}")
     model = _configured_aux_model(("vision",), ("AUXILIARY_VISION_MODEL",))
     return await vision_analyze_tool(image_url, full_prompt, model, task_id=task_id, region=region)
+=======
+        f"following question:\n\n{question}"
+    )
+    # Prefer config.yaml auxiliary.vision.model; env var is a legacy override.
+    model = None
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        _vmodel = cfg_get(_cfg, "auxiliary", "vision", "model")
+        if _vmodel:
+            model = str(_vmodel).strip() or None
+    except Exception:
+        pass
+    if not model:
+        model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    return await vision_analyze_tool(
+        image_url, full_prompt, model, task_id=task_id, region=region, target=target
+    )
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
 
 
 registry.register(
@@ -930,6 +1064,7 @@ def _video_to_base64_data_url(video_path: Path, mime_type: Optional[str] = None)
     return f"data:{mime};base64,{base64.b64encode(video_path.read_bytes()).decode('ascii')}"
 
 
+<<<<<<< HEAD
 async def _materialize_video(video_url: str, task_id: Optional[str], temp_paths: list) -> Path:
     """Local video path for a terminal-backend path, local file, or HTTP(S) URL. Only files created
     here are appended to ``temp_paths`` — never user-provided paths. Terminal-backend reads use the
@@ -947,6 +1082,94 @@ async def _materialize_video(video_url: str, task_id: Optional[str], temp_paths:
         suffix = Path(source).suffix.lower()
         if suffix not in _VIDEO_MIME_TYPES:
             raise ValueError(_unsupported_video_format(suffix))
+=======
+def _terminal_backend_is_local() -> bool:
+    backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
+    return backend in ("", "local")
+
+
+def _is_path_like_video_source(value: str) -> bool:
+    lowered = (value or "").strip().lower()
+    if not lowered:
+        return False
+    return not lowered.startswith(("http://", "https://", "data:"))
+
+
+def _video_backend_is_local(target: Optional[str] = None) -> bool:
+    """True when the governing execution target runs directly on the host.
+
+    Target-aware replacement for the legacy ``TERMINAL_ENV`` sniff: an explicit
+    named target (or ``terminal.default_target``) decides, matching the image
+    resolver's confinement logic.
+    """
+    if not target:
+        return _terminal_backend_is_local()
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        resolution = resolve_execution_target(target)
+        return resolution.backend == "local"
+    except Exception:
+        return False
+
+
+async def _materialize_video_from_terminal_backend(
+    video_source: str, task_id: Optional[str], target: Optional[str] = None,
+) -> Path:
+    """Read a path via the shared media resolver into a local temp video file.
+
+    Routes through :func:`tools.image_source.resolve_image_source` with
+    ``permitted=("video",)`` so terminal-backend video reads get the exact
+    pipeline vision_analyze uses: media-cache host reads (gateway-downloaded
+    videos live on the host, not in the sandbox), bounded in-sandbox exec-read
+    (``head -c`` cap — no unbounded base64 stream, no python3 dependency in
+    the sandbox image), lazy env bring-up (#62825), the credential-read
+    guard, and the 50MB ingest cap.
+    """
+    from tools.image_source import ImageResolutionError, ResolveContext, resolve_image_source
+
+    source = video_source
+    if source.startswith("file://"):
+        source = source[len("file://"):]
+    suffix = Path(source).suffix.lower()
+    if suffix not in _VIDEO_MIME_TYPES:
+        raise ValueError(
+            f"Unsupported video format: '{suffix}'. "
+            f"Supported: {', '.join(sorted(_VIDEO_MIME_TYPES.keys()))}"
+        )
+
+    try:
+        resolved = await resolve_image_source(
+            video_source, ResolveContext(task_id=task_id, target=target),
+            permitted=("video",)
+        )
+    except ImageResolutionError as exc:
+        raise ValueError(f"Could not read video from terminal backend: {exc}") from exc
+
+    temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"terminal_video_{uuid.uuid4()}{suffix}"
+    temp_path.write_bytes(resolved.data)
+    return temp_path
+
+
+async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
+    """Download video from URL with SSRF protection and retry."""
+    import asyncio
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _ssrf_redirect_guard(response):
+        from tools.url_safety import async_is_safe_url, redirect_target_from_response
+        redirect_url = redirect_target_from_response(response)
+        if redirect_url and not await async_is_safe_url(redirect_url):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {redirect_url}"
+            )
+
+    last_error = None
+    for attempt in range(max_retries):
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
         try:
             resolved = await resolve_image_source(
                 video_url, ResolveContext(task_id=task_id), permitted=("video",))
@@ -978,10 +1201,77 @@ async def _materialize_video(video_url: str, task_id: Optional[str], temp_paths:
 
 
 async def video_analyze_tool(
+<<<<<<< HEAD
     video_url: str, user_prompt: str, model: str = None, task_id: Optional[str] = None) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     async def stage(prompt: str, debug_call_data: dict, temp_paths: list) -> tuple:
         temp_video_path = await _materialize_video(video_url, task_id, temp_paths)
+=======
+    video_url: str,
+    user_prompt: str,
+    model: str = None,
+    task_id: Optional[str] = None,
+    target: Optional[str] = None,
+) -> str:
+    """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
+    if not isinstance(user_prompt, str):
+        user_prompt = str(user_prompt) if user_prompt is not None else ""
+    debug_call_data = {
+        "parameters": {
+            "video_url": video_url,
+            "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
+            "model": model,
+        },
+        "error": None,
+        "success": False,
+        "analysis_length": 0,
+        "model_used": model,
+        "video_size_bytes": 0,
+    }
+
+    temp_video_path = None
+    should_cleanup = True
+
+    try:
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return tool_error("Interrupted", success=False)
+
+        logger.info("Analyzing video: %s", video_url[:60])
+        logger.info("User prompt: %s", user_prompt[:100])
+
+        # Resolve local path vs remote URL
+        resolved_url = video_url
+        if resolved_url.startswith("file://"):
+            resolved_url = resolved_url[len("file://"):]
+        local_path = Path(os.path.expanduser(resolved_url))
+
+        if not _video_backend_is_local(target) and _is_path_like_video_source(video_url):
+            logger.info("Reading video source via terminal backend: %s", video_url)
+            temp_video_path = await _materialize_video_from_terminal_backend(
+                video_url, task_id, target
+            )
+            should_cleanup = True
+        elif local_path.is_file():
+            from agent.file_safety import raise_if_read_blocked
+            raise_if_read_blocked(str(local_path))
+            logger.info("Using local video file: %s", video_url)
+            temp_video_path = local_path
+            should_cleanup = False
+        elif await _validate_image_url_async(video_url):
+            blocked = check_website_access(video_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
+            temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
+            await _download_video(video_url, temp_video_path)
+            should_cleanup = True
+        else:
+            raise ValueError(
+                "Invalid video source. Provide an HTTP/HTTPS URL or a valid local file path."
+            )
+
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
         video_size_bytes = temp_video_path.stat().st_size
         video_size_mb = video_size_bytes / (1024 * 1024)
         logger.info("Video ready (%.1f MB)", video_size_mb)
@@ -1024,6 +1314,10 @@ VIDEO_ANALYZE_SCHEMA = {
                 "type": "string",
                 "description": "Your specific question about the video. The AI will describe what happens in the video and answer your question.",
             },
+            "target": {
+                "type": "string",
+                "description": "Optional named execution target, for example 'local' or 'devbox'. Uses terminal.default_target when omitted.",
+            },
         },
         "required": ["video_url", "question"],
     },
@@ -1031,6 +1325,7 @@ VIDEO_ANALYZE_SCHEMA = {
 
 
 def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+<<<<<<< HEAD
     video_url, question = args.get("video_url", ""), args.get("question", "")
     full_prompt = (
         "Fully describe and explain everything happening in this video, "
@@ -1038,6 +1333,30 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         f"transitions. Then answer the following question:\n\n{question}")
     model = _configured_aux_model(("video", "vision"), ("AUXILIARY_VIDEO_MODEL", "AUXILIARY_VISION_MODEL"))
     return video_analyze_tool(video_url, full_prompt, model, task_id=kw.get("task_id"))
+=======
+    video_url = args.get("video_url", "")
+    question = args.get("question", "")
+    target = args.get("target")
+    full_prompt = (
+        "Fully describe and explain everything happening in this video, "
+        "including visual content, motion, audio cues, text overlays, and scene "
+        f"transitions. Then answer the following question:\n\n{question}"
+    )
+    # Prefer config.yaml auxiliary.video.model (falling back to vision);
+    # env vars are a legacy override.
+    model = None
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        _cfg = load_config()
+        _vmodel = cfg_get(_cfg, "auxiliary", "video", "model") or cfg_get(_cfg, "auxiliary", "vision", "model")
+        if _vmodel:
+            model = str(_vmodel).strip() or None
+    except Exception:
+        pass
+    if not model:
+        model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
+    return video_analyze_tool(video_url, full_prompt, model, task_id=kw.get("task_id"), target=target)
+>>>>>>> c733415018 (feat(vision): add target argument for named execution target media resolution (#9))
 
 
 registry.register(

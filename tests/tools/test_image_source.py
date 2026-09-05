@@ -36,12 +36,24 @@ def _reload(monkeypatch, hermes_home: Path):
 
 @pytest.fixture(autouse=True)
 def _no_real_sandbox_bringup(monkeypatch):
-    """Neutralize the resolver's lazy sandbox bring-up (issue #62825) so unit
-    tests never spawn a real ssh/docker env. Patched on terminal_tool (which
-    _reload does not touch) and resolved at call time, so it survives the
-    per-test image_source reload. The bring-up tests override it."""
-    import tools.terminal_tool as tt
-    monkeypatch.setattr(tt, "ensure_task_env", lambda *a, **k: None)
+    """Neutralize real sandbox bring-up so unit tests never spawn a real
+    ssh/docker env. The resolver delegates to tools.file_tools._get_file_ops;
+    patching that indirection (which _reload does not touch) covers the
+    per-test image_source reload. The delegation tests override it."""
+    import tools.image_source as isrc_src
+    monkeypatch.setattr(
+        isrc_src, "_backend_file_ops",
+        lambda task_id, resolution, target=None: _FailingFileOps(),
+        raising=False,
+    )
+
+
+class _FailingFileOps:
+    """Default stub when a test doesn't expect a backend read at all."""
+
+    def read_file_bytes(self, path, max_bytes=None):
+        return SimpleNamespace(
+            error=f"unexpected backend read of {path!r}", base64_content=None)
 
 
 class TestDataUrl:
@@ -157,7 +169,7 @@ class TestNonLocalBackendConfinement:
     @pytest.mark.asyncio
     async def test_host_secret_outside_cache_routes_to_sandbox_not_host(self, tmp_path, monkeypatch):
         """A non-cache host path (e.g. /etc/passwd) must NOT be host-read — it
-        routes to the in-sandbox exec-read, which reads the CONTAINER's file."""
+        routes to the in-backend read, which reads the CONTAINER's file."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -166,36 +178,44 @@ class TestNonLocalBackendConfinement:
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY-DO-NOT-LEAK")
 
-        # Fake sandbox env: its exec-read returns a *different* (container) image,
-        # proving we read the container filesystem, not the host secret.
+        # Fake backend file-ops: its exec-read returns a *different* (container)
+        # image, proving we read the container filesystem, not the host secret.
         container_png_b64 = base64.b64encode(PNG).decode()
         calls = {}
 
-        def fake_execute(cmd, **kw):
-            calls["cmd"] = cmd
-            return {"returncode": 0, "output": container_png_b64}
+        class _FakeOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                calls["path"] = path
+                calls["max_bytes"] = max_bytes
+                return SimpleNamespace(
+                    error=None, base64_content=container_png_b64, is_binary=True)
 
-        with patch("tools.image_source._get_active_env",
-                   return_value=SimpleNamespace(execute=fake_execute)):
+        with patch("tools.image_source._backend_file_ops", return_value=_FakeOps()):
             res = await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))
 
-        # Read came from the sandbox exec-read, returning the container image —
+        # Read came from the backend exec-read, returning the container image —
         # the host secret bytes never appear.
         assert res.origin == "container"
         assert res.data == PNG
         assert b"HOST-PRIVATE-KEY" not in res.data
-        assert "head -c" in calls["cmd"] and "< " in calls["cmd"]  # bounded, redirect-safe form
+        assert calls["max_bytes"] == isrc._MAX_INGEST_BYTES  # bounded read
 
     @pytest.mark.asyncio
     async def test_non_cache_path_fails_closed_without_sandbox(self, tmp_path, monkeypatch):
-        """No active sandbox env -> refuse rather than fall back to a host read."""
+        """No reachable backend env -> refuse rather than fall back to a host read."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY")
 
-        with patch("tools.image_source._get_active_env", return_value=None):
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(
+                    error="No terminal environment is available for task 't1'",
+                    base64_content=None)
+
+        with patch("tools.image_source._backend_file_ops", return_value=_NoEnvOps()):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))
 
@@ -218,7 +238,11 @@ class TestNonLocalBackendConfinement:
             pytest.skip("symlinks unsupported")
 
         # Fails closed (no sandbox) rather than host-reading the symlink target.
-        with patch("tools.image_source._get_active_env", return_value=None):
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(error="no environment", base64_content=None)
+
+        with patch("tools.image_source._backend_file_ops", return_value=_NoEnvOps()):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(str(link), isrc.ResolveContext(task_id="t1"))
 
@@ -226,85 +250,86 @@ class TestNonLocalBackendConfinement:
 class TestExecReadSafety:
     @pytest.mark.asyncio
     async def test_exec_read_is_bounded_and_redirect_safe(self, tmp_path, monkeypatch):
-        """Leading-dash paths go through an input redirect (no argv exposure)
-        and the read is size-bounded via head -c."""
+        """The read is delegated with the ingest byte cap; leading-dash paths
+        are handed over as a plain string (ShellFileOperations handles shell
+        escaping via its own arg-quoting, not here)."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         captured = {}
 
-        def fake_execute(cmd, **kw):
-            captured["cmd"] = cmd
-            return {"returncode": 0, "output": base64.b64encode(PNG).decode()}
+        class _FakeOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                captured["path"] = path
+                captured["max_bytes"] = max_bytes
+                return SimpleNamespace(
+                    error=None, base64_content=base64.b64encode(PNG).decode(),
+                    is_binary=True)
 
-        with patch("tools.image_source._get_active_env",
-                   return_value=SimpleNamespace(execute=fake_execute)):
+        with patch("tools.image_source._backend_file_ops", return_value=_FakeOps()):
             await isrc.resolve_image_source(
                 "/workspace/-i-etc-shadow.png", isrc.ResolveContext(task_id="t1"))
-        assert f"head -c {isrc._MAX_INGEST_BYTES + 1} < " in captured["cmd"]
-        assert "'-i-etc-shadow.png'" in captured["cmd"] or "-i-etc-shadow.png" in captured["cmd"]
+        assert captured["max_bytes"] == isrc._MAX_INGEST_BYTES
+        # The path arrives verbatim — no quoting/option mangling at this layer.
+        assert captured["path"] == "/workspace/-i-etc-shadow.png"
 
 
     @pytest.mark.asyncio
-    async def test_exec_read_nonzero_returncode_raises(self, tmp_path, monkeypatch):
+    async def test_exec_read_error_result_raises(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
 
-        def fake_execute(cmd, **kw):
-            return {"returncode": 1, "output": ""}
+        class _FailOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(
+                    error="File not found: /workspace/nope.png", base64_content=None)
 
-        with patch("tools.image_source._get_active_env",
-                   return_value=SimpleNamespace(execute=fake_execute)):
+        with patch("tools.image_source._backend_file_ops", return_value=_FailOps()):
             with pytest.raises(isrc.SourceNotFound):
                 await isrc.resolve_image_source(
                     "/workspace/nope.png", isrc.ResolveContext(task_id="t1"))
 
     @pytest.mark.asyncio
-    async def test_exec_read_retries_cold_start_then_succeeds(self, tmp_path, monkeypatch):
-        """#76566: under Docker, vision's first exec-read can fail (cold
-        container / pipe setup) and an identical retry succeeds. The
-        resolver must transparently retry before raising, so users don't
-        see 'could not read inside the sandbox' on a file that is fully
-        readable on the second attempt."""
+    async def test_exec_read_single_delegation_no_resolver_retry(self, tmp_path, monkeypatch):
+        """Retry policy lives in the env bring-up (_get_file_ops), not the
+        resolver: read_file_bytes is called exactly once per resolve."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
 
         calls = {"n": 0}
-        b64 = base64.b64encode(PNG).decode()
 
-        def fake_execute(cmd, **kw):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # First call: cold start — empty pipe, exit non-zero.
-                return {"returncode": 1, "output": ""}
-            return {"returncode": 0, "output": b64}
+        class _FakeOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                calls["n"] += 1
+                return SimpleNamespace(
+                    error=None, base64_content=base64.b64encode(PNG).decode(),
+                    is_binary=True)
 
-        with patch("tools.image_source._get_active_env",
-                   return_value=SimpleNamespace(execute=fake_execute)):
+        with patch("tools.image_source._backend_file_ops", return_value=_FakeOps()):
             res = await isrc.resolve_image_source(
                 "/workspace/cold.png", isrc.ResolveContext(task_id="t1"))
         assert res.origin == "container"
         assert res.data == PNG
-        assert calls["n"] == 2
+        assert calls["n"] == 1
 
     @pytest.mark.asyncio
-    async def test_exec_read_retries_exhausted_includes_diagnostic(
-        self, tmp_path, monkeypatch
-    ):
-        """#76566: when every retry still fails, the error must carry the
-        container's stderr/stdout so the user can tell 'no such file'
-        from 'permission denied' from 'cold start never came up'."""
+    async def test_exec_read_failure_includes_diagnostic(self, tmp_path, monkeypatch):
+        """When the backend read fails, its error text is surfaced so the user
+        can tell 'no such file' from 'permission denied' from 'container never
+        came up'."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
 
-        def fake_execute(cmd, **kw):
-            return {"returncode": 1, "output": "head: can't open '/x': No such file or directory"}
+        class _FailOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(
+                    error="head: can't open '/workspace/missing.png': No such file or directory",
+                    base64_content=None)
 
-        with patch("tools.image_source._get_active_env",
-                   return_value=SimpleNamespace(execute=fake_execute)):
+        with patch("tools.image_source._backend_file_ops", return_value=_FailOps()):
             with pytest.raises(isrc.SourceNotFound) as excinfo:
                 await isrc.resolve_image_source(
                     "/workspace/missing.png", isrc.ResolveContext(task_id="t1"))
@@ -351,34 +376,45 @@ class TestSvgNormalization:
 
 class TestLazySandboxBringUp:
     """Issue #62825: under a non-local backend, the FIRST vision_analyze of a
-    session (before any terminal command) must bring the sandbox up itself
-    instead of failing with 'no active sandbox session'."""
+    session (before any terminal command) must trigger the environment
+    bring-up itself instead of failing with 'no active sandbox session'. The
+    resolver satisfies this by delegating to _get_file_ops, which lazily
+    creates the env — so the contract under test is that the delegation
+    happens with the resolver's resolution and task context."""
 
     @pytest.mark.asyncio
-    async def test_first_read_brings_up_sandbox_then_reads(self, tmp_path, monkeypatch):
+    async def test_first_read_delegates_to_file_ops_bring_up(self, tmp_path, monkeypatch):
         isrc = _reload(monkeypatch, tmp_path / "hermes")
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
 
-        brought_up = []
-        fake_env = SimpleNamespace(
-            execute=lambda cmd, **kw: {"returncode": 0, "output": base64.b64encode(PNG).decode()}
-        )
+        delegation = {}
 
-        def fake_ensure(task_id):
-            brought_up.append(task_id)
+        class _LazyOps:
+            """Mimics _get_file_ops: bring-up happens on construction; the
+            read then succeeds."""
 
-        # Env is absent until the lazy bring-up runs, then available — exactly
-        # the SSH-handshake ordering the bug was about.
-        def fake_get_active(task_id):
-            return fake_env if brought_up else None
+            def __init__(self, task_id, resolution, target=None):
+                delegation["task_id"] = task_id
+                delegation["resolution"] = resolution
+                delegation["target"] = target
 
-        import tools.terminal_tool as tt
-        monkeypatch.setattr(tt, "ensure_task_env", fake_ensure)
-        monkeypatch.setattr(isrc, "_get_active_env", fake_get_active)
+            def read_file_bytes(self, path, max_bytes=None):
+                delegation["path"] = path
+                return SimpleNamespace(
+                    error=None,
+                    base64_content=base64.b64encode(PNG).decode(),
+                    is_binary=True,
+                )
 
-        res = await isrc.resolve_image_source("/tmp/test.png", isrc.ResolveContext(task_id="t1"))
+        monkeypatch.setattr(
+            "tools.image_source._backend_file_ops", _LazyOps, raising=False)
 
-        assert brought_up == ["t1"]  # bring-up was triggered before the read
+        res = await isrc.resolve_image_source(
+            "/tmp/test.png", isrc.ResolveContext(task_id="t1"))
+
+        assert delegation["task_id"] == "t1"
+        assert delegation["path"] == "/tmp/test.png"
+        assert delegation["resolution"].named is False  # legacy ssh resolution
         assert res.origin == "container"
         assert res.data == PNG
 
@@ -391,9 +427,17 @@ class TestLazySandboxBringUp:
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY")
 
-        import tools.terminal_tool as tt
-        monkeypatch.setattr(tt, "ensure_task_env", lambda *_a, **_k: None)
-        monkeypatch.setattr(isrc, "_get_active_env", lambda *_a, **_k: None)
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(
+                    error="No terminal environment is available for task 't1'",
+                    base64_content=None)
+
+        monkeypatch.setattr(
+            "tools.image_source._backend_file_ops",
+            lambda task_id, resolution, target=None: _NoEnvOps(),
+            raising=False,
+        )
 
         with pytest.raises(isrc.SourceNotFound):
             await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))

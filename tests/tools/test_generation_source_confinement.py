@@ -9,6 +9,7 @@ local backend is a no-op.
 
 import base64
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,20 +47,22 @@ class TestConfineSourceImages:
         assert err is None
 
     def test_path_resolves_to_data_url_under_sandbox(self, monkeypatch, tmp_path):
-        """A path under docker resolves through the sandbox exec-read and
+        """A path under docker resolves through the backend read and
         arrives as a data: URL carrying the CONTAINER's bytes."""
-        from types import SimpleNamespace
-
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
 
         import tools.image_source as isrc
 
         b64 = base64.b64encode(PNG).decode()
+
+        class _FakeOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(error=None, base64_content=b64, is_binary=True)
+
         monkeypatch.setattr(
-            isrc, "_get_active_env",
-            lambda tid: SimpleNamespace(
-                execute=lambda cmd, **kw: {"returncode": 0, "output": b64}),
+            isrc, "_backend_file_ops",
+            lambda task_id, resolution, target=None: _FakeOps(), raising=False,
         )
 
         url, refs, err = igt._confine_source_images(
@@ -70,13 +73,20 @@ class TestConfineSourceImages:
         assert refs is None
 
     def test_unreadable_path_returns_error_payload(self, monkeypatch, tmp_path):
-        """No sandbox env + non-cache path -> structured error, not a host read."""
+        """No reachable backend + non-cache path -> structured error, not a host read."""
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "h"))
 
         import tools.image_source as isrc
 
-        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(error="no environment", base64_content=None)
+
+        monkeypatch.setattr(
+            isrc, "_backend_file_ops",
+            lambda task_id, resolution, target=None: _NoEnvOps(), raising=False,
+        )
 
         secret = tmp_path / "id_rsa"
         secret.write_bytes(b"HOST-PRIVATE-KEY")
@@ -96,7 +106,14 @@ class TestConfineSourceImages:
 
         import tools.image_source as isrc
 
-        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(error="no environment", base64_content=None)
+
+        monkeypatch.setattr(
+            isrc, "_backend_file_ops",
+            lambda task_id, resolution, target=None: _NoEnvOps(), raising=False,
+        )
 
         dispatched = []
         monkeypatch.setattr(
@@ -121,7 +138,14 @@ class TestConfineSourceImages:
 
         import tools.image_source as isrc
 
-        monkeypatch.setattr(isrc, "_get_active_env", lambda tid: None)
+        class _NoEnvOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(error="no environment", base64_content=None)
+
+        monkeypatch.setattr(
+            isrc, "_backend_file_ops",
+            lambda task_id, resolution, target=None: _NoEnvOps(), raising=False,
+        )
 
         out = vgt._handle_video_generate(
             {"prompt": "animate", "image_url": str(tmp_path / "nope.png")},
