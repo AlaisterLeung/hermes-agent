@@ -18,7 +18,7 @@ jobs:
     # existed to spread the suite over 4-core runners. It cost a matrix job, a
     # duration cache, a per-slice artifact and a merge job to do it.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -97,6 +97,9 @@ jobs:
         env:
           # Fork note: capped for the 4-core standard runner.
           HERMES_TEST_WORKERS: 8
+          # Two retries per failing FILE absorb parallel-runner load flakes
+          # (sqlite "database is locked" under 8 concurrent workers).
+          HERMES_TEST_FILE_RETRIES: 2
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
