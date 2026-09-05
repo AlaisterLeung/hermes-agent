@@ -272,9 +272,18 @@ async def test_auto_thread_preserves_existing_thread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_auto_thread_skips_dm(monkeypatch):
-    """DMs should not get auto-threaded."""
+    """DMs should not get auto-threaded.
+
+    ``MATRIX_DM_AUTO_THREAD`` is read at ``__init__`` like the other Matrix
+    policy knobs, so it must be pinned here: when another test file in the
+    same process (e.g. tests/cron/test_matrix_cron_thread_continuity.py,
+    which constructs a MatrixAdapter while the gateway's own env leaks in)
+    has set it to true, the adapter would legitimately thread the DM and
+    this assertion would fail for environmental, not behavioral, reasons.
+    """
     monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
     monkeypatch.delenv("MATRIX_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("MATRIX_DM_AUTO_THREAD", "false")
 
     adapter = _make_adapter()
     _set_dm(adapter)
