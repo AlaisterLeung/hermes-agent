@@ -57,6 +57,8 @@ def _make_background_cli_stub():
     cli._provider_sort = None
     cli._provider_require_params = None
     cli._provider_data_collection = None
+    cli._provider_preferred_min_throughput = None
+    cli._provider_preferred_max_latency = None
     cli._openrouter_min_coding_score = None
     cli._fallback_model = None
     cli._agent_running = False

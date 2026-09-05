@@ -1561,6 +1561,8 @@ provider_routing:
   # models:                   # Per-model pins (same keys; unset keys fall through)
   #   "openai/gpt-6-astra": {only: ["openai"]}
   #   "anthropic/claude-fable-5.1": {only: ["anthropic"]}
+  # preferred_min_throughput: {p50: 40, p90: 50}  # tok/s — number (p50) or p50/p75/p90/p99 cutoffs
+  # preferred_max_latency: 2.5                    # seconds — number (p50) or p50/p75/p90/p99 cutoffs
 ```
 
 **Shortcuts:** Append `:nitro` to any model name for throughput sorting (e.g., `anthropic/claude-sonnet-4:nitro`), or `:floor` for price sorting. Per-model details: [Provider Routing](/user-guide/features/provider-routing#per-model-overrides-models).

@@ -2293,7 +2293,10 @@ def _make_agent(
         # OpenRouter provider_routing prefs (gateway + CLI parity).
         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
         provider_sort=_pr.get("sort"), provider_require_parameters=_pr.get("require_parameters", False),
-        provider_data_collection=_pr.get("data_collection"), platform=platform, session_id=session_id or key,
+        provider_data_collection=_pr.get("data_collection"),
+        provider_preferred_min_throughput=_pr.get("preferred_min_throughput"),
+        provider_preferred_max_latency=_pr.get("preferred_max_latency"),
+        platform=platform, session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(), ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),

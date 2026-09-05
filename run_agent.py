@@ -243,6 +243,7 @@ class AIAgent(
         log_prefix_chars: int = 100, log_prefix: str = "",
         providers_allowed: List[str] = None, providers_ignored: List[str] = None, providers_order: List[str] = None,
         provider_sort: str = None, provider_require_parameters: bool = False, provider_data_collection: str = None,
+        provider_preferred_min_throughput: Any = None, provider_preferred_max_latency: Any = None,
         openrouter_min_coding_score: Optional[float] = None,
         session_id: str = None,
         tool_progress_callback: callable = None, tool_start_callback: callable = None,

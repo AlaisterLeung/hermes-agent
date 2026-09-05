@@ -196,6 +196,8 @@ _BG_PROVIDER_KWARGS = {
     "providers_order": "_providers_order", "provider_sort": "_provider_sort",
     "provider_require_parameters": "_provider_require_params",
     "provider_data_collection": "_provider_data_collection",
+    "provider_preferred_min_throughput": "_provider_preferred_min_throughput",
+    "provider_preferred_max_latency": "_provider_preferred_max_latency",
     "openrouter_min_coding_score": "_openrouter_min_coding_score", "fallback_model": "_fallback_model"}
 
 # /worktree subcommand -> CLICommandsMixin method name (all need a repo root).

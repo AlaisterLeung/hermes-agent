@@ -2813,7 +2813,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
+        self._provider_preferred_min_throughput = pr.get("preferred_min_throughput")
+        self._provider_preferred_max_latency = pr.get("preferred_max_latency")
 
+        self._provider_preferred_min_throughput = pr.get("preferred_min_throughput")
+        self._provider_preferred_max_latency = pr.get("preferred_max_latency")
         # OpenRouter Pareto Code router coding-score floor; out-of-range = unset.
         _raw_score = (CLI_CONFIG.get("openrouter", {}) or {}).get("min_coding_score")
         self._openrouter_min_coding_score: Optional[float] = None

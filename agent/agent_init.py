@@ -2175,7 +2175,9 @@ _PASSTHROUGH_PARAMS = (
     "load_soul_identity", "pass_session_id", "log_prefix_chars",
     # OpenRouter provider preferences
     "providers_allowed", "providers_ignored", "providers_order", "provider_sort",
-    "provider_require_parameters", "provider_data_collection", "openrouter_min_coding_score",
+    "provider_require_parameters", "provider_data_collection",
+    "provider_preferred_min_throughput", "provider_preferred_max_latency",
+    "openrouter_min_coding_score",
     # Toolset filtering
     "enabled_toolsets", "disabled_toolsets",
     # Model response configuration (None = provider/model default)
@@ -2209,6 +2211,7 @@ def init_agent(
     providers_ignored: List[str] = None, providers_order: List[str] = None,
     provider_sort: str = None, provider_require_parameters: bool = False,
     provider_data_collection: str = None, openrouter_min_coding_score: Optional[float] = None,
+    provider_preferred_min_throughput: Any = None, provider_preferred_max_latency: Any = None,
     session_id: str = None, tool_progress_callback: callable = None,
     tool_start_callback: callable = None, tool_complete_callback: callable = None,
     thinking_callback: callable = None, reasoning_callback: callable = None,

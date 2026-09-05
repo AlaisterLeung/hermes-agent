@@ -404,6 +404,7 @@ def _load_config() -> dict:
 _ROUTING_FILTER_DEFAULTS = (
     ("providers_allowed", None), ("providers_ignored", None), ("providers_order", None), ("provider_sort", None),
     ("provider_require_parameters", False), ("provider_data_collection", ""),
+    ("provider_preferred_min_throughput", None), ("provider_preferred_max_latency", None),
 )
 
 _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
