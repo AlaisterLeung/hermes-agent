@@ -204,6 +204,7 @@ def _install_fake_tools_package():
     sys.modules["tools.environments.base"] = types.SimpleNamespace(
         BaseEnvironment=_DummyEnvironment,
         EnvironmentConnectionError=_DummyConnectionError,
+        get_sandbox_dir=lambda: Path(tempfile.gettempdir()),
     )
     sys.modules["tools.environments.local"] = types.SimpleNamespace(LocalEnvironment=_DummyEnvironment)
     sys.modules["tools.environments.singularity"] = types.SimpleNamespace(

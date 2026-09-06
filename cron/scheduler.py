@@ -1998,67 +1998,7 @@ def _relay_fronted_delivery_platforms(connected: set) -> set:
         return set()
 
 
-def cron_delivery_targets() -> list[dict]:
-    """Return the platforms a cron job can auto-deliver to.
-
-    Single source of truth for any UI (dashboard dropdown, etc.) that lets a
-    user pick a cron delivery target. A platform is included when it is a valid
-    cron delivery platform AND its gateway is configured (enabled + credentials
-    present). Each entry reports whether the platform's home target (the
-    room/channel cron posts to) is set — a platform can be configured for
-    interactive use but still lack the home target an unattended cron job needs.
-
-    Returns a list of dicts: ``{"id", "name", "home_target_set", "home_env_var"}``
-    ordered by the gateway's canonical platform order. Callers should always
-    prepend the implicit ``local`` option themselves — it needs no config.
-    """
-    targets: list[dict] = []
-    try:
-        from gateway.config import load_gateway_config
-
-        gateway_config = load_gateway_config()
-        connected = {p.value for p in gateway_config.get_connected_platforms()}
-        connected |= _relay_fronted_delivery_platforms(connected)
-    except Exception:
-        logger.debug("cron_delivery_targets: gateway config unavailable", exc_info=True)
-        connected = set()
-
-    for name in _iter_home_target_platforms():
-        if name not in connected:
-            continue
-        if not _is_known_delivery_platform(name):
-            continue
-        env_var = _resolve_home_env_var(name)
-        targets.append(
-            {
-                "id": name,
-                "name": name.replace("_", " ").title(),
-                "home_target_set": bool(_get_home_target_chat_id(name)),
-                "home_env_var": env_var or None,
-            }
-        )
-
-    # Bot Chat targets: one per local profile. Machine-local by design (the
-    # scheduler delivers via a local chat subprocess), so the names listed
-    # here are exactly the names that resolve at fire time — no gateway
-    # config, no home channel needed.
-    try:
-        from hermes_cli.profiles import list_profile_names
-
-        for profile_name in list_profile_names():
-            targets.append(
-                {
-                    "id": f"{BOT_CHAT_PLATFORM}:{profile_name}",
-                    "name": f"Bot Chat ({profile_name})",
-                    "home_target_set": True,
-                    "home_env_var": None,
-                }
-            )
-    except Exception:
-        logger.debug("cron_delivery_targets: profile listing unavailable", exc_info=True)
-    return targets
-
-
+from cron.scheduler_delivery import cron_delivery_targets  # noqa: E402,F401 — facade binds the split-off sibling's object
 def _origin_thread_is_stale(origin: dict) -> bool:
     """True when a Slack origin's thread is a stale creation-turn artifact.
 
@@ -2366,24 +2306,7 @@ _ROUTING_TOKENS = frozenset({"all"})
 BOT_CHAT_PLATFORM = "bot-chat"
 
 
-def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
-    """Return the target profile for a ``bot-chat[:<name>]`` deliver token.
-
-    Returns ``""`` for the bare token (the job's own profile), the profile
-    name for the explicit form, or ``None`` when ``part`` is not a bot-chat
-    token at all.  Case-insensitive on the token; the profile name is
-    normalized by the profile layer at resolve time.
-    """
-    raw = (part or "").strip()
-    lowered = raw.lower()
-    if lowered == BOT_CHAT_PLATFORM:
-        return ""
-    prefix = BOT_CHAT_PLATFORM + ":"
-    if lowered.startswith(prefix):
-        return raw[len(prefix):].strip()
-    return None
-
-
+from cron.scheduler_delivery import parse_bot_chat_deliver_token  # noqa: E402,F401 — facade binds the split-off sibling's object
 def _resolve_bot_chat_target(job: dict, profile_arg: str) -> Optional[dict]:
     """Resolve a bot-chat deliver token to a concrete delivery target.
 

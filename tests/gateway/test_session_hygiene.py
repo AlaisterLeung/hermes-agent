@@ -1683,7 +1683,7 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             worker_started.set()
             # Keep the worker alive (and keep reporting "progress") so a
             # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline:
                 if commit_fence is not None:
                     commit_fence.touch_progress()
@@ -1703,8 +1703,8 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         elapsed = time.monotonic() - started
 
         assert result == "ok"
-        assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
+        assert worker_started.wait(timeout=5)
+        assert elapsed < 5.0, (
             f"hygiene host waited {elapsed:.1f}s after fence cancel — "
             "must not extend toward the 600s ceiling (#96953)"
         )

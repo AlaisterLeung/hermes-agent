@@ -11392,12 +11392,6 @@
   },
   {
    "facade": "tools.terminal_tool",
-   "name": "cleanup_vm",
-   "kind": "moved-lazy",
-   "target": "tools.terminal_tool_lifecycle"
-  },
-  {
-   "facade": "tools.terminal_tool",
    "name": "env_var_enabled",
    "kind": "moved-lazy",
    "target": "utils"
@@ -11431,12 +11425,6 @@
    "name": "is_managed_tool_gateway_ready",
    "kind": "moved-lazy",
    "target": "tools.managed_tool_gateway"
-  },
-  {
-   "facade": "tools.terminal_tool",
-   "name": "is_persistent_env",
-   "kind": "moved-lazy",
-   "target": "tools.terminal_tool_lifecycle"
   },
   {
    "facade": "tools.terminal_tool",

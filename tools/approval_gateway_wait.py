@@ -167,3 +167,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         entry.event.set()
     _drop_entry()
     return _finish(payload, state != "timeout", entry.result, entry.reason)
+
+
+# Backward-compat alias for tools.approval's lazy indirection.
+_impl = _await_gateway_decision

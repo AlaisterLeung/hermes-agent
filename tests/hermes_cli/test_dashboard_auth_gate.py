@@ -142,6 +142,9 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    # These tests stub uvicorn; skip the real bind check so a busy 9119 under
+    # HERMES_TEST_WORKERS parallelism cannot SystemExit 75 the auth-gate path.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda host, port: False)
     return captured
 
 

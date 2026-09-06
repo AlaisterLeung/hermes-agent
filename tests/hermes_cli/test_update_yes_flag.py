@@ -12,6 +12,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +47,38 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery():
+    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+
+    ``_restart_gateway_fleet_after_update`` calls
+    ``_m()._purge_stale_hermes_modules()`` FIRST, which evicts
+    ``hermes_cli.gateway`` from ``sys.modules`` — the restart phase's fresh
+    ``from hermes_cli.gateway import ...`` then loads an UNPATCHED copy,
+    silently discarding every mock here and letting real gateway discovery
+    (and real ``os.kill``) run on the dev box. So the purge itself must be
+    stubbed too (same pattern as test_update_autostash.py); patching the
+    gateway module attributes alone does NOT survive the eviction.
+    """
+    from pathlib import Path
+
+    import hermes_cli.image_provenance as _ip
+    import hermes_cli.main as hermes_main
+    import hermes_cli.update_cmd as _update_cmd
+
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway._get_service_pids", return_value=set()), \
+         patch.object(hermes_main, "_purge_stale_hermes_modules",
+                      lambda *a, **k: None), \
+         patch.object(_update_cmd, "_surviving_gateway_pids_after_failed_restart",
+                      return_value=[]), \
+         patch.object(_ip, "IMAGE_PROVENANCE_PATH",
+                      Path("/nonexistent/hermes-image-provenance.json")):
+        yield
 
 
 class TestUpdateYesConfigMigration:

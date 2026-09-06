@@ -46,7 +46,7 @@ from tools.terminal_tool_lifecycle import (
     _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
-    _is_container_backend, _is_host_cwd, _is_unusable_container_cwd, _parse_env_var,
+    _HOST_CWD_PREFIXES, _is_container_backend, _is_host_cwd, _is_unusable_container_cwd, _parse_env_var,
     _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
 )
 from tools.terminal_tool_config import _CONTAINER_BACKENDS  # re-export for file_tools
@@ -223,16 +223,34 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
             return
         _docker_orphan_reaper_ran = True
 
-    # 2 × lifetime gives sibling processes a grace window; floor at 60s so
-    # TERMINAL_LIFETIME_SECONDS=0 can't instant-reap a sibling's own setup.
-    # container_config only carries container_* keys, so read the env var.
+    # 2 × the longest configured Docker-target lifetime gives every named
+    # sibling a conservative grace window. A process-wide reaper runs only
+    # once, so using the first-created target's value could reap a longer-lived
+    # target prematurely.
     try:
         lifetime = int(container_config.get(
             "lifetime_seconds", os.getenv("TERMINAL_LIFETIME_SECONDS", "300"),
         ))
     except (TypeError, ValueError):
         lifetime = 300
-    max_age = max(60, lifetime) * 2
+    try:
+        from tools.execution_targets import list_execution_targets
+
+        targets = list_execution_targets()
+        if targets and targets[0].named:
+            for target in targets:
+                if target.backend != "docker":
+                    continue
+                try:
+                    lifetime = max(
+                        lifetime, int(target.config.get("lifetime_seconds", 300)),
+                    )
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        logger.debug("Could not resolve Docker target lifetimes", exc_info=True)
+    lifetime = max(60, lifetime)
+    max_age = lifetime * 2
 
     try:
         from tools.environments.docker import reap_orphan_containers, _container_identity
@@ -1042,7 +1060,13 @@ def _get_env_config(terminal_config: Optional[Dict[str, Any]] = None) -> Dict[st
 
     def _get(key: str, env_name: str, default: Any) -> Any:
         if terminal_config is None:
-            return os.getenv(env_name, str(default) if not isinstance(default, (list, dict)) else json.dumps(default))
+            # Scope-aware read (``_tenv``): under a per-turn terminal scope
+            # (gateway multiplexing) values resolve ONLY from the active
+            # profile's policy — a raw ``os.getenv`` here re-created the
+            # first-writer-wins cross-profile leak (#68559) because the
+            # launch profile's TERMINAL_* env stays pinned in os.environ.
+            # With no scope bound this is byte-identical to os.getenv.
+            return _tenv(env_name, str(default) if not isinstance(default, (list, dict)) else json.dumps(default))
         return terminal_config.get(key, default)
 
     def _coerce(value: Any, converter: Any, label: str, key: str) -> Any:
@@ -1166,7 +1190,7 @@ def _get_env_config(terminal_config: Optional[Dict[str, Any]] = None) -> Dict[st
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = (
-            (os.getenv("TERMINAL_CWD") or _safe_getcwd())
+            (_tenv("TERMINAL_CWD") or _safe_getcwd())
             if terminal_config is None
             else (cwd or _safe_getcwd())
         )
@@ -2725,6 +2749,18 @@ def terminal_tool(
                         # Internal env.execute() consumers (file ops cat
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
+                        # Yield-to-background: a mid-turn user message parks a
+                        # yield bit on this worker tid (redirect() during tool
+                        # execution); the local backend's wait loop hands the
+                        # live process to the background registry and returns
+                        # at once instead of parking the message behind the
+                        # command (#463292351f). Non-local backends ignore it
+                        # (handler is None → no kwarg).
+                        **_yield_kwargs(
+                            command, env_type=env_type, cwd=command_cwd,
+                            effective_task_id=effective_task_id,
+                            task_id=task_id, session_key=session_key,
+                        ),
                     }
                     with _scoped_sudo_execution(
                         target_resolution.target,
@@ -2803,6 +2839,18 @@ def terminal_tool(
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
+            # A yielded handoff carries returncode None (the process lives on
+            # in the background registry) — it must take the yielded path
+            # below, never the foreground-exit interpretation (which would
+            # TypeError on None comparisons).
+            if result.get("yielded_session_id"):
+                return json.dumps({
+                    "output": output, "exit_code": None, "error": None,
+                    "status": "yielded_to_background",
+                    "session_id": result["yielded_session_id"],
+                    "pid": result.get("pid"), "notify_on_complete": True,
+                    "note": _YIELDED_NOTE,
+                }, ensure_ascii=False)
             # Spill metadata from the bounded collector: present only when
             # output overflowed the capture window (see _wait_for_process).
             spill_total_chars = result.get("output_total_chars")
@@ -3320,31 +3368,7 @@ def _environment_is_persistent(env: Any) -> bool:
     )
 
 
-def is_persistent_env(task_id: str, target: Optional[str] = None) -> bool:
-    """Return True if the active environment for task_id is configured for
-    cross-turn persistence (``persistent_filesystem=True``).
-
-    Used by the agent loop to skip per-turn teardown for backends whose whole
-    point is to survive between turns (docker with ``container_persistent``,
-    daytona, modal, etc.). Non-persistent backends (e.g. Morph) still get torn
-    down at end-of-turn to prevent leakage. The idle reaper
-    (``_cleanup_inactive_envs``) handles persistent envs once they exceed
-    ``terminal.lifetime_seconds``.
-
-    Session-scoped docker containers (per-session isolation mode) also count
-    as persistent HERE: their lifetime is the SESSION, not the turn — they
-    are removed by ``AIAgent.close()`` → ``cleanup_vm`` at session teardown
-    and by the idle reaper, not per-turn.
-    """
-    env = get_active_env(task_id, target=target)
-    if env is None:
-        return False
-    if getattr(env, "_session_scoped", False):
-        return True
-    return _environment_is_persistent(env)
-
-
-
+from tools.terminal_tool_lifecycle import is_persistent_env  # noqa: E402,F401 — facade binds the split-off sibling's object
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
@@ -3438,6 +3462,7 @@ def _build_environment_constructor_configs(
             "port": config.get("ssh_port", 22),
             "key": config.get("ssh_key", ""),
             "persistent": config.get("ssh_persistent", False),
+            "file_sync": config.get("file_sync", True),
             "runtime_scope": resolution.security_scope if resolution.named else "",
         }
 
@@ -3762,146 +3787,7 @@ def _cleanup_retired_environments(
     return cleaned
 
 
-def cleanup_vm(
-    task_id: Hashable,
-    *,
-    force_remove: bool = False,
-    preserve_persistent: bool = False,
-    target: Optional[str] = None,
-    include_collapsed: bool = False,
-):
-    """Manually clean up a specific environment by task_id.
-
-    *force_remove* (default False) is forwarded to backends that accept it
-    — currently only ``DockerEnvironment``. ``preserve_persistent`` is used
-    by per-turn cleanup to keep each persistent named sibling live while
-    removing only non-persistent targets. The default of False matches
-    session-lifecycle semantics: this function is called from
-    ``AIAgent.close()`` (TUI session close, gateway session teardown) and the
-    per-turn cleanup branch for non-persistent envs, both of which should
-    honor the user's persist-mode preference. Stopping the container here
-    would defeat the "ONE long-lived container shared across sessions"
-    contract — exactly the bug Ben reported when the container was killed
-    on every TUI session close.
-
-    Pass ``force_remove=True`` for actual user-initiated teardown
-    (e.g. ``/reset``-style flows that haven't been wired yet, or future
-    "destroy my sandbox" commands).
-
-    The idle reaper passes the env through ``env.cleanup()`` directly (not
-    via this function), so persist-mode idle envs are similarly no-op'd —
-    only the orphan reaper at next startup reclaims them.
-    """
-    # Direct tuple keys are used by global/idle cleanup. For a raw task,
-    # omitted target cleans every target scope owned by that exact raw key;
-    # an explicit target cleans exactly that scope. Do not collapse arbitrary
-    # subagent ids to "default" here: legacy cleanup_vm(child_id) never tore
-    # down the parent's shared environment, and doing so in named mode would
-    # let a delegate's close race/disrupt its parent.
-    if isinstance(task_id, tuple):
-        keys = [task_id]
-    elif target is None:
-        try:
-            resolution = _target_resolution(None)
-            scoped_task_id = resolution.scope_task_key(task_id)
-            collapsed_task_id = _resolve_container_task_id(str(task_id))
-            scoped_collapsed_task_id = resolution.scope_task_key(collapsed_task_id)
-        except Exception:
-            scoped_task_id = task_id
-            collapsed_task_id = task_id
-            scoped_collapsed_task_id = task_id
-        matching_task_ids = {task_id, scoped_task_id}
-        if include_collapsed:
-            matching_task_ids.update({
-                collapsed_task_id, scoped_collapsed_task_id,
-            })
-        with _env_lock:
-            keys = [
-                key for key in _active_environments
-                if key in matching_task_ids
-                or (
-                    isinstance(key, tuple) and len(key) == 2
-                    and key[0] in matching_task_ids
-                )
-            ]
-        if not keys:
-            keys = [task_id]
-    else:
-        resolution = _target_resolution(target)
-        if resolution.named:
-            keys = [resolution.environment_key(task_id)]
-        else:
-            keys = [task_id]
-
-    active_process_keys = set()
-    if preserve_persistent:
-        try:
-            from tools.process_registry import process_registry
-
-            active_process_keys = {
-                key for key in keys
-                if process_registry.has_active_processes(key)
-            }
-        except Exception:
-            logger.debug(
-                "Failed to inspect active processes before cleanup",
-                exc_info=True,
-            )
-
-    envs = []
-    removed_keys = []
-    with _env_lock:
-        for key in keys:
-            existing = _active_environments.get(key)
-            if key in active_process_keys:
-                continue
-            if (
-                preserve_persistent
-                and existing is not None
-                and _environment_is_persistent(existing)
-            ):
-                continue
-            env = _active_environments.pop(key, None)
-            _last_activity.pop(key, None)
-            removed_keys.append(key)
-            if env is not None:
-                envs.append((key, env))
-
-    # Clean up per-task creation lock
-    with _creation_locks_lock:
-        for key in removed_keys:
-            _creation_locks.pop(key, None)
-
-    # Invalidate stale file_ops cache entry
-    try:
-        from tools.file_tools import clear_file_ops_cache
-        for key in removed_keys:
-            clear_file_ops_cache(key)
-    except ImportError:
-        pass
-
-    for key in keys:
-        _cleanup_retired_environments(
-            task_key=key,
-            min_age_seconds=0.0,
-            require_idle=preserve_persistent,
-        )
-
-    if not envs:
-        return
-
-    for key, env in envs:
-        try:
-            _cleanup_env(env, force_remove=force_remove)
-
-            logger.info("Manually cleaned up environment for task: %s", key)
-
-        except Exception as e:
-            error_str = str(e)
-            if "404" in error_str or "not found" in error_str.lower():
-                logger.info("Environment for task %s already cleaned up", key)
-            else:
-                logger.warning("Error cleaning up environment for task %s: %s", key, e)
+from tools.terminal_tool_lifecycle import cleanup_vm  # noqa: E402,F401 — facade binds the split-off sibling's object
 
 
 def _create_environment(
@@ -3915,223 +3801,16 @@ def _create_environment(
     task_id: str = "default",
     host_cwd: Optional[str] = None,
 ):
-    """
-    Create an execution environment for sandboxed command execution.
-    
-    Args:
-        env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
-        image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
-        cwd: Working directory
-        timeout: Default command timeout
-        ssh_config: SSH connection config (for env_type="ssh")
-        container_config: Resource config for container backends (cpu, memory, disk, persistent)
-        task_id: Task identifier for environment reuse and snapshot keying
-        host_cwd: Optional host working directory to bind into Docker when explicitly enabled
-        
-    Returns:
-        Environment instance with execute() method
-    """
-    cc = container_config or {}
-    cpu = cc.get("container_cpu", 1)
-    memory = cc.get("container_memory", 5120)
-    disk = cc.get("container_disk", 51200)
-    persistent = cc.get("container_persistent", True)
-    volumes = cc.get("docker_volumes", [])
-    docker_forward_env = cc.get("docker_forward_env", [])
-    docker_env = cc.get("docker_env", {})
-    docker_extra_args = cc.get("docker_extra_args", [])
-    docker_network = cc.get("docker_network", True)
+    """Create an execution environment for *env_type* (delegates to the split
+    builders in ``tools.terminal_tool_backends``; kept as a module-level
+    indirection so tests and task overrides can patch either site)."""
+    from tools.terminal_tool_backends import _create_environment as _backends_create
 
-    if env_type == "local":
-        env = _LocalEnvironment(cwd=cwd, timeout=timeout)
-        setattr(
-            env, "_persistent",
-            bool((local_config or {}).get("persistent", False)),
-        )
-        return env
-    
-    elif env_type == "docker":
-        # One-shot orphan reaper: clean up labeled containers left behind by
-        # prior Hermes processes that hit SIGKILL / OOM / a closed terminal
-        # before the atexit cleanup hook could run.  Gated to once per
-        # process so concurrent _create_environment calls (parallel
-        # subagents, RL benchmarks) don't run the reaper N times.
-        # Disable via ``terminal.docker_orphan_reaper: false`` (issue #20561).
-        _maybe_reap_docker_orphans(cc)
-        # Per-session container isolation: a session-keyed container must not
-        # outlive its session, so cross-process reuse/persist is disabled for
-        # it — cleanup_vm()/the idle reaper stop+rm it instead of leaving a
-        # running container behind for every chat ever opened. The shared
-        # "default" container and RL/benchmark override sandboxes keep their
-        # existing lifecycle.
-        session_scoped = (
-            _docker_session_isolation_enabled()
-            and task_id != "default"
-            and not _has_isolation_overrides(task_id)
-        )
-        docker_env_obj = _DockerEnvironment(
-            image=image, cwd=cwd, timeout=timeout,
-            cpu=cpu, memory=memory, disk=disk,
-            persistent_filesystem=persistent, task_id=task_id,
-            storage_task_id=cc.get("storage_task_id"),
-            legacy_storage_task_id=cc.get("legacy_storage_task_id"),
-            volumes=volumes,
-            host_cwd=host_cwd,
-            auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
-            forward_env=docker_forward_env,
-            env=docker_env,
-            run_as_host_user=cc.get("docker_run_as_host_user", False),
-            network=docker_network,
-            extra_args=docker_extra_args,
-            persist_across_processes=(
-                False if session_scoped
-                else cc.get("docker_persist_across_processes", True)
-            ),
-            shared_container_key=cc.get("docker_shared_container_key", ""),
-            shm_size=cc.get("docker_shm_size", "1g"),
-        )
-        # Marker read by is_persistent_env(): a session-scoped container
-        # survives BETWEEN turns (skip per-turn teardown) but is removed at
-        # session close / idle timeout. Guarded setattr: test doubles for
-        # _DockerEnvironment may not accept attributes.
-        if session_scoped:
-            try:
-                docker_env_obj._session_scoped = True
-            except AttributeError:
-                pass
-        return docker_env_obj
-    
-    elif env_type == "singularity":
-        return _SingularityEnvironment(
-            image=image, cwd=cwd, timeout=timeout,
-            cpu=cpu, memory=memory, disk=disk,
-            persistent_filesystem=persistent, task_id=task_id,
-        )
-    
-    elif env_type == "modal":
-        sandbox_kwargs = {}
-        if cpu > 0:
-            sandbox_kwargs["cpu"] = cpu
-        if memory > 0:
-            sandbox_kwargs["memory"] = memory
-        if disk > 0:
-            try:
-                import inspect, modal
-                if "ephemeral_disk" in inspect.signature(modal.Sandbox.create).parameters:
-                    sandbox_kwargs["ephemeral_disk"] = disk
-            except Exception:
-                pass
-
-        modal_state = _get_modal_backend_state(cc.get("modal_mode"))
-
-        if modal_state["selected_backend"] == "managed":
-            return _ManagedModalEnvironment(
-                image=image, cwd=cwd, timeout=timeout,
-                modal_sandbox_kwargs=sandbox_kwargs,
-                persistent_filesystem=persistent, task_id=task_id,
-            )
-
-        if modal_state["selected_backend"] != "direct":
-            if modal_state["managed_mode_blocked"]:
-                raise ValueError(
-                    "Modal backend is configured for managed mode, but "
-                    "Nous Tool Gateway access is not currently available and no direct "
-                    "Modal credentials/config were found. "
-                    + nous_tool_gateway_unavailable_message(
-                        "managed Modal execution",
-                    )
-                    + " Choose TERMINAL_MODAL_MODE=direct/auto to use direct Modal credentials."
-                )
-            if modal_state["mode"] == "managed":
-                raise ValueError(
-                    "Modal backend is configured for managed mode, but the managed tool gateway is unavailable. "
-                    + nous_tool_gateway_unavailable_message(
-                        "managed Modal execution",
-                    )
-                )
-            if modal_state["mode"] == "direct":
-                raise ValueError(
-                    "Modal backend is configured for direct mode, but no direct Modal credentials/config were found."
-                )
-            message = "Modal backend selected but no direct Modal credentials/config was found."
-            if managed_nous_tools_enabled():
-                message = (
-                    "Modal backend selected but no direct Modal credentials/config or managed tool gateway was found."
-                )
-            raise ValueError(message)
-
-        return _ModalEnvironment(
-            image=image, cwd=cwd, timeout=timeout,
-            modal_sandbox_kwargs=sandbox_kwargs,
-            persistent_filesystem=persistent, task_id=task_id,
-        )
-    
-    elif env_type == "daytona":
-        # Lazy import so daytona SDK is only required when backend is selected.
-        from tools.environments.daytona import DaytonaEnvironment as _DaytonaEnvironment
-        return _DaytonaEnvironment(
-            image=image, cwd=cwd, timeout=timeout,
-            cpu=int(cpu), memory=memory, disk=disk,
-            persistent_filesystem=persistent, task_id=task_id,
-        )
-
-    elif env_type == "vercel_sandbox":
-        from tools.environments.vercel_sandbox import (
-            VercelSandboxEnvironment as _VercelSandboxEnvironment,
-        )
-        return _VercelSandboxEnvironment(
-            runtime=cc.get("vercel_runtime") or None,
-            cwd=cwd,
-            timeout=timeout,
-            cpu=cpu,
-            memory=memory,
-            disk=disk,
-            persistent_filesystem=persistent,
-            task_id=task_id,
-        )
-
-    elif env_type == "ssh":
-        if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
-            raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
-        return _SSHEnvironment(
-            host=ssh_config["host"],
-            user=ssh_config["user"],
-            port=ssh_config.get("port", 22),
-            key_path=ssh_config.get("key", ""),
-            cwd=cwd,
-            timeout=timeout,
-            runtime_scope=ssh_config.get("runtime_scope", ""),
-            file_sync=ssh_config.get("file_sync", True),
-        )
-
-    else:
-        provider = _get_plugin_env_provider(env_type)
-        if provider is not None:
-            env_obj = provider.create_environment(
-                cwd=cwd, timeout=timeout, task_id=task_id,
-                image=image, container_config=cc,
-            )
-            # Stamp the backend name so path-resolution and progress surfaces
-            # can identify plugin backends without class-name sniffing.
-            try:
-                env_obj._hermes_backend_name = provider.name.strip().lower()
-            except AttributeError:
-                pass  # test doubles may reject attributes
-            return env_obj
-        try:
-            from agent.terminal_env_registry import plugin_backend_names
-
-            plugin_names = plugin_backend_names()
-        except Exception:
-            plugin_names = []
-        extra = (
-            ", " + ", ".join(f"'{n}'" for n in plugin_names) if plugin_names else ""
-        )
-        raise ValueError(
-            f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'ssh'{extra}"
-        )
+    return _backends_create(
+        env_type=env_type, image=image, cwd=cwd, timeout=timeout,
+        ssh_config=ssh_config, container_config=container_config,
+        local_config=local_config, task_id=task_id, host_cwd=host_cwd,
+    )
 
 
 def _apply_task_cwd_override(
@@ -4207,6 +3886,8 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
     the 128+signum band are the shell convention (very likely but not
     guaranteed, so those notes hedge with "usually").
     """
+    from tools.terminal_tool_result import _SIGNAL_EXIT_NOTES
+
     if exit_code < 0:
         signum = -exit_code
         if signum == 2:  # SIGINT — executor's interrupt-marker path owns it

@@ -132,9 +132,9 @@ _TOOL_STUBS = {
     "write_file": ("path: str, content: str, cross_profile: bool = False, target: str = None",
         '"""Write content to a file (always overwrites). Returns dict with status."""',
         '{"path": path, "content": content, "cross_profile": cross_profile, "target": target}'),
-    "search_files": ('pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", context: int = 0, execution_target: str = None',
+    "search_files": ('pattern: str, target: str = "content", path: str = ".", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = "content", order: str = "discovery", context: int = 0, execution_target: str = None',
         '"""Search file contents (target="content") or find files by name (target="files"). Returns dict with "matches"."""',
-        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "context": context, "execution_target": execution_target}'),
+        '{"pattern": pattern, "target": target, "path": path, "file_glob": file_glob, "limit": limit, "offset": offset, "output_mode": output_mode, "order": order, "context": context, "execution_target": execution_target}'),
     "patch": ('path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = "replace", patch: str = None, cross_profile: bool = False, target: str = None',
         '"""Targeted find-and-replace (mode="replace") or V4A multi-file patches (mode="patch"). Returns dict with status."""',
         '{"path": path, "old_string": old_string, "new_string": new_string, "replace_all": replace_all, "mode": mode, "patch": patch, "cross_profile": cross_profile, "target": target}'),
@@ -435,6 +435,7 @@ def _get_or_create_env(
         _active_environments, _env_lock, _get_env_config, _last_activity,
         _start_cleanup_thread, _creation_locks, _creation_locks_lock,
         _resolve_container_task_id, _resolve_task_host_cwd, _select_image,
+        _is_container_backend,
         resolve_task_overrides, _record_environment_lifetime,
         _record_environment_target, _environment_matches_target,
         _prepare_environment_replacement, _EnvironmentReplacementError,
@@ -443,6 +444,7 @@ def _get_or_create_env(
         _environment_has_stable_storage,
         _build_environment_constructor_configs,
     )
+    from tools.terminal_tool_backends import _container_config_from_config
     from tools.execution_targets import (
         execution_target_config_is_frozen,
         resolve_execution_target,
@@ -496,10 +498,23 @@ def _get_or_create_env(
 
         cwd = _resolve_remote_operation_cwd(raw_task_id, resolution, config)
 
-        container_config, ssh_config, local_config = (
-            _build_environment_constructor_configs(
+        ssh_config: Optional[dict] = None
+        local_config: Optional[dict] = None
+        if env_type == "ssh" or env_type == "local":
+            # Target-aware ssh/local extras (file_sync toggle, runtime-scope
+            # isolation, persistent-shell flag) ride the terminal_tool builder.
+            built = _build_environment_constructor_configs(
                 config, resolution, base_task_id,
             )
+            if env_type == "ssh":
+                ssh_config = built[1]
+            else:
+                local_config = built[2]
+        # Shared shaper for containers: probe, terminal, and execute_code must
+        # hand _create_environment byte-identical container_config keys.
+        container_config = (
+            _container_config_from_config(config)
+            if _is_container_backend(env_type) else None
         )
 
         logger.info("Creating new %s environment for execute_code task %s...",

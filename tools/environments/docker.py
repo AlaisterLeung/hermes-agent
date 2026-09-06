@@ -779,7 +779,10 @@ class DockerEnvironment(BaseEnvironment):
         _ensure_docker_available()
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
-        volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
+        volume_args, writable_args = self._mount_args(
+            volumes, host_cwd, auto_mount_cwd, task_id,
+            storage_task_id=storage_task_id,
+            legacy_storage_task_id=legacy_storage_task_id)
         volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
@@ -821,24 +824,83 @@ class DockerEnvironment(BaseEnvironment):
         # creation, so reusing a pre-egress container would bypass the firewall.
         profile_name = _container_identity(shared_container_key)
         task_label = _sanitize_label_value(task_id)
+        process_label = _sanitize_label_value(_PROCESS_INSTANCE_ID)
         self._labels = {
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
-            _EGRESS_LABEL_KEY: egress_label}
+            _EGRESS_LABEL_KEY: egress_label,
+            "hermes-process-instance": process_label,
+        }
+        if storage_label:
+            self._labels["hermes-storage-id"] = storage_label
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_uses_s6_init = image_uses_s6_init
         self._all_run_args = all_run_args
+
+        # A config-derived runtime task label changes when a named target is
+        # edited. Persistent storage has a deliberately stable label, so retire
+        # any old-spec prior-process container before mounting that storage
+        # into the replacement. Containers cached by THIS process are never
+        # removed here — hot edits retire those through terminal_tool after
+        # in-flight users release them.
+        if storage_label:
+            try:
+                self._remove_superseded_storage_containers(
+                    storage_label, profile_name, task_label,
+                    current_egress_label=egress_label,
+                    allow_exact_reuse=persist_across_processes,
+                )
+            except Exception:
+                if storage_guard is not None:
+                    if storage_guard_finalizer is not None:
+                        storage_guard_finalizer.detach()
+                    _close_storage_creation_lease(storage_guard)
+                raise
 
         reused = persist_across_processes and self._attach_existing_container(
             task_label, profile_name, egress_label, network)
         if not reused:
             self._container_id = self._docker_run(cwd)
 
-        # Init-time env forwarding args seed the snapshot.
-        self._init_env_args = self._build_init_env_args()
-        self.init_session()
+        if self._container_id:
+            try:
+                _track_environment_container(self, self._container_id)
+            except Exception:
+                if storage_guard is not None:
+                    if storage_guard_finalizer is not None:
+                        storage_guard_finalizer.detach()
+                    _close_storage_creation_lease(storage_guard)
+                raise
+        # Keep the storage-owner creation barrier until initialization is
+        # complete. Docker labels publish before init_session is ready, so a
+        # sibling constructor must remain blocked until success or failure.
+        try:
+            # Init-time env forwarding args seed the snapshot.
+            self._init_env_args = self._build_init_env_args()
+            self.init_session()
+        except Exception as init_error:
+            # Do not publish an uninitialized labeled container after dropping
+            # the creation barrier. Retire it while the barrier is still held;
+            # transactional cleanup restores ownership if removal itself fails.
+            try:
+                self.cleanup(force_remove=True)
+                if not self.wait_for_cleanup(timeout=60.0):
+                    raise RuntimeError(
+                        "container cleanup timed out after initialization failure"
+                    )
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    f"Docker initialization failed and its container could not "
+                    f"be retired safely: {cleanup_error}"
+                ) from init_error
+            raise
+        finally:
+            if storage_guard is not None:
+                if storage_guard_finalizer is not None:
+                    storage_guard_finalizer.detach()
+                _close_storage_creation_lease(storage_guard)
 
     # --- __init__ helpers ---
     def _egress_and_env_args(self, extra_args) -> tuple[str, list[str], list[str], list[str], list[str]]:
@@ -905,7 +967,8 @@ class DockerEnvironment(BaseEnvironment):
             # extra_network == "none": same intent stated twice; the extra arg carries it once.
         return args
 
-    def _mount_args(self, volumes, host_cwd, auto_mount_cwd, task_id) -> tuple[list[str], list[str]]:
+    def _mount_args(self, volumes, host_cwd, auto_mount_cwd, task_id,
+                    storage_task_id=None, legacy_storage_task_id=None) -> tuple[list[str], list[str]]:
         """``(volume_args, writable_args)`` for user volumes, host cwd and /workspace,/root.
         Persistent mode bind-mounts from TERMINAL_SANDBOX_DIR (default ~/.hermes/sandboxes/)."""
         volume_args: list[str] = []
@@ -934,8 +997,44 @@ class DockerEnvironment(BaseEnvironment):
         if self._persistent:
             from tools.environments.base import get_sandbox_dir
             # _sandbox_dir_name(): a raw session-key task_id carries colons,
-            # which `-v` reads as extra spec fields (exit 125).
-            sandbox = get_sandbox_dir() / "docker" / _sandbox_dir_name(task_id)
+            # which `-v` reads as extra spec fields (exit 125). Named-target
+            # storage IDs are already bounded; sanitize both so a legacy
+            # session-key task_id cannot leak colons into `-v`.
+            docker_root = get_sandbox_dir() / "docker"
+            sandbox = docker_root / _sandbox_dir_name(storage_task_id or task_id)
+            if legacy_storage_task_id and legacy_storage_task_id != (storage_task_id or task_id):
+                legacy_sandbox = docker_root / _sandbox_dir_name(legacy_storage_task_id)
+                if legacy_sandbox.exists() and not sandbox.exists():
+                    docker = find_docker() or "docker"
+                    legacy_result = subprocess.run(
+                        [
+                            docker, "ps", "-a", "--no-trunc",
+                            "--filter", (
+                                "label=hermes-task-id="
+                                f"{_sanitize_label_value(legacy_storage_task_id)}"
+                            ),
+                            "--filter", (
+                                "label=hermes-profile="
+                                f"{_sanitize_label_value(_get_active_profile_name())}"
+                            ),
+                            "--format", "{{.ID}}",
+                        ],
+                        capture_output=True, text=True, timeout=10,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if legacy_result.returncode != 0:
+                        raise RuntimeError(
+                            "Could not inspect the legacy named-target Docker runtime "
+                            "before migrating persistent storage."
+                        )
+                    if legacy_result.stdout.strip():
+                        raise RuntimeError(
+                            "A legacy named-target Docker container still owns this "
+                            "persistent workspace. Stop/remove that container, then retry; "
+                            "the workspace data will be migrated automatically."
+                        )
+                    sandbox.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(legacy_sandbox, sandbox)
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
             writable_args += ["-v", f"{self._home_dir}:/root"]
@@ -966,16 +1065,20 @@ class DockerEnvironment(BaseEnvironment):
         container_id, state = existing
         if not network:
             actual_mode = self._container_network_mode(container_id)
+            if actual_mode is None:
+                raise RuntimeError(
+                    f"Could not verify NetworkMode for reusable Docker "
+                    f"runtime {container_id[:12]}; refusing reuse while "
+                    "docker_network=false is configured. Retry after "
+                    "Docker inspection is available."
+                )
             if actual_mode != "none":
                 logger.warning(
                     "Existing container %s has NetworkMode=%s but "
                     "docker_network=false requests an air-gapped "
                     "container — removing it and starting fresh (task=%s, profile=%s).",
                     container_id[:12], actual_mode or "unknown", task_label, profile_name)
-                try:
-                    run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
+                self._retire_network_mismatched_container(container_id)
                 return False
 
         if state != "running":
@@ -1440,27 +1543,112 @@ class DockerEnvironment(BaseEnvironment):
                 "no such", "not found", "does not exist",
             ))
 
+        exclusive_lease = None
+        if force_remove:
+            finalizer = getattr(self, "_lease_finalizer", None)
+            if finalizer is not None and finalizer.alive:
+                finalizer.detach()
+            _release_runtime_tracking(container_id, self._lease_root)
+            exclusive_lease = _acquire_exclusive_container_lease(
+                container_id, self._lease_root,
+            )
+            if exclusive_lease is None:
+                _track_environment_container(self, container_id)
+                raise RuntimeError(
+                    f"Docker runtime {container_id[:12]} is still used by "
+                    "another environment or Hermes process; retry cleanup "
+                    "after those users finish."
+                )
+
         def _do_cleanup() -> None:
-            for argv, fail_msg in ((["stop", "-t", "10"], "docker stop %s timed out / failed: %s"),
-                                   (["rm", "-f"], "docker rm -f %s failed: %s")):
+            cleanup_error = None
+            try:
                 try:
-                    subprocess.run(
-                        [docker_exe, *argv, container_id],
-                        capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
-                except (subprocess.TimeoutExpired, OSError) as e:
-                    logger.warning(fail_msg, log_id, e)
+                    stopped = subprocess.run(
+                        [docker_exe, "stop", "-t", "10", container_id],
+                        capture_output=True, timeout=30,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if getattr(stopped, "returncode", 0) != 0:
+                        logger.warning(
+                            "docker stop %s failed (continuing with rm): %s",
+                            log_id, getattr(stopped, "stderr", ""),
+                        )
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    logger.warning(
+                        "docker stop %s timed out / failed: %s", log_id, exc,
+                    )
+                remove_error = None
+                try:
+                    removed = subprocess.run(
+                        [docker_exe, "rm", "-f", container_id],
+                        capture_output=True, timeout=30,
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if getattr(removed, "returncode", 0) != 0:
+                        remove_error = RuntimeError(
+                            f"docker rm -f {log_id} failed: "
+                            f"{getattr(removed, 'stderr', '') or getattr(removed, 'stdout', '')}"
+                        )
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    remove_error = RuntimeError(
+                        f"docker rm -f {log_id} failed: {exc}"
+                    )
+                if remove_error is not None and not _container_is_absent():
+                    raise remove_error
+            except Exception as exc:
+                cleanup_error = exc
+            finally:
+                if exclusive_lease is not None:
+                    _close_exclusive_container_lease(exclusive_lease)
+                if cleanup_error is None:
+                    if exclusive_lease is None:
+                        _release_runtime_tracking(container_id, self._lease_root)
+                    self._container_id = None
+                    if not self._persistent:
+                        for directory in workspace_dirs:
+                            if directory:
+                                shutil.rmtree(directory, ignore_errors=True)
+                else:
+                    # Keep ownership so the failure stays visible and a retry
+                    # is possible; wait_for_cleanup re-raises transactionally.
+                    self._container_id = container_id
+                    if exclusive_lease is not None:
+                        try:
+                            _track_environment_container(self, container_id)
+                        except Exception as restore_exc:
+                            cleanup_error = RuntimeError(
+                                f"{cleanup_error}; could not restore runtime ownership: "
+                                f"{restore_exc}"
+                            )
+                    logger.error(
+                        "Docker cleanup failed for %s; runtime ownership retained: %s",
+                        log_id, cleanup_error,
+                    )
+                self._cleanup_error = cleanup_error
 
         t = threading.Thread(target=_do_cleanup, daemon=True, name=f"hermes-cleanup-{log_id}")
         with _TEARDOWN_LOCK:
             _TEARDOWN_THREADS.add(t)
-        t.start()
         self._cleanup_thread = t
-        self._container_id = None
-
-        # Bind-mount dirs are the container's filesystem state; only drop them
-        # once the container itself is removed.
-        if not self._persistent:
-            self._remove_bind_dirs()
+        try:
+            t.start()
+        except Exception as start_error:
+            if exclusive_lease is not None:
+                _close_exclusive_container_lease(exclusive_lease)
+                try:
+                    _track_environment_container(self, container_id)
+                except Exception as restore_error:
+                    start_error = RuntimeError(
+                        f"{start_error}; could not restore runtime ownership: "
+                        f"{restore_error}"
+                    )
+            self._container_id = container_id
+            self._cleanup_error = start_error
+            raise RuntimeError(
+                f"Could not start Docker cleanup worker for {log_id}: "
+                f"{start_error}"
+            ) from start_error
 
     @staticmethod
     def wait_for_all_teardowns(timeout: float = 15.0) -> bool:

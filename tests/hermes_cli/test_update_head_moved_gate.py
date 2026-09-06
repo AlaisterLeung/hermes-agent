@@ -127,6 +127,20 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    monkeypatch.setattr(
+        hermes_gateway, "_get_service_pids", lambda all_profiles=False: set()
+    )
+    monkeypatch.setattr(
+        update_cmd, "_surviving_gateway_pids_after_failed_restart", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        hermes_main, "_purge_stale_hermes_modules", lambda *a, **k: None
+    )
+    import hermes_cli.image_provenance as _ip
+
+    monkeypatch.setattr(
+        _ip, "IMAGE_PROVENANCE_PATH", tmp_path / "no-image-provenance.json"
+    )
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):

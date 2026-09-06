@@ -27,6 +27,7 @@ router = APIRouter()
 _find_cron_job_profile = late("_find_cron_job_profile", "hermes_cli.web_server_cron")
 _fire_cron_job_for_profile = late("_fire_cron_job_for_profile", "hermes_cli.web_server_cron")
 _forward_cron_fire_to_gateway = late("_forward_cron_fire_to_gateway", "hermes_cli.web_server_cron")
+_forward_cron_fire_to_gateway_sync = late("_forward_cron_fire_to_gateway_sync", "hermes_cli.web_server")
 _gateway_intentionally_stopped = late("_gateway_intentionally_stopped", "hermes_cli.web_server_cron")
 _notify_cron_provider_for_profile = late("_notify_cron_provider_for_profile", "hermes_cli.web_server_cron")
 _call_cron_for_profile = late("_call_cron_for_profile", "hermes_cli.web_server_cron")
@@ -170,25 +171,39 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
+    """Run a job NOW on behalf of the dashboard's trigger button.
+
+    Execution belongs to the GATEWAY process (live platform adapters, session
+    context) — the same rule the desktop ticker and the Chronos webhook door
+    already follow. The dashboard never executes the job locally: it forwards
+    the fire to the gateway api_server, which claims via the store CAS (so a
+    concurrent ticker or retry cannot double-run) and runs with live adapters.
+    Paused jobs pass ``force`` so the claim resumes-and-fires atomically; an
+    unreachable gateway surfaces as 503 to the dashboard caller instead of a
+    silent standalone-path delivery from this process.
+    """
     selected = _job_profile(job_id, profile)
     job = _found(_call_cron_for_profile(selected, "resolve_job_ref", job_id))
-    # Never expose the job as due before claiming it: the built-in ticker and
-    # external/manual fire paths share one durable claim, so only one executes
-    # this run even racing across processes. Active jobs keep the legacy call
-    # shape; paused jobs need the explicit force flag to resume + claim atomically.
     force = not job.get("enabled", True) or job.get("state") == "paused"
-    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
+    forwarded = _forward_cron_fire_to_gateway_sync(selected, job["id"], force=force)
+    if forwarded is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gateway is unreachable; the job stays due — start the "
+            "gateway (or its api_server adapter) and trigger again",
+        )
+    status_code, gateway_body = forwarded
+    if status_code == 503:
+        raise HTTPException(status_code=503, detail=gateway_body.get("error", "cron fire admission failed"))
+    if status_code == 200 and gateway_body.get("status") in ("duplicate", "gone"):
+        raise HTTPException(
+            status_code=409,
+            detail="Job is already running or was claimed by another scheduler",
+        )
     refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
-    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
-        return refreshed
-    if not ran:
-        raise HTTPException(status_code=409, detail="Job is already running or was claimed by another scheduler")
     if refreshed:
         return refreshed
-    # A one-shot may remove itself after exhausting repeat=1: keep the response
-    # shape without inventing an outcome the store no longer holds; the list
-    # refresh removes the completed row.
-    return {**job, "enabled": False, "state": "completed"}
+    return {"ok": True, "gateway_status": status_code, "job_id": job["id"]}
 
 
 def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):

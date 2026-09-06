@@ -932,16 +932,20 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; the remote backend's output crosses the same trust boundary as a
+        if read_remote_script is not None:
+            # The SELECTED target's file is authoritative: under a named
+            # remote target the command will execute against the target's
+            # filesystem, so a same-path host twin must not mask its content.
+            # The remote backend's output crosses the same trust boundary as a
             # local read — sanitize identically (binary skip + size fail-closed).
             if not budget.charge_remote_read():
                 return _budget_exhausted("remote reads", depth)
-            script_text, unsafe = _sanitize_remote_script_text(
+            remote_text, remote_unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
-            if unsafe:
+            if remote_unsafe:
                 return True
+            script_text = remote_text
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.

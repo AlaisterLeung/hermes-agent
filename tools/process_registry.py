@@ -1701,9 +1701,10 @@ class ProcessRegistry:
                 session.termination_source = source
             self._move_to_finished(session)
             self._write_checkpoint()
-            return {
+            result = {
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, "output": output}
+            return self._with_execution_metadata(result, session)
         except Exception as e:
             return {"status": "error", "error": str(e)}
 

@@ -777,7 +777,7 @@ async def test_trigger_cron_job_maps_admission_failure_to_unavailable(
     )
 
     with pytest.raises(HTTPException) as exc:
-        await web_server.trigger_cron_job(job["id"], profile="worker_alpha")
+        await _rt_cron.trigger_cron_job(job["id"], profile="worker_alpha")
 
     assert exc.value.status_code == 503
 

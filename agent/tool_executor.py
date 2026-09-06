@@ -75,18 +75,37 @@ def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -
         logger.debug("persisted-path record for result stub failed: %s", exc)
 
 
-def _ensure_file_checkpoint(agent, function_name: str, function_args: dict, effective_task_id: str) -> None:
-    """Checkpoint the same workspace path that the file tool will mutate, resolved the way
-    file tools do (against the task's live cwd, which differs from the process cwd in Docker)."""
+def _ensure_file_checkpoint(
+    agent,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> None:
+    """Checkpoint the same workspace path that the file tool will mutate."""
     file_path = function_args.get("path", "")
     if not file_path:
         return
-    from tools.file_tools_paths import _resolve_path_for_task
 
-    resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
-    agent._checkpoint_mgr.ensure_checkpoint(
-        agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path)), f"before {function_name}",
+    # Checkpointing is a host-filesystem operation. Never interpret an SSH or
+    # container path with local path semantics merely because it resembles one.
+    target_cwd = _selected_local_target_cwd(
+        effective_task_id, function_name, function_args,
     )
+    if not target_cwd:
+        return
+
+    # File tools resolve relative paths against the task's live/session cwd,
+    # which can differ from the Hermes process cwd (notably in Docker).  Resolve
+    # through that same path pipeline before asking the checkpoint manager to
+    # discover the project root.
+    from tools.file_tools import _resolve_path_for_task
+
+    target = function_args.get("target")
+    resolved_path = _resolve_path_for_task(
+        file_path, effective_task_id or "default", target,
+    )
+    work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
+    agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -1178,9 +1197,22 @@ def _safe_callback(callback, label: str, *args, **kwargs) -> None:
         logging.debug("%s callback error: %s", label, callback_error)
 
 
-def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -> None:
-    """Run user-visible and checkpoint preflight on final tool arguments."""
-    function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
+def _begin_tool_execution(
+    agent,
+    ref: _ToolCallRef | None = None,
+    display_index: int | None = None,
+    *,
+    function_name: str | None = None,
+    function_args: dict | None = None,
+    effective_task_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> None:
+    """Run user-visible and checkpoint preflight on final tool arguments.
+
+    Accepts either a ``_ToolCallRef`` (internal dispatch) or the explicit
+    keyword form (tests and middlewares that patch this entry point)."""
+    if ref is not None:
+        function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
     if _tool_progress_enabled(agent):
         prefix = f"Tool {display_index}" if display_index is not None else "Tool"

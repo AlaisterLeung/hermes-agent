@@ -146,7 +146,20 @@ def _pinned_execution_target_resolution():
     default through that authority yields the same named resolution the
     tool dispatch uses. Returns None when no target was pinned (plain
     local ACP server) or when resolution fails.
+
+    Late-bound through ``acp_adapter.server`` (which re-exports this name):
+    a patch installed on the server module wins over the original here, so
+    tests and embeddings can redirect the pinned-target lookup from either
+    site without an import cycle.
     """
+    try:
+        import acp_adapter.server as _server
+
+        override = _server.__dict__.get("_pinned_execution_target_resolution")
+        if override is not None and override.__module__ != __name__:
+            return override()
+    except Exception:
+        pass
     try:
         from tools.execution_targets import resolve_execution_target
 

@@ -219,7 +219,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # background process still references their task scope.
     from tools.terminal_tool import _cleanup_retired_environments
     _cleanup_retired_environments(min_age_seconds=60.0, require_idle=True)
-def get_active_env(task_id: str):
+def get_active_env(task_id: str, target: Optional[str] = None):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
@@ -293,19 +293,30 @@ def ensure_task_env(task_id: Optional[str] = None):
         return new_env
 
 
-def is_persistent_env(task_id: str) -> bool:
-    """True if *task_id*'s active env persists across turns.
+def is_persistent_env(task_id: str, target: Optional[str] = None) -> bool:
+    """Return True if the active environment for task_id is configured for
+    cross-turn persistence (``persistent_filesystem=True``).
 
-    The agent loop skips per-turn teardown for these (persistent docker,
-    daytona, modal, …); non-persistent backends are torn down at end of turn
-    to prevent leakage, and the idle reaper handles the rest. Session-scoped
-    docker containers count as persistent HERE: their lifetime is the session
-    (removed by ``AIAgent.close()`` → ``cleanup_vm`` and the idle reaper).
+    Used by the agent loop to skip per-turn teardown for backends whose whole
+    point is to survive between turns (docker with ``container_persistent``,
+    daytona, modal, etc.). Non-persistent backends (e.g. Morph) still get torn
+    down at end-of-turn to prevent leakage. The idle reaper
+    (``_cleanup_inactive_envs``) handles persistent envs once they exceed
+    ``terminal.lifetime_seconds``.
+
+    Session-scoped docker containers (per-session isolation mode) also count
+    as persistent HERE: their lifetime is the SESSION, not the turn — they
+    are removed by ``AIAgent.close()`` → ``cleanup_vm`` at session teardown
+    and by the idle reaper, not per-turn.
     """
-    env = get_active_env(task_id)
+    from tools.terminal_tool import _environment_is_persistent
+
+    env = get_active_env(task_id, target=target)
     if env is None:
         return False
-    return bool(getattr(env, "_session_scoped", False) or getattr(env, "_persistent", False))
+    if getattr(env, "_session_scoped", False):
+        return True
+    return _environment_is_persistent(env)
 
 
 def cleanup_all_environments():

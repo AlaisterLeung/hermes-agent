@@ -109,6 +109,7 @@ def test_idle_exactly_at_threshold():
 
 import os
 import socket as _socket
+import tempfile
 import threading
 
 
@@ -124,7 +125,9 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    # pytest tmp_path on self-hosted CI is too deep for AF_UNIX (~108 bytes).
+    sock_dir = tempfile.mkdtemp(prefix="hz-", dir="/tmp")
+    sock_path = os.path.join(sock_dir, "s")
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)

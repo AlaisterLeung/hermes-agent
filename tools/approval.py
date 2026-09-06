@@ -34,8 +34,7 @@ from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
     _user_deny_block_result,
 )
-from tools.approval_gateway_wait import _await_gateway_decision
-from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
+
 from tools.approval_smart import _smart_verdict
 
 logger = logging.getLogger(__name__)
@@ -610,7 +609,7 @@ _ACTION_GATE = _GateSpec(
 
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
-                human_present: bool) -> tuple[dict | None, bool]:
+                human_present: bool) -> tuple[dict | None, bool, str]:
     """Guardian-LLM step -> ``(result, smart_denied_for_owner)``: a result ends the gate;
     ``smart_denied_for_owner`` means an interactive owner may still override the DENY for this
     one operation (once/deny only, nothing persists).
@@ -624,12 +623,12 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     if verdict == "approve":
         _reset_denials(session_key)
         logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
-        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False
+        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False, verdict
     if verdict != "deny":
-        return None, False
+        return None, False, verdict
     _record_denial(session_key)
     if human_present:
-        return None, True
+        return None, True, verdict
     return {
         # Unattended programmatic platforms (webhook/msgraph_webhook/ api_server): respect unattended_mode
         # config. Resolves instantly — never a pending approval nobody can answer (#37284, #87509).
@@ -637,7 +636,7 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
         "message": (f"BLOCKED by smart approval: {description}. The command was assessed as genuinely "
                     f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
         "smart_denied": True,
-    }, True
+    }, True, verdict
 
 
 def _prepare_smart_approval_observer(
@@ -717,13 +716,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             execution_target=execution_target,
             execution_backend=execution_backend,
         )
-        result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
-                                           session_key, human_present=is_cli or is_gateway or is_ask)
+        result, smart_denied, verdict = _smart_gate(
+            spec, command, description, pattern_key, pattern_keys,
+            session_key, human_present=is_cli or is_gateway or is_ask)
+        # Observe the RAW verdict (approve/deny), including the deny that
+        # falls through to an owner override; escalate emits no post hook.
+        _observe_smart_approval_verdict(observer_payload, verdict)
         if result is not None:
-            _observe_smart_approval_verdict(
-                observer_payload, "approve" if result.get("approved") else "deny")
             return result
-        _observe_smart_approval_verdict(observer_payload, "escalate")
     pending_body = pending_body() if pending_body else None
     allow_permanent = permanent_capable and not smart_denied
 
@@ -1267,6 +1267,28 @@ import unicodedata  # noqa: F401,E402
 import uuid  # noqa: F401,E402
 
 
+def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
+    """Module-level indirection (lazy import breaks the approval cycle);
+    tests patch this name on tools.approval."""
+    from tools.approval_gateway_wait import _impl as _gateway_impl
+    return _gateway_impl(session_key, notify_cb, approval_data, surface=surface)
+
+
+def _present_with_selected_transport(*args, **kwargs):
+    from tools.approval_prompt import _present_with_selected_transport as _impl
+    return _impl(*args, **kwargs)
+
+
+def _transport_choice(*args, **kwargs):
+    from tools.approval_prompt import _transport_choice as _impl
+    return _impl(*args, **kwargs)
+
+
+def prompt_dangerous_approval(*args, **kwargs):
+    from tools.approval_prompt import prompt_dangerous_approval as _impl
+    return _impl(*args, **kwargs)
+
+
 _PLUGIN_COMPAT_LAZY = {
     'DANGEROUS_PATTERNS': ('tools.approval_detection', 'DANGEROUS_PATTERNS'),
     'DANGEROUS_PATTERNS_COMPILED': ('tools.approval_detection', 'DANGEROUS_PATTERNS_COMPILED'),
@@ -1279,6 +1301,10 @@ _PLUGIN_COMPAT_LAZY = {
     'human_wait_seconds': ('tools.approval_human_wait', 'human_wait_seconds'),
     'human_wait_window': ('tools.approval_human_wait', 'human_wait_window'),
     'is_interrupted': ('tools.interrupt', 'is_interrupted'),
+    '_present_with_selected_transport': ('tools.approval_prompt', '_present_with_selected_transport'),
+    '_transport_choice': ('tools.approval_prompt', '_transport_choice'),
+    '_await_gateway_decision': ('tools.approval_gateway_wait', '_await_gateway_decision'),
+    'prompt_dangerous_approval': ('tools.approval_prompt', 'prompt_dangerous_approval'),
     'request_elicitation_consent': ('tools.approval_prompt', 'request_elicitation_consent'),
     'reset_current_observability_context': ('tools.approval_context', 'reset_current_observability_context'),
     'reset_current_session_key': ('tools.approval_context', 'reset_current_session_key'),

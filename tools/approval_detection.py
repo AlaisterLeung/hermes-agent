@@ -396,7 +396,19 @@ DANGEROUS_PATTERNS = [
 ]
 
 
-DANGEROUS_PATTERNS_COMPILED = [(re.compile(p, _RE_FLAGS), d) for p, d in DANGEROUS_PATTERNS]
+# Patterns whose two independent `(?=[\s\S]*...)` lookaheads are quadratic on
+# long compound commands. Each carries its anchor tokens; when either anchor is
+# absent from the input the pattern cannot match, so the scan is skipped. The
+# tokens are plain literals for the anchor, not the full verb alternation, so
+# the check is conservative in the safe direction (it may run the regex, never
+# silently skip a match).
+_ANCHOR_GUARDED_PATTERNS = {
+    "stop/restart hermes launchd service (kills running agents)": ("launchctl", "hermes"),
+}
+
+DANGEROUS_PATTERNS_COMPILED = [
+    (re.compile(p, _RE_FLAGS), d) for p, d in DANGEROUS_PATTERNS
+]
 
 # Preserve approvals stored under the removed interpreter regex rules.
 _REMOVED_PATTERN_KEY_ALIASES = {
@@ -1214,6 +1226,9 @@ def detect_dangerous_command(command: str) -> tuple:
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
+            anchors = _ANCHOR_GUARDED_PATTERNS.get(description)
+            if anchors is not None and not all(a in command_lower for a in anchors):
+                continue
             if pattern_re.search(command_lower):
                 return (True, description, description)
     normalized = _normalize_command_for_detection(command)

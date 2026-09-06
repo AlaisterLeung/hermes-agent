@@ -1002,6 +1002,8 @@ class TestReviewRound3:
              patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
+             patch.object(bt_real_profile, "_launch_real_profile_chrome", return_value=(9251, None)), \
              patch.object(bt.subprocess, "run", return_value=proc), \
              patch.object(bt_cloud, "_is_headed_mode", return_value=False):
             cdp, err = bt_real_profile._real_profile_cdp()

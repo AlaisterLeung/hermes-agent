@@ -1369,7 +1369,7 @@ def read_file_tool(
         # (mark_background_review_skill_read gates on is_background_review).
         if not _partial:
             try:
-                from tools.skill_manager_tool import mark_background_review_skill_read
+                from tools.skill_manager_guards import mark_background_review_skill_read
 
                 mark_background_review_skill_read(Path(resolved_str))
             except Exception:
@@ -1404,110 +1404,8 @@ def read_file_tool(
 
 
 
-def reset_file_dedup(task_id: str = None):
-    """Advance the read-dedup generation after context compression.
-
-    Called after context compression.  The per-key ``dedup`` mtime map is
-    preserved, but the generation-read set is cleared. The first unchanged
-    read of each key after compaction therefore returns full content that may
-    have been summarized away; later reads in the same generation return the
-    lightweight stub. Stub-hit counters are also cleared so the hard block
-    restarts fresh (issue #84857).
-
-    Call with a task_id to reset just that task, or without to reset all.
-    """
-    with _read_tracker_lock:
-        if task_id:
-            try:
-                from tools.execution_targets import resolve_execution_target
-
-                scoped_task_id = resolve_execution_target().scope_task_key(task_id)
-            except Exception:
-                scoped_task_id = task_id
-            task_ids = {task_id, scoped_task_id}
-            keys = list(task_ids) + [
-                key for key in _read_tracker
-                if (
-                    isinstance(key, tuple)
-                    and len(key) == 2
-                    and key[0] in task_ids
-                )
-            ]
-            for key in keys:
-                task_data = _read_tracker.get(key)
-                if not task_data:
-                    continue
-                if "dedup" in task_data:
-                    task_data["dedup"].clear()
-                if "dedup_hits" in task_data:
-                    task_data["dedup_hits"].clear()
-                task_data.setdefault("dedup_generation_reads", set()).clear()
-        else:
-            for task_data in _read_tracker.values():
-                if "dedup_hits" in task_data:
-                    task_data["dedup_hits"].clear()
-                task_data.setdefault("dedup_generation_reads", set()).clear()
-
-
-def notify_other_tool_call(
-    task_id: str = "default", execution_target: str | None = None,
-):
-    """Reset consecutive read/search counter for a task.
-
-    Called by the tool dispatcher (model_tools.py) whenever a tool OTHER
-    than read_file / search_files is executed.  This ensures we only warn
-    or block on *truly consecutive* repeated reads — if the agent does
-    anything else in between (write, patch, terminal, etc.) the counter
-    resets and the next read is treated as fresh.
-    """
-    with _read_tracker_lock:
-        if execution_target is None:
-            try:
-                from tools.execution_targets import resolve_execution_target
-
-                scoped_task_id = resolve_execution_target().scope_task_key(task_id)
-            except Exception:
-                scoped_task_id = task_id
-            keys = [task_id, scoped_task_id] + [
-                key for key in _read_tracker
-                if (
-                    isinstance(key, tuple)
-                    and len(key) == 2
-                    and key[0] in {task_id, scoped_task_id}
-                )
-            ]
-        else:
-            try:
-                from tools.execution_targets import resolve_execution_target
-
-                keys = [
-                    resolve_execution_target(execution_target).file_coordination_key(
-                        task_id
-                    )
-                ]
-            except Exception:
-                keys = [task_id]
-        for key in keys:
-            task_data = _read_tracker.get(key)
-            if not task_data:
-                continue
-            task_data["last_key"] = None
-            task_data["consecutive"] = 0
-            # An intervening non-read tool call breaks any stub-loop in
-            # progress, so clear per-key dedup hit counters too.
-            if "dedup_hits" in task_data:
-                task_data["dedup_hits"].clear()
-            # Any other tool (terminal, delegate, ...) may have created a
-            # previously-missing path — a cached miss is no longer
-            # trustworthy. The serve-side existence guard in
-            # _check_not_found_cache already covers this, but clearing
-            # here keeps the cache honest and covers exotic cases the
-            # stat can't (e.g. permission flips).
-            nf = task_data.get("not_found")
-            if nf:
-                nf.clear()
-
-
+from tools.file_tools_read_tracking import reset_file_dedup  # noqa: E402,F401 — facade binds the split-off sibling's object
+from tools.file_tools_read_tracking import notify_other_tool_call  # noqa: E402,F401 — facade binds the split-off sibling's object
 def _invalidate_dedup_for_path(
     filepath: str,
     task_id: str,

@@ -119,6 +119,9 @@ afterEach(async () => {
 });
 
 describe("SessionsPage per-row profile routing (#99387)", () => {
+  // Interacts with the full page (gsap, rAF, several awaits); under 2-core
+  // CI runners the 5s default timeout is a coin flip. The assertion set is
+  // bounded, so give it headroom rather than a flaky retry.
   it("sends every per-row request to the row's owning profile, not the management default", async () => {
     await renderSessionsPage([
       { id: "sid-guanli", profile: "guanli", source: "cli", model: null, title: "Managed", started_at: 1, ended_at: null,
@@ -150,5 +153,5 @@ describe("SessionsPage per-row profile routing (#99387)", () => {
     );
     await act(async () => click(confirm ?? null));
     expect(apiMocks.deleteSession).toHaveBeenCalledWith("sid-guanli", "guanli");
-  });
+  }, 20_000);
 });

@@ -402,6 +402,52 @@ async def _forward_cron_fire_to_gateway(
     return resp.status_code, body
 
 
+
+
+def _forward_cron_fire_to_gateway_sync(
+    profile: str,
+    job_id: str,
+    *,
+    force: bool = False,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Forward a manual dashboard trigger to the gateway (blocking variant).
+
+    Same destination and auth as :func:`_forward_cron_fire_to_gateway` — the
+    gateway api_server's cron-fire route, authenticated with API_SERVER_KEY —
+    but synchronous so the existing cron-dashboard threadpool wrapper can call
+    it like the other ``*_sync`` workers. ``force`` rides in the body for
+    paused-job triggers; the gateway's claim path resumes-and-claims
+    atomically. Returns ``(status_code, body)`` or ``None`` when the gateway
+    is unreachable; the caller maps that to 503 rather than executing here.
+    """
+    _profile_name, home = _cron_profile_home(profile)
+    url = _gateway_fire_endpoint(_profile_name, home)
+    from agent.secret_scope import get_secret
+
+    api_key = get_secret("API_SERVER_KEY", "") or ""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url,
+                json={"job_id": job_id, "force": force},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception as exc:
+        _log.warning(
+            "manual cron trigger for %s could not reach the gateway fire "
+            "endpoint %s (%s: %s)",
+            job_id, url, type(exc).__name__, exc,
+        )
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": (resp.text or "")[:500]}
+    if not isinstance(body, dict):
+        body = {"raw": body}
+    return resp.status_code, body
 def _gateway_intentionally_stopped(profile: Optional[str]) -> bool:
     """True when the profile's gateway is stopped BY OPERATOR INTENT.
 

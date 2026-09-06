@@ -43,6 +43,8 @@ _CONTAINER_KEYS = (
     ("docker_shared_container_key", ""), ("docker_orphan_reaper", True), ("docker_snap_compat", False),
 )
 _DOCKER_KWARGS = (
+    ("storage_task_id", "storage_task_id", None),
+    ("legacy_storage_task_id", "legacy_storage_task_id", None),
     ("volumes", "docker_volumes", []), ("auto_mount_cwd", "docker_mount_cwd_to_workspace", False),
     ("forward_env", "docker_forward_env", []), ("env", "docker_env", {}),
     ("run_as_host_user", "docker_run_as_host_user", False), ("network", "docker_network", True),
@@ -100,8 +102,10 @@ def _modal_unavailable_reason(modal_state: Dict[str, Any]) -> tuple[str, str]:
 
 
 # --- Environment builders. Signature: (*, env_type, image, cwd, timeout, cc, task_id, ssh_config, host_cwd)
-def _build_local_env(*, cwd, timeout, **_):
-    return _LocalEnvironment(cwd=cwd, timeout=timeout)
+def _build_local_env(*, cwd, timeout, local_config=None, **_):
+    env = _LocalEnvironment(cwd=cwd, timeout=timeout)
+    setattr(env, "_persistent", bool((local_config or {}).get("persistent", False)))
+    return env
 
 
 def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
@@ -217,7 +221,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     connection with no remote setup/sync (the prompt-time probe). Unknown types fall through to plugin backends."""
     builder = _ENV_BUILDERS.get(env_type, _build_plugin_env)
     return builder(env_type=env_type, image=image, cwd=cwd, timeout=timeout, cc=container_config or {},
-                   task_id=task_id, ssh_config=ssh_config, host_cwd=host_cwd, probe_only=probe_only)
+                   task_id=task_id, ssh_config=ssh_config, host_cwd=host_cwd,
+                   probe_only=probe_only, local_config=local_config)
 
 
 # --- Requirement checkers: one generic path driven by _BACKEND_SPECS; optional fields, checked in order:

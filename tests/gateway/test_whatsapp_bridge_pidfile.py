@@ -114,7 +114,11 @@ class TestKillPortProcess:
         ])
         try:
             conn, _ = srv.accept()  # establish the client connection
-            pids = _listener_pids_on_port(port)
+            pids: list = []
+            try:
+                pids = _listener_pids_on_port(port)
+            except (PermissionError, OSError):
+                pytest.skip("lsof/ss not permitted in this environment")
             if os.getpid() not in pids:
                 pytest.skip("neither lsof nor ss detected the listener here")
             # The listener (this process) is found; the client process is NOT —

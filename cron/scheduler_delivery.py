@@ -91,6 +91,30 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _cron_session_id_from_job(job: dict) -> Optional[str]:
+    """Best-effort cron session id from job metadata (digest fallback only).
+
+    SECONDARY fallback only. The primary source is the ``HERMES_SESSION_ID``
+    session ContextVar the agent binds for the current run (ContextVar-first
+    via ``gateway.session_context.get_session_env``, which also covers the
+    plain ``os.environ`` set/id inherited by cron workers) — compression-proof
+    via the lineage-tip resolution in ``cron.scheduler``. Job metadata carries
+    the id only in legacy / manual shapes: a ``session_id`` key (dashboards /
+    API-created jobs), a dict-valued ``origin`` stamping the origin session,
+    or the historical ``cron_<job_id>_<YYYYmmdd_HHMMSS>`` id in
+    ``last_session_id``.
+    """
+    direct = job.get("session_id") or job.get("last_session_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    origin = job.get("origin")
+    if isinstance(origin, dict):
+        origin_session = origin.get("session_id")
+        if isinstance(origin_session, str) and origin_session.strip():
+            return origin_session.strip()
+    return None
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery is also mirrored into the target chat's session transcript.
 
@@ -214,7 +238,7 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
     create_thread = getattr(adapter, "create_handoff_thread", None)
     if not callable(create_thread) or loop is None:
         return None
-    thread_name = f"Hermes — {job.get('name') or job.get('id', 'cron')}"
+    thread_name = f"[Cron] {job.get('name') or job.get('id', 'cron')}"
     try:
         from agent.async_utils import safe_schedule_threadsafe
         coro = create_thread(str(chat_id), thread_name)
@@ -1666,6 +1690,31 @@ def _deliver_result(
     # attach_to_session=false and cron.mirror_delivery=false, else the seed gets "" and fails.
     _, mirror_text = BasePlatformAdapter.extract_media(content)
     mirror_text = (mirror_text or "").strip()
+
+    # Digest enrichment (fork #10): when mirroring is on, seed with a bounded
+    # digest of the run's own cron session transcript (tool timeline + final
+    # response + original-session pointer) instead of the bare final response.
+    # Pure enrichment — any failure falls back to the plain mirror_text above.
+    # The session id is ContextVar-first (gateway/session_context.
+    # get_session_env("HERMES_SESSION_ID"), which falls back to os.environ for
+    # CLI/cron workers); job metadata is the secondary fallback. The hermetic
+    # test fixture blanks HERMES_SESSION_* os vars (ContextVar _UNSET → env
+    # miss → ""), so tests set the id explicitly — never read os.environ
+    # directly here or parallel workers pick up a sibling job's id.
+    if mirror_enabled:
+        try:
+            from gateway.session_context import get_session_env
+            from cron.digest import build_cron_digest
+
+            _digest_session_id = get_session_env("HERMES_SESSION_ID") or _cron_session_id_from_job(job)
+            _digest_seed = build_cron_digest(job, _digest_session_id, mirror_text)
+            if _digest_seed:
+                mirror_text = _digest_seed
+        except Exception as e:
+            logger.debug(
+                "Job '%s': cron digest build failed, seeding plain final response: %s",
+                job.get("id", "?"), e,
+            )
 
     try:
         config = load_gateway_config()

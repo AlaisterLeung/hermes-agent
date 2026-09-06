@@ -26,7 +26,10 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.commands import HERMES_VERSION, SlashCommandsMixin, _estimate_tokens
-from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
+from acp_adapter.content import (
+    PromptBlock, _content_blocks_to_openai_user_content, _extract_text,
+    _pinned_execution_target_resolution,  # re-exported: tests patch it here
+)
 from acp_adapter.events import (
     _build_plan_update_from_todo_result, make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
