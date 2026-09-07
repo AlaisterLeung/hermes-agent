@@ -569,3 +569,71 @@ class TestPerChatDisplayOverrides:
         )
 
 
+class TestPerChatDisplayTurnWiring:
+    """_run_agent_display_settings() must consult the per-chat layer (#31488).
+
+    Regression: the Sep-2026 rebase of PR #11 onto the run.py -> run_turn.py
+    split silently dropped the ``chat=`` pass-throughs, so a per-chat
+    ``tool_progress: all`` / ``interim_assistant_messages: true`` override
+    never reached the turn (platform-level ``off``/``false`` won instead).
+    """
+
+    def _mixin(self):
+        from gateway.run import GatewayRunner
+        from gateway.run_turn import GatewayTurnMixin
+
+        mixin = GatewayTurnMixin.__new__(GatewayTurnMixin)
+        object.__setattr__(mixin, "_RunAgentDisplay", GatewayRunner._RunAgentDisplay)
+        object.__setattr__(mixin, "_adapter_for_source", lambda source: None)
+        object.__setattr__(
+            mixin, "_resolve_turn_toolsets",
+            lambda user_config, source, platform_key: (None, None),
+        )
+        return mixin
+
+    def _source(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!dev:example.org",
+            user_id="@boss:example.org",
+        )
+
+    def _config(self):
+        return {
+            "display": {
+                "platforms": {
+                    "matrix": {
+                        "tool_progress": "off",
+                        "interim_assistant_messages": False,
+                        "chats": {
+                            "!dev:example.org": {
+                                "tool_progress": "all",
+                                "interim_assistant_messages": True,
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+    def test_per_chat_tool_progress_reaches_turn(self, monkeypatch):
+        mixin = self._mixin()
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config", lambda: self._config(),
+        )
+        disp = mixin._run_agent_display_settings(self._source())
+        assert disp.progress_mode == "all"
+        assert disp.tool_progress_enabled is True
+
+    def test_per_chat_interim_messages_reach_turn(self, monkeypatch):
+        mixin = self._mixin()
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config", lambda: self._config(),
+        )
+        disp = mixin._run_agent_display_settings(self._source())
+        assert disp.interim_assistant_messages_enabled is True
+
+

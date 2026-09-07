@@ -792,7 +792,8 @@ class TurnRunner:
             from gateway.config import StreamingConfig
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
-        plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
+        # Per-chat override aware (#31488).
+        plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming", chat=ctx.source)
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )

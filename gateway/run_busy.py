@@ -518,7 +518,7 @@ class GatewayBusySessionMixin:
             steer_ack_enabled = bool(
                 resolve_display_setting(
                     _load_gateway_config(), _platform_config_key(event.source.platform),
-                    "busy_steer_ack_enabled", True,
+                    "busy_steer_ack_enabled", True, chat=event.source,
                 )
             )
         if not steer_ack_enabled:
@@ -544,7 +544,7 @@ class GatewayBusySessionMixin:
         busy_ack_detail_enabled = bool(
             resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(event.source.platform),
-                "busy_ack_detail", True,
+                "busy_ack_detail", True, chat=event.source,
             )
         )
         if busy_ack_detail_enabled and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
