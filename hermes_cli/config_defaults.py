@@ -1667,9 +1667,10 @@ DEFAULT_CONFIG = {
         # Make cron deliveries CONTINUABLE (user can reply to a brief with it in context). False
         # keeps deliveries isolated to the job's session; per-job `attach_to_session` overrides.
         # Thread-capable platforms (Telegram topics, Discord/Slack threads) get a seeded thread per
-        # job via create_handoff_thread; DM-only platforms mirror the brief into the origin DM
+        # job via create_handoff_thread; DM-only platforms mirror the brief into the target DM
         # session. Appended at a turn boundary via mirror_to_session, cached system prompt
-        # untouched; fan-out/broadcast targets are never mirrored.
+        # untouched. User-written bare platforms address home conversations, unlike `all`
+        # broadcast expansions, which do not gain mirror eligibility.
         "mirror_delivery": False,
         # Max due jobs run in parallel per tick. None/0 = unbounded (thread count only); 1 = serial.
         # Env override: HERMES_CRON_MAX_PARALLEL.
@@ -1812,6 +1813,10 @@ DEFAULT_CONFIG = {
             # Range 200..60000.
             "listing_max_tokens": 4000,
         },
+        # Remote connector discovery/lifecycle through the Nous tool gateway.
+        # The flag is the user's off switch; availability additionally requires
+        # the portal sign-in every managed tool gates on.
+        "connectors": {"enabled": True},
     },
     "logging": {  # File logging to ~/.hermes/logs/: agent.log captures INFO+, errors.log WARNING+.
         "level": "INFO",       # minimum level for agent.log: DEBUG, INFO, WARNING
@@ -1911,6 +1916,8 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+        # Bot-to-bot loop guard: admitted bot messages per conversation before a cooldown.
+        "bot_loop_guard": {"enabled": True, "max_events": 20, "window_seconds": 300, "cooldown_seconds": 600},
         # Startup-liveness watchdog: stdlib-only daemon thread armed at process entry that
         # hard-exits 75 if the loop isn't live within the deadline. Armed before config loads, so
         # run_gateway() bridges these to HERMES_STARTUP_WATCHDOG / HERMES_STARTUP_WATCHDOG_TIMEOUT_S
@@ -2151,6 +2158,23 @@ DEFAULT_CONFIG = {
     },
     # External secret sources — pull credentials from secret managers at startup instead of storing
     # them in ~/.hermes/.env.
+    # Browser credential vault: which login sources browser_vault_list/fill may draw from. The local
+    # encrypted vault (`hermes vault add`, Desktop → Settings → Credential Vault) is always on.
+    # External password managers are unlocked per session with a masked master-password prompt;
+    # headless sessions (cron, webhook, API) never prompt and see them as locked.
+    "vault": {
+        "onepassword": {
+            "enabled": False,       # `op` CLI: Login items with a website URL become fillable handles.
+            "account": "",          # account shorthand for `op --account`; empty = default account.
+            "binary_path": "",      # absolute path to op; empty = PATH.
+            # Env var holding a service-account token (headless auth, no unlock prompt). Unset = prompt.
+            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
+        },
+        "bitwarden": {
+            "enabled": False,       # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
+            "binary_path": "",      # absolute path to bw; empty = PATH.
+        },
+    },
     "secrets": {
         # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration
         # order. Mapped sources (explicit VAR→ref) always beat bulk sources (BSM project dumps);
@@ -2506,6 +2530,14 @@ OPTIONAL_ENV_VARS = {
         "Exact Firecrawl tool-gateway origin override for Nous Subscribers only (optional)",
         "Firecrawl gateway URL (leave empty to derive from domain)", None, password=False,
         advanced=True),
+    "TOOL_GATEWAY_URL": _tool(
+        "Exact shared tool-gateway origin for on-origin vendors and media uploads (optional)",
+        "Shared tool-gateway URL (leave empty to derive from domain)", None,
+        password=False, advanced=True),
+    "CONNECTOR_GATEWAY_URL": _tool(
+        "Exact connector-gateway origin for the connectors API (optional)",
+        "Connector-gateway URL (leave empty to derive from domain)", None,
+        password=False, advanced=True),
     "TOOL_GATEWAY_DOMAIN": _tool(
         "Shared tool-gateway domain suffix for Nous Subscribers only, used to derive vendor "
         "hosts, e.g. nousresearch.com -> firecrawl-gateway.nousresearch.com",
