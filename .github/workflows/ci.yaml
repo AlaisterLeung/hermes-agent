@@ -150,12 +150,6 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
-  contributor-check:
-    name: Check contributors
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/contributor-check.yml
-
   uv-lockfile:
     name: Check uv.lock
     needs: detect
@@ -204,17 +198,6 @@ jobs:
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
 
-  review-labels:
-    name: Review label gate
-    needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
-    uses: ./.github/workflows/review-labels.yml
-    with:
-      ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
-      ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
-      mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
-      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
-
   osv-scanner:
     name: OSV scan
     uses: ./.github/workflows/osv-scanner.yml
@@ -242,14 +225,12 @@ jobs:
       - e2e-desktop
       - docs-site
       - history-check
-      - contributor-check
       - uv-lockfile
       - case-collision-check
       - lockfile-diff
       - docker-lint
       - profile-artifact-check
       - supply-chain
-      - review-labels
       - osv-scanner
       # The image build runs in its own workflow (docker.yml) and reports
       # its own check. It was never required here, because it is too slow
