@@ -358,6 +358,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.vault import build_vault_parser
 from hermes_cli.subcommands.moa import build_moa_parser
 from hermes_cli.subcommands.fallback import build_fallback_parser
 from hermes_cli.subcommands.worktree import build_worktree_parser
@@ -1443,6 +1444,15 @@ def _apply_in_dir(args) -> None:
     except OSError as e:
         print(f"Error: cannot enter --in directory {in_dir}: {e}")
         sys.exit(1)
+    # Every cwd consumer (resolve_agent_cwd -> Codex app-server thread cwd, the
+    # terminal tool, context-file discovery) prefers TERMINAL_CWD over the process
+    # cwd, so a value inherited from a parent surface, the shell or .env outlives
+    # this chdir and re-homes the session in the old directory (#106220). Refresh
+    # it. An unset variable stays unset: the backends then derive from the new
+    # process cwd (local exports it at cli import, docker mounts it, ssh and
+    # container backends keep their own remote/sandbox default).
+    if os.environ.get("TERMINAL_CWD", "").strip():
+        os.environ["TERMINAL_CWD"] = _target_dir
     args.no_restore_cwd = True
 
 
@@ -2619,6 +2629,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "resume",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -3261,6 +3272,7 @@ def _build_cli_parser():
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
     build_monitoring_parser(subparsers, cmd_monitoring=cmd_monitoring)
     build_claw_parser(subparsers, cmd_claw=cmd_claw)
+    build_vault_parser(subparsers)
     build_update_parser(subparsers, cmd_update=cmd_update)
     build_uninstall_parser(subparsers, cmd_uninstall=cmd_uninstall)
     build_acp_parser(subparsers, cmd_acp=cmd_acp)
