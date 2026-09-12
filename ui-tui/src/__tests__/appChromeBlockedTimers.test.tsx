@@ -304,7 +304,15 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
-    await flush()
+    // A loaded runner can need more than one scheduler turn for the reveal
+    // re-render (and Ink's write) to land — poll for the frame instead of
+    // asserting after a single fixed delay.
+    await vi.waitFor(
+      () => {
+        expect(rule.output()).toContain('6m 0s')
+      },
+      { timeout: 5_000 }
+    )
 
     const resumed = rule.output()
 
