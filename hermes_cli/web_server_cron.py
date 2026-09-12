@@ -272,10 +272,10 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
 def _fire_cron_job_for_profile(profile: str, job_id: str, *, force: bool = False) -> bool:
     """Run ONE due cron job for ``profile`` via the scheduler provider's ``fire_due``.
 
-    DEPRECATED for NAS webhook fires — superseded by :func:`_forward_cron_fire_to_gateway`, since
-    fires must run in the GATEWAY process (it owns the live adapters; the standalone path here
-    cannot serve relay-fronted platforms or E2EE rooms). Retained for the dashboard trigger path
-    and external callers on the web_deps late-binding seam; do not add new uses.
+    DEPRECATED — every fire path forwards to the gateway now: fires must run
+    where the live adapters are (the standalone path here cannot serve
+    relay-fronted platforms or E2EE rooms). Retained for external callers on
+    the web_deps late-binding seam; do not add new uses.
     """
     _profile_name, home = _cron_profile_home(profile)
     from cron.scheduler_provider import provider_fire_due_accepts, provider_supports_force_fire, resolve_cron_scheduler
@@ -398,6 +398,51 @@ async def _forward_cron_fire_to_gateway(
             resp = await client.post(url, json={"job_id": job_id}, headers={"Authorization": authorization})
     except Exception as exc:
         _log.warning("cron fire forward to %s failed (%s: %s); returning 503 for NAS retry", url, type(exc).__name__, exc)
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": (resp.text or "")[:500]}
+    if not isinstance(body, dict):
+        body = {"raw": body}
+    return resp.status_code, body
+
+
+def _forward_cron_fire_to_gateway_sync(
+    profile: str,
+    job_id: str,
+    *,
+    force: bool = False,
+) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Forward a manual dashboard trigger to the gateway (blocking variant).
+
+    Same destination and auth as :func:`_forward_cron_fire_to_gateway`
+    (gateway cron-fire route, API_SERVER_KEY), but synchronous for the
+    cron-dashboard threadpool wrapper like the other ``*_sync`` workers.
+    ``force`` rides in the body for paused-job triggers (the gateway claim
+    resumes-and-claims atomically). Returns ``(status_code, body)`` or ``None``
+    when the gateway is unreachable — the caller maps that to 503.
+    """
+    _profile_name, home = _cron_profile_home(profile)
+    url = _gateway_fire_endpoint(_profile_name, home)
+    from agent.secret_scope import get_secret
+
+    api_key = get_secret("API_SERVER_KEY", "") or ""
+    import httpx
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(
+                url,
+                json={"job_id": job_id, "force": force},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception as exc:
+        _log.warning(
+            "manual cron trigger for %s could not reach the gateway fire "
+            "endpoint %s (%s: %s)",
+            job_id, url, type(exc).__name__, exc,
+        )
         return None
     try:
         body = resp.json()

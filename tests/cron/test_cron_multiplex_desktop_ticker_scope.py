@@ -7,15 +7,13 @@ Two halves:
    RUNNING event loop — the desktop dashboard shape) spawns a fresh thread that
    did not inherit the profile ContextVars; it must run inside a copy of the
    active context so the sender reads THIS profile's home + secrets.
-2. The desktop ticker must stand down, per tick, for a profile whose OWN
-   gateway is running — that gateway ticks it with live adapters, and racing it
-   on the tick lock lets the adapter-less desktop ticker deliver standalone.
+2. The desktop dashboard ticker must not execute cron jobs locally at all:
+   due fires are forwarded to the owning gateway's ``/api/cron/fire``, which
+   claims them via the store CAS and runs them with live adapters.
 """
 import asyncio
 import threading
 from unittest.mock import patch
-
-import pytest
 
 
 
@@ -107,46 +105,42 @@ def test_multiplex_ticker_profile_gate_skips_rejected_profile(tmp_path):
     assert (orphan / "cron" / "ticker_last_success").exists()
 
 
-@pytest.mark.parametrize("profile_count", [1, 2])
-def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch, profile_count):
-    """Desktop yields to each live gateway, including a single-profile install."""
+def test_desktop_ticker_forwards_instead_of_ticking_profiles(monkeypatch):
+    """The desktop ticker's forwarding contract.
+
+    Fork note: the ticker is a ``GatewayForwardingCronScheduler`` and no longer
+    resolves a provider via ``resolve_cron_scheduler`` — the upstream doubles
+    here never engage, and the real forwarding scheduler would block in its
+    sweep until the per-file watchdog kills the subprocess. Spy the class so
+    ``start()`` records its kwargs and returns immediately (same reason
+    tests/hermes_cli/conftest.py skips test_desktop_cron_ticker_profiles.py).
+
+    Profile stand-down is not wired on the desktop — fires are forwarded to the
+    owning gateway, which claims via store CAS — so assert the forwarding
+    sweep contract instead of the retired profile_gate kwarg.
+    """
+    import cron.scheduler_provider as sp
     from hermes_cli import web_server
 
-    homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")][:profile_count]
-    running = {homes[-1][1]}
-    monkeypatch.setattr(
-        "hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes)
-    )
-    monkeypatch.setattr(
-        "hermes_cli.profiles._check_gateway_running", lambda home: home in running
-    )
-    monkeypatch.setattr("hermes_cli.profiles._served_by_running_multiplexer", lambda name: False)
     captured = {}
 
-    class _Provider:
-        name = "fake"
-
+    class _SpyForwarding(sp.GatewayForwardingCronScheduler):
         def start(self, stop_event, **kwargs):
             captured.update(kwargs)
 
-    from cron import scheduler_provider as sp
-
-    monkeypatch.setattr(web_server, "resolve_cron_scheduler", lambda: _Provider(), raising=False)
-    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: _Provider())
-    monkeypatch.setattr(sp, "InProcessCronScheduler", _Provider)
+    monkeypatch.setattr(
+        sp, "GatewayForwardingCronScheduler", _SpyForwarding
+    )
     monkeypatch.setattr("hermes_logging.enable_profile_log_routing", lambda homes: None)
 
-    web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
+    web_server._start_desktop_cron_ticker(threading.Event(), interval=7)
 
-    assert captured.get("profile_homes") == homes
-    gate = captured.get("profile_gate")
-    assert gate is not None, "desktop ticker did not install a profile gate"
-    for name, home in homes:
-        assert gate(name, home) is (home not in running)
-
-    # Re-evaluate on each tick: Desktop resumes fallback after gateway exit
-    # and stands down again if a gateway starts later.
-    running.clear()
-    assert all(gate(name, home) for name, home in homes)
-    running.update(home for _, home in homes)
-    assert not any(gate(name, home) for name, home in homes)
+    assert captured.get("interval") == 7, (
+        "the desktop ticker must pass the sweep interval through to the "
+        "forwarding scheduler"
+    )
+    assert captured.get("profile_homes") is None, (
+        "the adapter-less desktop ticker must not tick profile stores locally "
+        "— due fires are forwarded to the gateways' /api/cron/fire, which "
+        "claims them via store CAS (no profile_gate needed)"
+    )
