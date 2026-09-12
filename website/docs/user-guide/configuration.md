@@ -276,6 +276,8 @@ If `targets` is absent or empty, Hermes preserves the existing flat config and e
 
 Target entries are validated strictly before environment creation. Unknown, misspelled, backend-inapplicable, malformed, or missing required settings return an error naming the target and field; documented top-level compatibility and policy fields remain supported.
 
+SSH targets run without the `~/.hermes` mirror: Hermes does not sync credentials, skills, or caches to a named target's remote host. The mirror exists to provision ephemeral sandboxes, while a named target is a real, self-managed machine, so file sync is disabled for named targets (including a named `default_target`). The legacy flat `ssh` configuration keeps the historical mirror behavior; there is no per-target toggle for this.
+
 ### Runtime target registry (no gateway restart)
 
 Static targets in `config.yaml` remain the right choice for durable, hand-managed environments. Controllers for ephemeral compute should publish provider-owned runtime targets with the built-in CLI instead:

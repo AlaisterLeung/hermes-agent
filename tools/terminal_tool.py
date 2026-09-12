@@ -3297,6 +3297,7 @@ def _build_environment_constructor_configs(
             "port": config.get("ssh_port", 22),
             "key": config.get("ssh_key", ""),
             "persistent": config.get("ssh_persistent", False),
+            "file_sync": not resolution.named,
             "runtime_scope": resolution.security_scope if resolution.named else "",
         }
 
