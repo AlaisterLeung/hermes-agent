@@ -278,19 +278,78 @@ def _seed_cron_session(
 def _seed_cron_thread_session(
     job: dict, adapter, platform_name: str, chat_id: str, thread_id: str, mirror_text: str,
     chat_name: Optional[str] = None, is_dm: bool = False, scope_id: Optional[str] = None,
+    loop=None,
 ) -> None:
-    """Seed the freshly-opened cron thread's session with the brief (never raises), else the
-    user's in-thread reply resolves to a transcript without it. Threads are participant-shared
-    (no real user_id); a DM thread must seed ``chat_type="dm"`` — DM-thread replies route through
-    the DM arm (``…:dm:<chat>:<thread>``), so a "thread"-typed seed is a row no DM reply hits."""
+    """Seed the freshly-opened cron thread's session with the brief (never raises).
+
+    The seed key must match the reply's ``build_session_key`` arm: DM threads key
+    through the DM arm; Matrix ROOM threads key ``chat_type="group"`` with no user
+    component (threads are participant-shared); everything else keeps the historical
+    "thread" + system:cron shape. Matrix DM-ness is re-resolved live via the
+    adapter's ``_is_dm_room`` (metadata and the adapter's runtime classification can
+    disagree); best-effort — a successful delivery is never failed by the probe.
+    """
     text = (mirror_text or "").strip()
     if not text:
         return
     try:
+        from gateway.config import Platform
+
+        # Matrix only: re-resolve DM-ness from the adapter — job metadata and the
+        # live classification can disagree, and the seed must match the arm the
+        # REPLY will take.
+        try:
+            if Platform(platform_name.lower()) == Platform.MATRIX:
+                resolve_dm: Any = getattr(adapter, "_is_dm_room", None)
+                if callable(resolve_dm):
+                    import asyncio as _asyncio
+
+                    async def _probe_dm() -> bool:
+                        return bool(await _asyncio.wait_for(
+                            resolve_dm(str(chat_id)), timeout=15))
+
+                    on_loop: Any = None
+                    try:
+                        on_loop = _asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    if on_loop is not None:
+                        # On the loop's own thread — blocking would deadlock.
+                        logger.debug(
+                            "Job '%s': skipping live DM re-resolution on %s:%s "
+                            "(called from loop thread)",
+                            job.get("id", "?"), platform_name, chat_id,
+                        )
+                    elif loop is not None and not loop.is_closed():
+                        is_dm = bool(
+                            _asyncio.run_coroutine_threadsafe(
+                                _probe_dm(), loop
+                            ).result(timeout=25)
+                        )
+                    else:
+                        is_dm = bool(_asyncio.run(_probe_dm()))
+        except Exception:
+            logger.debug(
+                "Job '%s': live DM re-resolution failed for %s:%s — using "
+                "metadata value (%s)",
+                job.get("id", "?"), platform_name, chat_id, is_dm,
+            )
+
+        try:
+            platform_enum = Platform(platform_name.lower())
+        except (ValueError, KeyError):
+            platform_enum = None
+        # Matrix room threads: participant-shared key (group, no user).
+        _matrix_room_seed = platform_enum == Platform.MATRIX and not is_dm
         ok = _seed_cron_session(
             job, adapter, platform_name, chat_id, text,
-            thread_id=str(thread_id), chat_type="dm" if is_dm else "thread",
-            user_id="system:cron", user_name="Cron", chat_name=chat_name, scope_id=scope_id,
+            thread_id=str(thread_id),
+            # Room threads: group, no user; everything else keeps the
+            # historical thread + system:cron shape.
+            chat_type="dm" if is_dm else ("group" if _matrix_room_seed else "thread"),
+            user_id=None if _matrix_room_seed else "system:cron",
+            user_name=None if _matrix_room_seed else "Cron",
+            chat_name=chat_name, scope_id=scope_id,
             discord_keys_on_thread=True)
         if ok:
             logger.info(
@@ -1348,14 +1407,14 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""
     job = t.job
     origin = t.origin
-    seed_kwargs = dict(
+    seed_kwargs: dict[str, Any] = dict(
         chat_name=origin.get("chat_name"), is_dm=t.is_dm_target, scope_id=origin.get("scope_id"))
     thread_seeded = False
     inchannel_seeded = False
     if t.opened_thread_id:
         _seed_cron_thread_session(
             job, t.runtime_adapter, t.platform_name, t.chat_id, t.opened_thread_id, t.mirror_text,
-            **seed_kwargs,
+            loop=t.loop, **seed_kwargs,
         )
         thread_seeded = True
     # in_channel: CREATE + seed the flat session (the mirror only APPENDS to an existing one). Same
@@ -1376,7 +1435,7 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             _seed_cron_thread_session(
                 job, t.runtime_adapter, t.platform_name, t.chat_id, str(delivered_message_id),
                 t.mirror_text,
-                **seed_kwargs)
+                loop=t.loop, **seed_kwargs)
     elif t.in_channel_surface and not t.inchannel_continuable:
         logger.warning(
             "Job '%s': in_channel delivery to %s:%s is not a "

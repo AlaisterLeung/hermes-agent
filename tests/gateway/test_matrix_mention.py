@@ -272,9 +272,15 @@ async def test_auto_thread_preserves_existing_thread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_auto_thread_skips_dm(monkeypatch):
-    """DMs should not get auto-threaded."""
+    """DMs should not get auto-threaded.
+
+    ``MATRIX_DM_AUTO_THREAD`` is read at ``__init__``, so it must be pinned:
+    another suite in the same process can construct a MatrixAdapter with the
+    gateway's env leak and flip the DM path for environmental reasons.
+    """
     monkeypatch.setenv("MATRIX_REQUIRE_MENTION", "false")
     monkeypatch.delenv("MATRIX_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("MATRIX_DM_AUTO_THREAD", "false")
 
     adapter = _make_adapter()
     _set_dm(adapter)
