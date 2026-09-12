@@ -2155,9 +2155,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:
-    """Per-turn VM + browser cleanup for a task. Skips ``cleanup_vm`` for persistent
-    terminal envs (``_cleanup_inactive_envs`` reaps them after ``terminal.lifetime_seconds``)
-    and ``cleanup_browser`` in headed mode (the inactivity reaper handles idle sessions)."""
+    """Per-turn VM + browser cleanup for a task.
+
+    Removes each non-persistent target while keeping persistent named sibling
+    environments live so long-lived containers survive between turns. The
+    idle reaper in ``terminal_tool._cleanup_inactive_envs`` still tears them
+    down once ``terminal.lifetime_seconds`` is exceeded. Non-persistent
+    backends are torn down per-turn as before to prevent resource leakage
+    (the original intent of this hook for the Morph backend, see commit
+    fbd3a2fd). The current logical turn stops counting itself first so the
+    collapsed shared environment is only cleaned when the last overlapping
+    turn finalizes.
+
+    Skips ``cleanup_browser`` in headed mode (the inactivity reaper handles
+    idle sessions).
+    """
     def _headed() -> bool:
         try:
             from tools.browser_tool_cloud import _is_headed_mode
@@ -2165,8 +2177,32 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         except Exception:
             return bool(os.environ.get("AGENT_BROWSER_HEADED"))
 
+    def _cleanup_vm() -> None:
+        try:
+            from tools.terminal_tool import (
+                active_environment_turns,
+                defer_environment_turn_cleanup,
+                release_logical_environment_turn_for_cleanup,
+            )
+
+            # Decrement self before deciding "last user"; the idempotent lease
+            # keeps duplicate finalization paths from double-decrementing.
+            release_logical_environment_turn_for_cleanup(task_id)
+            remaining_turns = active_environment_turns(task_id)
+            include_collapsed = remaining_turns == 0
+            if not include_collapsed:
+                defer_environment_turn_cleanup(task_id)
+            _ra().cleanup_vm(
+                task_id,
+                preserve_persistent=True,
+                include_collapsed=include_collapsed,
+            )
+        except Exception as e:
+            if agent.verbose_logging:
+                logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
+
     for label, skip, skip_what, cleanup in (
-        ("VM", is_persistent_env, "cleanup_vm for persistent env", lambda: _ra().cleanup_vm(task_id)),
+        ("VM", lambda _tid: False, "cleanup_vm for persistent env", _cleanup_vm),
         ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: _ra().cleanup_browser(task_id)),
     ):
         try:

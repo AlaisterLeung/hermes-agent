@@ -125,7 +125,16 @@ class TurnFacadeMixin:
 
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self):
+            # logical_environment_turn scopes per-target logical-environment turn accounting to
+            # this task (named execution targets).
+            from tools.terminal_tool import logical_environment_turn
+
+            with (
+                bind_subagent_parent(self),
+                scoped_runtime_main({}),
+                track_in_interrupt_scope(self),
+                logical_environment_turn(effective_task_id),
+            ):
                 try:
                     if lease is not None:
                         lease.start()

@@ -139,7 +139,8 @@ _PIPE_TO_INTERPRETER = re.compile(
 # Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
 _BINARY_SNIFF_BYTES = 4096
 
-_ReadRemoteScriptFn = Callable[[str], Optional[str]]
+_ReadRemoteScriptResult = Optional[str] | tuple[Optional[str], bool]
+_ReadRemoteScriptFn = Callable[[str], _ReadRemoteScriptResult]
 
 # Wrappers that hand execution to their argument tail: the real command sits further right, so a
 # first-token-only guard would let `sudo bash ~/restart.sh` / `sudo launchctl submit ...` walk past.
@@ -396,6 +397,7 @@ def _budget_exhausted(what: str, depth: int) -> bool:
 
 
 # --- shell tokenization -----------------------------------------------------------------------
+
 
 def _split_logical_lines(text: str) -> list[str]:
     """Split on newlines outside quotes (a quoted newline is data, not a separator); honors
@@ -866,7 +868,7 @@ def _read_referenced_script_unlocked(
 
 
 def _sanitize_remote_script_text(
-    text: Optional[str], *, max_bytes: Optional[int] = None
+    result: _ReadRemoteScriptResult, *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
     """Apply the local-read contract to text from an untrusted ``read_remote_script`` callback: NUL
     means binary (nothing to scan, checked first); oversized fails closed. Size compares re-encoded
@@ -878,7 +880,19 @@ def _sanitize_remote_script_text(
     inside each callback so the guarantee holds for every callback, not just the ones we hardened. See
     #76762, #77703.
     """
-    if not text or "\x00" in text:
+    if isinstance(result, tuple):
+        if len(result) != 2 or not isinstance(result[1], bool):
+            return None, True
+        text, unsafe = result
+        if unsafe:
+            return None, True
+    else:
+        text = result
+    if not text:
+        return None, False
+    if not isinstance(text, str):
+        return None, True
+    if "\x00" in text:
         return None, False
     byte_limit = _capped_read_limit(max_bytes)
     if len(text) > byte_limit:
@@ -940,16 +954,18 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; the remote backend's output crosses the same trust boundary as a
-            # local read — sanitize identically (binary skip + size fail-closed).
+        if read_remote_script is not None:
+            # The SELECTED target's file is authoritative — the command executes
+            # on the target's filesystem, so a same-path host twin must not mask
+            # its content (same trust boundary as any remote read).
             if not budget.charge_remote_read():
                 return _budget_exhausted("remote reads", depth)
-            script_text, unsafe = _sanitize_remote_script_text(
+            remote_text, remote_unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
-            if unsafe:
+            if remote_unsafe:
                 return True
+            script_text = remote_text
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.

@@ -414,6 +414,10 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
     ``apply_terminal_config_to_env`` (also used by terminal_tool and the TUI/dashboard launchers) so the
     semantics can't drift between sites."""
     try:
+        # --ignore-user-config: the early dotenv bootstrap must not re-apply the
+        # ignored config's terminal settings (the CLI bridges defaults after).
+        if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
+            return
         if Path(home_path).resolve() != _process_hermes_home().resolve():
             return
         from hermes_cli.config import apply_terminal_config_to_env

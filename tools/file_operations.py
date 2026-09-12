@@ -177,11 +177,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     patches "succeed" with a plausible diff while landing in the wrong directory).
     """
 
-    def __init__(self, terminal_env, cwd: str = None):
+    def __init__(self, terminal_env, cwd: str = None, *, fixed_cwd: str = None):
         self.env = terminal_env
         # Never os.getcwd(): that is the HOST path, absent inside container backends.
         self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        # Named SSH targets pin operations to this session's cwd record (the
+        # environment object is shared across sessions).
+        self.fixed_cwd = fixed_cwd
         # Ordinary executables: bool cache (hits AND misses). rg is special — it has
         # an off-PATH resolver and may be installed mid-session — so only successful
         # rg resolutions are cached (see SearchMixin._resolve_command).
@@ -191,14 +194,17 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
-        """Run ``command`` on the backend. cwd: explicit arg → live ``env.cwd`` →
-        init-time ``self.cwd``. ``stdin_data`` is piped (bypasses ARG_MAX)."""
+        """Run ``command`` on the backend. cwd: explicit arg → scope-pinned
+        ``self.fixed_cwd`` → live ``env.cwd`` → init-time ``self.cwd``.
+        ``stdin_data`` is piped (bypasses ARG_MAX)."""
         kwargs = {}
         if timeout:
             kwargs['timeout'] = timeout
         if stdin_data is not None:
             kwargs['stdin_data'] = stdin_data
-        effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
+        effective_cwd = (
+            cwd or self.fixed_cwd or getattr(self.env, 'cwd', None) or self.cwd
+        )
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         exit_code = result.get("returncode", 0)
         # A stdin write failure with a clean child exit is still a failure: the

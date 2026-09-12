@@ -29,6 +29,29 @@ _SSH_MULTIPLEX = os.name != "nt"
 _load_hermes_env_vars = load_hermes_env_vars
 
 
+def _double_quote(cmd_string: str) -> str:
+    """Escape a string for use as a single double-quoted shell argument.
+
+    The result is parseable by POSIX and non-POSIX login shells alike, so
+    ``bash -c`` receives the exact original content.
+    """
+    escaped = cmd_string.replace("\\", "\\\\")
+    escaped = escaped.replace('"', '\\"')
+    escaped = escaped.replace("$", "\\$")
+    escaped = escaped.replace("`", "\\`")
+    return f'"{escaped}"'
+
+
+def _active_profile_identity() -> str:
+    """Return the current Hermes profile without exposing it in socket paths."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return str(get_active_profile_name() or "default")
+    except Exception:
+        return str(os.environ.get("HERMES_PROFILE") or "default")
+
+
 def _ensure_ssh_available() -> None:
     """Fail fast with a clear error when the SSH client is unavailable."""
     for tool in ("ssh", "scp"):
@@ -57,19 +80,43 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
-                 probe_only: bool = False):
+                 probe_only: bool = False,
+                 runtime_scope: str = "", profile_name: str | None = None,
+                 file_sync: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
-        self.host, self.user, self.port, self.key_path = host, user, port, key_path
+        self.host = host
+        self.user = user
+        self.port = port
+        self.key_path = key_path
+        self.runtime_scope = str(runtime_scope or "")
+        self.profile_name = str(profile_name or _active_profile_identity())
+        # When False, skip the ~/.hermes mirror (init mkdir + FileSyncManager):
+        # for self-managed remote hosts the sync is redundant or harmful.
+        self.file_sync = bool(file_sync)
+
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
-        # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
-        # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
-        # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
-        # per-instance socket so its cleanup() can never close the agent's shared master.
-        socket_key = f"{user}@{host}:{port}"
+        # Short deterministic socket path: the raw user@host:port + SSH's 16-byte
+        # ControlMaster suffix overflows macOS's 104-byte sun_path under a deep
+        # $TMPDIR, and a stable path keeps ControlMaster reuse working. The digest
+        # covers credential + profile + target scope (OpenSSH reuses a master before
+        # re-authenticating later ``-i`` options). Probe sockets get their own
+        # per-instance suffix so cleanup never closes the shared master.
+        normalized_key = (
+            os.path.normcase(
+                os.path.abspath(os.path.expanduser(os.path.expandvars(key_path)))
+            )
+            if key_path else "<ssh-agent-or-default>"
+        )
+        socket_identity = "\0".join((
+            str(user), str(host), str(port), normalized_key,
+            self.profile_name, self.runtime_scope,
+        ))
         if probe_only:
-            socket_key = f"{socket_key}:probe:{self._session_id}"
-        _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
+            socket_identity = f"{socket_identity}\0probe:{self._session_id}"
+        _socket_id = hashlib.sha256(
+            socket_identity.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
         self._establish_connection()
@@ -256,8 +303,9 @@ class SSHEnvironment(BaseEnvironment):
                               f"Remote file cleanup on {self.host}")
 
     def _before_execute(self) -> None:
+        """Sync files to remote via FileSyncManager (rate-limited internally)."""
         if self._sync_manager is not None:
-            self._sync_manager.sync()  # rate-limited internally
+            self._sync_manager.sync()
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -272,7 +320,7 @@ class SSHEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
 
     def cleanup(self):
-        if self._sync_manager:
+        if self._sync_manager is not None:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
         for socket in self._control_sockets():

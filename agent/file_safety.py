@@ -87,7 +87,12 @@ def build_write_denied_paths(home: str) -> set[str]:
     # credentials across every profile that inherits from it; the root Anthropic
     # PKCE store is still read by default/non-profile sessions when a profile is
     # active; bws_cache.enc.json is the Bitwarden Secrets Manager encrypted cache.
-    hermes_files = (".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"))
+    hermes_files = (
+        ".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"),
+        # Keyed execution-target fingerprint secret. Exposing or replacing it
+        # would let an untrusted tool forge persisted target identities.
+        ".execution-target-fingerprint-key",
+    )
     paths = [
         *(os.path.join(home, *f) for f in home_files),
         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
@@ -199,6 +204,7 @@ _DID_SUFFIX = (
 _CREDENTIAL_FILE_NAMES = (
     "auth.json", "auth.lock", ".anthropic_oauth.json", ".env", "webhook_subscriptions.json",
     os.path.join("auth", "google_oauth.json"), os.path.join("cache", "bws_cache.json"),
+    ".execution-target-fingerprint-key",
 )
 
 # Directory-prefix read denies under HERMES_HOME / <root>: (subdir, message for

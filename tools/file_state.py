@@ -15,21 +15,24 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Hashable, Iterable, List, Optional, Tuple
 
-# (mtime, read_ts, partial). partial=True when read_file returned a windowed
-# view (offset > 1 or limit < total_lines) — a later write should still warn
-# so the model re-reads in full.
-ReadStamp = Tuple[float, float, bool]
+
+# ── Public stamp type ────────────────────────────────────────────────
+# (mtime, read_ts, partial) — partial=True for windowed reads (offset > 1 or
+# limit < total_lines); later writes still warn so the model re-reads in full.
+ReadStamp = Tuple[Optional[float], float, bool]
+TaskKey = Hashable
 
 # Bounded so long sessions don't accumulate unbounded state.
 _MAX_PATHS_PER_AGENT = 4096
 _MAX_GLOBAL_WRITERS = 4096
 
 
-def _disabled() -> bool:
-    # Re-read each call so tests can toggle via monkeypatch.setenv.
-    return os.environ.get("HERMES_DISABLE_FILE_STATE_GUARD", "").strip() == "1"
+def _raw_task_id(task_id: TaskKey) -> TaskKey:
+    if isinstance(task_id, tuple) and len(task_id) == 2:
+        return task_id[0]
+    return task_id
 
 
 def _mtime_or_none(resolved: str) -> Optional[float]:
@@ -37,11 +40,6 @@ def _mtime_or_none(resolved: str) -> Optional[float]:
         return os.path.getmtime(resolved)
     except OSError:
         return None
-
-
-def _fmt_ts(ts: float) -> str:
-    # Short wall-clock for warnings; avoids datetime formatting on the hot path.
-    return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
 def _evict_oldest(container, cap: int) -> None:
@@ -61,78 +59,154 @@ class FileStateRegistry:
     """Process-wide coordinator for cross-agent file edits."""
 
     def __init__(self) -> None:
-        self._reads: Dict[str, Dict[str, ReadStamp]] = defaultdict(dict)
-        self._last_writer: Dict[str, Tuple[str, float]] = {}
+        self._reads: Dict[TaskKey, Dict[str, ReadStamp]] = defaultdict(dict)
+        self._last_writer: Dict[str, Tuple[TaskKey, float]] = {}
         self._path_locks: Dict[str, threading.Lock] = {}
         self._path_lock_users: Dict[str, int] = {}
         self._meta_lock = threading.Lock()  # guards _path_locks
         self._state_lock = threading.Lock()  # guards _reads + _last_writer
 
-    @contextmanager
-    def lock_path(self, resolved: str):
-        """Per-path lock: threads on the same path serialize, different paths proceed.
-        The lock entry is dropped once the last holder/waiter exits."""
+    # ── Path lock management ────────────────────────────────────────
+    @staticmethod
+    def _state_path(resolved: str, namespace: Optional[str] = None) -> str:
+        return f"{namespace}\0{resolved}" if namespace else resolved
+
+    @staticmethod
+    def _display_path(state_path: str) -> str:
+        return state_path.split("\0", 1)[-1]
+
+    def _lock_for(self, resolved: str,
+                  namespace: Optional[str] = None) -> threading.Lock:
+        state_path = self._state_path(resolved, namespace)
         with self._meta_lock:
-            lock = self._path_locks.setdefault(resolved, threading.Lock())
-            self._path_lock_users[resolved] = self._path_lock_users.get(resolved, 0) + 1
+            lock = self._path_locks.get(state_path)
+            if lock is None:
+                lock = threading.Lock()
+                self._path_locks[state_path] = lock
+            self._path_lock_users[state_path] = self._path_lock_users.get(state_path, 0) + 1
+            return lock
+
+    @contextmanager
+    def lock_path(self, resolved: str, namespace: Optional[str] = None):
+        """Acquire the per-path lock for a read→modify→write section.
+
+        Same process, same filesystem — threads on the same path serialize.
+        Different paths proceed in parallel.
+        """
+        lock = self._lock_for(resolved, namespace)
+        state_path = self._state_path(resolved, namespace)
         lock.acquire()
         try:
             yield
         finally:
             lock.release()
             with self._meta_lock:
-                users = self._path_lock_users[resolved] - 1
+                users = self._path_lock_users[state_path] - 1
                 if users:
-                    self._path_lock_users[resolved] = users
+                    self._path_lock_users[state_path] = users
                 else:
-                    self._path_lock_users.pop(resolved, None)
-                    self._path_locks.pop(resolved, None)
+                    self._path_lock_users.pop(state_path, None)
+                    self._path_locks.pop(state_path, None)
 
-    def _stamp(self, task_id: str, resolved: str, mtime: float, now: float, partial: bool) -> None:
-        """Caller holds ``_state_lock``."""
-        agent_reads = self._reads[task_id]
-        agent_reads[resolved] = (float(mtime), now, bool(partial))
-        _evict_oldest(agent_reads, _MAX_PATHS_PER_AGENT)
-
-    def record_read(self, task_id: str, resolved: str, *, partial: bool = False,
-                    mtime: Optional[float] = None) -> None:
+    # ── Read/write accounting ───────────────────────────────────────
+    def record_read(
+        self,
+        task_id: TaskKey,
+        resolved: str,
+        *,
+        partial: bool = False,
+        mtime: Optional[float] = None,
+        namespace: Optional[str] = None,
+        stat_path: bool = True,
+    ) -> None:
         if _disabled():
             return
-        mtime = _mtime_or_none(resolved) if mtime is None else mtime
-        if mtime is None:
-            return
-        with self._state_lock:
-            self._stamp(task_id, resolved, mtime, time.time(), partial)
-
-    def note_write(self, task_id: str, resolved: str, *, mtime: Optional[float] = None) -> None:
-        """Record a successful write: global last-writer AND this agent's own
-        read stamp (a write is an implicit read of the current content)."""
-        if _disabled():
-            return
-        mtime = _mtime_or_none(resolved) if mtime is None else mtime
-        if mtime is None:
-            return
+        if mtime is None and stat_path:
+            try:
+                mtime = os.path.getmtime(resolved)
+            except OSError:
+                return
         now = time.time()
+        state_path = self._state_path(resolved, namespace)
         with self._state_lock:
-            self._last_writer[resolved] = (task_id, now)
-            _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
-            self._stamp(task_id, resolved, mtime, now, False)
+            agent_reads = self._reads[task_id]
+            agent_reads[state_path] = (
+                float(mtime) if mtime is not None else None,
+                now,
+                bool(partial),
+            )
+            _cap_dict(agent_reads, _MAX_PATHS_PER_AGENT)
 
-    def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
-        """Model-facing warning if this write would be stale, else ``None``. Severity
-        order: sibling wrote after our read > mtime drift / partial read > never read."""
+    def note_write(
+        self,
+        task_id: TaskKey,
+        resolved: str,
+        *,
+        mtime: Optional[float] = None,
+        namespace: Optional[str] = None,
+        stat_path: bool = True,
+    ) -> None:
+        """Record a successful write.
+
+        Updates the global last-writer map AND this agent's own read stamp
+        (a write is an implicit read — the agent now knows the current
+        content). Remote callers set ``stat_path=False`` so an identically
+        named host-local path cannot influence remote freshness state.
+        """
+        if _disabled():
+            return
+        if mtime is None and stat_path:
+            try:
+                mtime = os.path.getmtime(resolved)
+            except OSError:
+                return
+        now = time.time()
+        state_path = self._state_path(resolved, namespace)
+        with self._state_lock:
+            self._last_writer[state_path] = (task_id, now)
+            _cap_dict(self._last_writer, _MAX_GLOBAL_WRITERS)
+            # Writer's own view is now up-to-date.
+            self._reads[task_id][state_path] = (
+                float(mtime) if mtime is not None else None,
+                now,
+                False,
+            )
+            _cap_dict(self._reads[task_id], _MAX_PATHS_PER_AGENT)
+
+    def check_stale(self, task_id: TaskKey, resolved: str,
+                    namespace: Optional[str] = None) -> Optional[str]:
+        """Return a model-facing warning if this write would be stale.
+
+        Three staleness classes, in order of severity:
+
+          1. Sibling subagent wrote this file after this agent's last read.
+          2. External/unknown change (mtime differs from our last read).
+          3. Agent never read the file (write-without-read).
+
+        Returns ``None`` when the write is safe.  Does not raise — callers
+        decide whether to block or warn.
+        """
         if _disabled():
             return None
+        state_path = self._state_path(resolved, namespace)
         with self._state_lock:
-            stamp = self._reads.get(task_id, {}).get(resolved)
-            last_writer = self._last_writer.get(resolved)
+            stamp = self._reads.get(task_id, {}).get(state_path)
+            last_writer = self._last_writer.get(state_path)
 
         if stamp is None and last_writer is None:  # net-new file / first touch
             return None
+        # Remote/container state (``stat_path=False``) has mtime=None: a
+        # missing host stat must not veto the stale verdict for backend-only paths.
         current_mtime = _mtime_or_none(resolved)
         if current_mtime is None:
-            return None  # file doesn't exist — write creates it; not stale
+            # All-mtime-less records (backend-only path): fall through to
+            # timestamp/identity comparison, don't veto on the host stat.
+            if stamp is not None and stamp[0] is None:
+                current_mtime = -1.0
+            else:
+                return None  # file doesn't exist — write creates it; not stale
 
+        # Case 1: sibling subagent modified after our last read.
         if last_writer is not None:
             writer_tid, writer_ts = last_writer
             if writer_tid != task_id:
@@ -152,11 +226,18 @@ class FileStateRegistry:
 
         if stamp is not None:
             read_mtime, _read_ts, partial = stamp
-            if current_mtime != read_mtime:
-                return (
-                    f"{resolved} was modified since you last read it "
-                    "on disk (external edit or unrecorded writer). "
-                    "Re-read the file before writing.")
+            if read_mtime is not None:
+                try:
+                    current_mtime = os.path.getmtime(resolved)
+                except OSError:
+                    # File doesn't exist — write will create it; not stale.
+                    return None
+                if current_mtime != read_mtime:
+                    return (
+                        f"{resolved} was modified since you last read it "
+                        "on disk (external edit or unrecorded writer). "
+                        "Re-read the file before writing."
+                    )
             if partial:
                 return (
                     f"{resolved} was last read with offset/limit pagination "
@@ -168,27 +249,57 @@ class FileStateRegistry:
             f"{resolved} was not read by this agent. "
             "Read the file first so you can write an informed edit.")
 
-    def writes_since(self, exclude_task_id: str, since_ts: float,
-                     paths: Iterable[str]) -> Dict[str, List[str]]:
-        """``{writer_task_id: [paths]}`` for writes after ``since_ts`` by agents
-        other than ``exclude_task_id`` (delegate_task's "subagent modified files
-        you previously read" reminder)."""
+    # ── Reminder helper for delegate_tool ───────────────────────────
+    def writes_since(
+        self,
+        exclude_task_id: TaskKey,
+        since_ts: float,
+        paths: Iterable[str],
+    ) -> Dict[str, List[str]]:
+        """Return ``{writer_task_id: [paths]}`` for writes done after
+        ``since_ts`` by agents OTHER than ``exclude_task_id``.
+
+        Used by delegate_task to append a "subagent modified files the
+        parent previously read" reminder to the delegation result.
+        """
         if _disabled():
             return {}
         paths_set = set(paths)
+        exclude_raw = _raw_task_id(exclude_task_id)
         out: Dict[str, List[str]] = defaultdict(list)
         with self._state_lock:
-            for p, (writer_tid, ts) in self._last_writer.items():
-                if writer_tid != exclude_task_id and ts >= since_ts and p in paths_set:
-                    out[writer_tid].append(p)
+            for state_path, (writer_tid, ts) in self._last_writer.items():
+                writer_raw = _raw_task_id(writer_tid)
+                if writer_raw == exclude_raw:
+                    continue
+                if ts < since_ts:
+                    continue
+                display_path = self._display_path(state_path)
+                # A namespaced remote path matches only its full identity: the
+                # display-path fallback would collide ``ssh-scope\0/path`` with
+                # an unrelated local ``/path`` (unnamespaced keys coincide).
+                if state_path in paths_set:
+                    out[str(writer_raw)].append(display_path)
         return dict(out)
 
-    def known_reads(self, task_id: str) -> List[str]:
-        """Resolved paths this agent has read."""
+    def known_reads(self, task_id: TaskKey) -> List[str]:
+        """Return reads for a raw task across all named-target scopes."""
         if _disabled():
             return []
         with self._state_lock:
-            return list(self._reads.get(task_id, {}).keys())
+            reads: list[str] = []
+            seen: set[str] = set()
+            for key, paths in self._reads.items():
+                if key != task_id and _raw_task_id(key) != task_id:
+                    continue
+                for path in paths:
+                    # Keep the internal target namespace for cross-host
+                    # conflict avoidance in writes_since (stripped from output).
+                    read_path = path if "\0" in path else self._display_path(path)
+                    if read_path not in seen:
+                        reads.append(read_path)
+                        seen.add(read_path)
+            return reads
 
     def forget_task(self, task_id: str) -> None:
         """Release read stamps owned by a task after its lifecycle ends."""
@@ -212,29 +323,88 @@ def get_registry() -> FileStateRegistry:
     return _registry
 
 
-# Convenience wrappers (short names used at call sites).
-def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = False) -> None:
-    _registry.record_read(task_id, str(resolved_or_path), partial=partial)
+def _disabled() -> bool:
+    # Re-read each call so tests can toggle via monkeypatch.setenv.
+    return os.environ.get("HERMES_DISABLE_FILE_STATE_GUARD", "").strip() == "1"
 
 
-def note_write(task_id: str, resolved_or_path: str | Path) -> None:
-    _registry.note_write(task_id, str(resolved_or_path))
+def _fmt_ts(ts: float) -> str:
+    # Short relative wall-clock for error messages; avoids pulling in
+    # datetime formatting overhead on the hot path.
+    return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
-    return _registry.check_stale(task_id, str(resolved_or_path))
+def _cap_dict(d: dict, limit: int) -> None:
+    """Trim a dict to ``limit`` entries by dropping insertion-order oldest."""
+    over = len(d) - limit
+    if over <= 0:
+        return
+    # dict preserves insertion order (PY>=3.7) — pop the oldest keys.
+    it = iter(d)
+    for _ in range(over):
+        try:
+            d.pop(next(it))
+        except (StopIteration, KeyError):
+            break
 
 
-def lock_path(resolved_or_path: str | Path):
-    return _registry.lock_path(str(resolved_or_path))
+# ── Convenience wrappers (short names used at call sites) ────────────
+def record_read(task_id: TaskKey, resolved_or_path: str | Path, *,
+                partial: bool = False, namespace: Optional[str] = None,
+                stat_path: bool = True) -> None:
+    _registry.record_read(
+        task_id, str(resolved_or_path), partial=partial, namespace=namespace,
+        stat_path=stat_path,
+    )
 
 
-def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Path]) -> Dict[str, List[str]]:
+def note_write(task_id: TaskKey, resolved_or_path: str | Path, *,
+               namespace: Optional[str] = None,
+               stat_path: bool = True) -> None:
+    _registry.note_write(
+        task_id, str(resolved_or_path), namespace=namespace,
+        stat_path=stat_path,
+    )
+
+
+def check_stale(task_id: TaskKey, resolved_or_path: str | Path, *,
+                namespace: Optional[str] = None) -> Optional[str]:
+    return _registry.check_stale(
+        task_id, str(resolved_or_path), namespace=namespace,
+    )
+
+
+def lock_path(resolved_or_path: str | Path, *, namespace: Optional[str] = None):
+    return _registry.lock_path(str(resolved_or_path), namespace=namespace)
+
+
+def writes_since(
+    exclude_task_id: TaskKey,
+    since_ts: float,
+    paths: Iterable[str | Path],
+) -> Dict[str, List[str]]:
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        exclude_task_id = resolve_execution_target().scope_task_key(exclude_task_id)
+    except Exception:
+        pass
     return _registry.writes_since(exclude_task_id, since_ts, [str(p) for p in paths])
 
 
-def known_reads(task_id: str) -> List[str]:
-    return _registry.known_reads(task_id)
+def known_reads(task_id: TaskKey) -> List[str]:
+    reads = _registry.known_reads(task_id)
+    try:
+        from tools.execution_targets import resolve_execution_target
+
+        scoped = resolve_execution_target().scope_task_key(task_id)
+    except Exception:
+        scoped = task_id
+    if scoped != task_id:
+        for path in _registry.known_reads(scoped):
+            if path not in reads:
+                reads.append(path)
+    return reads
 
 
 __all__ = [

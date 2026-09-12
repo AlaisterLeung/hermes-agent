@@ -597,8 +597,18 @@ class _ChildRun:
         # but the child's later `cd`s stay in its own record. Per-session container
         # isolation keys containers by task_id; the child must share the PARENT's.
         with _quiet("Child cwd seed failed: %s"):
-            from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
-            record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
+            from tools.terminal_tool import (
+                get_session_cwd,
+                inherit_session_cwds,
+                record_session_cwd,
+                register_container_alias,
+            )
+
+            # Target-aware superset of the legacy single-cwd copy: inherit cwd from every
+            # parent-owned scope, then keep the single-cwd seed for backends without target scope.
+            if self.parent_task_id:
+                inherit_session_cwds(self.parent_task_id, self.child_task_id)
+                record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
             register_container_alias(self.child_task_id, self.parent_task_id)
 
         self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)

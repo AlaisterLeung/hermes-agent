@@ -123,23 +123,9 @@ def _smart_approve(command: str, description: str) -> str:
 
 def _smart_verdict(command: str, description: str, pattern_key: str,
                    pattern_keys: list[str], session_key: str) -> str:
-    """Run the guardian LLM with observer hooks; 'approve' | 'deny' | 'escalate'.
-    Redaction is observer-payload preparation, not approval policy: if it fails,
-    skip observability rather than leak raw data or block the LLM decision."""
-    try:
-        from agent.redact import redact_sensitive_text
-        payload = {
-            "command": redact_sensitive_text(command, force=True),
-            "description": redact_sensitive_text(description, force=True),
-            "pattern_key": pattern_key, "pattern_keys": list(pattern_keys),
-            "session_key": session_key, "surface": "smart",
-        }
-    except Exception as exc:
-        logger.debug("Smart approval hook redaction failed: %s", exc)
-        payload = None
-    else:
-        _ctx._fire_approval_hook("pre_approval_request", **payload)
-    verdict = _smart_approve(command, description)
-    if payload is not None and verdict in {"approve", "deny"}:
-        _ctx._fire_approval_hook("post_approval_response", **payload, choice=f"smart_{verdict}", decided_by="aux_llm")
-    return verdict
+    """Run the guardian LLM and return its verdict: 'approve' | 'deny' | 'escalate'.
+
+    Hook emission does NOT happen here — the caller (tools.approval's
+    observer pair) owns pre_approval_request / post_approval_response so the
+    hooks fire exactly once per smart decision."""
+    return _smart_approve(command, description)
