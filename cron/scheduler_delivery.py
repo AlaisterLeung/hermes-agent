@@ -91,6 +91,27 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _cron_session_id_from_job(job: dict) -> Optional[str]:
+    """Best-effort cron session id from job metadata (digest fallback only).
+
+    Secondary source only — the primary is the ``HERMES_SESSION_ID`` session
+    ContextVar (ContextVar-first via ``gateway.session_context.
+    get_session_env``, env fallback for cron workers; compression-proof via
+    the lineage-tip resolution in ``cron.scheduler``). Job metadata carries an
+    id only in legacy/manual shapes: a ``session_id`` key, a dict ``origin``
+    stamping the origin session, or ``last_session_id``.
+    """
+    direct = job.get("session_id") or job.get("last_session_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    origin = job.get("origin")
+    if isinstance(origin, dict):
+        origin_session = origin.get("session_id")
+        if isinstance(origin_session, str) and origin_session.strip():
+            return origin_session.strip()
+    return None
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery is also mirrored into the target chat's session transcript.
 
@@ -216,7 +237,7 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
     create_thread = getattr(adapter, "create_handoff_thread", None)
     if not callable(create_thread) or loop is None:
         return None
-    thread_name = f"Hermes — {job.get('name') or job.get('id', 'cron')}"
+    thread_name = f"[Cron] {job.get('name') or job.get('id', 'cron')}"
     try:
         from agent.async_utils import safe_schedule_threadsafe
         coro = create_thread(str(chat_id), thread_name)
@@ -278,19 +299,78 @@ def _seed_cron_session(
 def _seed_cron_thread_session(
     job: dict, adapter, platform_name: str, chat_id: str, thread_id: str, mirror_text: str,
     chat_name: Optional[str] = None, is_dm: bool = False, scope_id: Optional[str] = None,
+    loop=None,
 ) -> None:
-    """Seed the freshly-opened cron thread's session with the brief (never raises), else the
-    user's in-thread reply resolves to a transcript without it. Threads are participant-shared
-    (no real user_id); a DM thread must seed ``chat_type="dm"`` — DM-thread replies route through
-    the DM arm (``…:dm:<chat>:<thread>``), so a "thread"-typed seed is a row no DM reply hits."""
+    """Seed the freshly-opened cron thread's session with the brief (never raises).
+
+    The seed key must match the reply's ``build_session_key`` arm: DM threads key
+    through the DM arm; Matrix ROOM threads key ``chat_type="group"`` with no user
+    component (threads are participant-shared); everything else keeps the historical
+    "thread" + system:cron shape. Matrix DM-ness is re-resolved live via the
+    adapter's ``_is_dm_room`` (metadata and the adapter's runtime classification can
+    disagree); best-effort — a successful delivery is never failed by the probe.
+    """
     text = (mirror_text or "").strip()
     if not text:
         return
     try:
+        from gateway.config import Platform
+
+        # Matrix only: re-resolve DM-ness from the adapter — job metadata and the
+        # live classification can disagree, and the seed must match the arm the
+        # REPLY will take.
+        try:
+            if Platform(platform_name.lower()) == Platform.MATRIX:
+                resolve_dm: Any = getattr(adapter, "_is_dm_room", None)
+                if callable(resolve_dm):
+                    import asyncio as _asyncio
+
+                    async def _probe_dm() -> bool:
+                        return bool(await _asyncio.wait_for(
+                            resolve_dm(str(chat_id)), timeout=15))
+
+                    on_loop: Any = None
+                    try:
+                        on_loop = _asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    if on_loop is not None:
+                        # On the loop's own thread — blocking would deadlock.
+                        logger.debug(
+                            "Job '%s': skipping live DM re-resolution on %s:%s "
+                            "(called from loop thread)",
+                            job.get("id", "?"), platform_name, chat_id,
+                        )
+                    elif loop is not None and not loop.is_closed():
+                        is_dm = bool(
+                            _asyncio.run_coroutine_threadsafe(
+                                _probe_dm(), loop
+                            ).result(timeout=25)
+                        )
+                    else:
+                        is_dm = bool(_asyncio.run(_probe_dm()))
+        except Exception:
+            logger.debug(
+                "Job '%s': live DM re-resolution failed for %s:%s — using "
+                "metadata value (%s)",
+                job.get("id", "?"), platform_name, chat_id, is_dm,
+            )
+
+        try:
+            platform_enum = Platform(platform_name.lower())
+        except (ValueError, KeyError):
+            platform_enum = None
+        # Matrix room threads: participant-shared key (group, no user).
+        _matrix_room_seed = platform_enum == Platform.MATRIX and not is_dm
         ok = _seed_cron_session(
             job, adapter, platform_name, chat_id, text,
-            thread_id=str(thread_id), chat_type="dm" if is_dm else "thread",
-            user_id="system:cron", user_name="Cron", chat_name=chat_name, scope_id=scope_id,
+            thread_id=str(thread_id),
+            # Room threads: group, no user; everything else keeps the
+            # historical thread + system:cron shape.
+            chat_type="dm" if is_dm else ("group" if _matrix_room_seed else "thread"),
+            user_id=None if _matrix_room_seed else "system:cron",
+            user_name=None if _matrix_room_seed else "Cron",
+            chat_name=chat_name, scope_id=scope_id,
             discord_keys_on_thread=True)
         if ok:
             logger.info(
@@ -1348,14 +1428,14 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""
     job = t.job
     origin = t.origin
-    seed_kwargs = dict(
+    seed_kwargs: dict[str, Any] = dict(
         chat_name=origin.get("chat_name"), is_dm=t.is_dm_target, scope_id=origin.get("scope_id"))
     thread_seeded = False
     inchannel_seeded = False
     if t.opened_thread_id:
         _seed_cron_thread_session(
             job, t.runtime_adapter, t.platform_name, t.chat_id, t.opened_thread_id, t.mirror_text,
-            **seed_kwargs,
+            loop=t.loop, **seed_kwargs,
         )
         thread_seeded = True
     # in_channel: CREATE + seed the flat session (the mirror only APPENDS to an existing one). Same
@@ -1376,7 +1456,7 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             _seed_cron_thread_session(
                 job, t.runtime_adapter, t.platform_name, t.chat_id, str(delivered_message_id),
                 t.mirror_text,
-                **seed_kwargs)
+                loop=t.loop, **seed_kwargs)
     elif t.in_channel_surface and not t.inchannel_continuable:
         logger.warning(
             "Job '%s': in_channel delivery to %s:%s is not a "
@@ -1759,6 +1839,27 @@ def _deliver_result(
     # attach_to_session=false and cron.mirror_delivery=false, else the seed gets "" and fails.
     _, mirror_text = BasePlatformAdapter.extract_media(content)
     mirror_text = (mirror_text or "").strip()
+
+    # Digest enrichment: with mirroring on, seed a bounded digest of the run's
+    # own cron session transcript (tool timeline + final response + session
+    # pointer) instead of the bare final response — pure enrichment, any
+    # failure falls back to the plain mirror_text above. Session id comes from
+    # get_session_env("HERMES_SESSION_ID") first (ContextVar, env fallback for
+    # CLI/cron workers), job metadata second — never read os.environ here.
+    if mirror_enabled:
+        try:
+            from gateway.session_context import get_session_env
+            from cron.digest import build_cron_digest
+
+            _digest_session_id = get_session_env("HERMES_SESSION_ID") or _cron_session_id_from_job(job)
+            _digest_seed = build_cron_digest(job, _digest_session_id, mirror_text)
+            if _digest_seed:
+                mirror_text = _digest_seed
+        except Exception as e:
+            logger.debug(
+                "Job '%s': cron digest build failed, seeding plain final response: %s",
+                job.get("id", "?"), e,
+            )
 
     try:
         config = load_gateway_config()

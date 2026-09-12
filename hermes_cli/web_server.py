@@ -75,58 +75,35 @@ from hermes_cli.web_server_lifecycle import (  # noqa: E402
 
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
-    """Tick the cron scheduler from inside the desktop dashboard backend.
+    """Watch for due cron jobs from inside the dashboard backend — forward only.
 
-    The desktop spawns a ``hermes dashboard`` backend, not a gateway, so without
-    this a cron created in the app would never fire (no live adapters; delivery
-    falls back to the per-platform send path). The primary backend outlives the
-    per-profile pool (reaped after ~10 idle minutes), so it ticks EVERY local
-    profile's store like a multiplex gateway; external providers keep the
-    single-store behavior (registries are not profile-scoped). Cross-process
-    safe: the built-in tick takes the per-store ``cron/.tick.lock``.
-
-    Every local profile's store is ticked, not just this backend's own (#69377's desktop sibling): the
-    desktop pools per-profile backends and reaps them after ~10 idle minutes, so a secondary profile's
-    ticker dies with its backend and that profile's jobs silently stop firing until the user next opens it
-    ("tasks on the sleeping profile could be idle" — community report, Aug 2026).
+    The dashboard owns no live adapters: the standalone send path cannot serve
+    E2EE rooms or relay-fronted platforms, and without the gateway's session
+    context a continuable delivery (thread open + brief seed) is impossible.
+    Each sweep therefore forwards every due job to the gateway api_server's
+    cron-fire endpoint, which claims (store CAS, at-most-once even against a
+    racing gateway tick) and executes with live adapters. An unreachable
+    gateway leaves jobs due and stamps ``last_fire_error`` so the miss surfaces
+    in ``cronjob list``. Multiplex profile coverage belongs on the gateway
+    ticker (which owns live adapters), not here.
     """
-    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
+    from cron.scheduler_provider import GatewayForwardingCronScheduler
 
-    provider = resolve_cron_scheduler()
+    def _fire_url() -> str:
+        _profile_name, home = _cron_profile_home(None)
+        return _gateway_fire_endpoint(_profile_name, home)
 
-    start_kwargs: dict = {"interval": interval}
-    if isinstance(provider, InProcessCronScheduler):
-        try:
-            from hermes_cli.profiles import (
-                _check_gateway_running, _served_by_running_multiplexer, profiles_to_serve)
+    def _api_key() -> str:
+        from agent.secret_scope import get_secret
 
-            # Same served set as the multiplexer: default + every live profile under profiles/.
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
-                # Even one profile needs the per-tick gateway gate; otherwise
-                # Desktop races its dedicated gateway for the same cron store.
-                start_kwargs["profile_homes"] = profile_homes
-                # Stand down, per tick, for a profile already owned by a gateway — its OWN
-                # process, or the live default multiplexer (a served satellite has no gateway.pid
-                # of its own). That gateway ticks with live adapters; winning the tick-lock race
-                # here would deliver through the standalone path (#100489, #107485).
-                start_kwargs["profile_gate"] = lambda name, home: not (
-                    _check_gateway_running(Path(home))
-                    or (name != "default" and _served_by_running_multiplexer(name)))
-                from hermes_logging import enable_profile_log_routing
+        return get_secret("API_SERVER_KEY", "") or ""
 
-                enable_profile_log_routing(profile_homes)
-                _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
-                )
-        except Exception:
-            # Fail open to the single-store ticker so the active profile keeps firing.
-            _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
-
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, **start_kwargs)
+    provider = GatewayForwardingCronScheduler(_fire_url, _api_key)
+    _log.info(
+        "Desktop cron scheduler started (provider=%s, interval=%ds)",
+        provider.name, interval,
+    )
+    provider.start(stop_event, interval=interval)
 
 
 # Desktop `serve` only (start_server(start_mcp_discovery_after_bind=True)):
@@ -777,6 +754,7 @@ from hermes_cli import web_server_gateway as _gateway_mod  # noqa: E402
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES, _terminate_desktop_managed_gateway  # noqa: E402
 from hermes_cli.web_server_sessions import _auto_archive_ticker_loop  # noqa: E402
 from hermes_cli.web_server_chat import PTY_REGISTRY  # noqa: E402
+from hermes_cli.web_server_cron import _cron_profile_home, _gateway_fire_endpoint  # noqa: E402
 from hermes_cli.web_server_dashboard import (  # noqa: E402
     _discover_dashboard_plugins, _mount_plugin_api_routes, mount_spa,
 )

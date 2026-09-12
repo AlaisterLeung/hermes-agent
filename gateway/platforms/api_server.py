@@ -11,6 +11,7 @@ import concurrent.futures
 import errno
 import hashlib
 import hmac
+import inspect
 import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
@@ -3473,26 +3474,37 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
-        """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
-        NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
-        a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
+        """POST /api/cron/fire — cron-fire webhook. Two authenticated callers: the external
+        scheduler's NAS-minted JWT (via the pluggable verifier) and co-located Hermes processes
+        (the desktop dashboard's cron ticker) authenticating with API_SERVER_KEY. 202 + background
+        run so a long turn never trips NAS's timeout; the store CAS claim guards double-fire on
+        retry."""
         from hermes_cli.config import cfg_get, load_config
         from plugins.cron_providers.chronos.verify import get_fire_verifier
         auth = request.headers.get("Authorization", "")
         token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-        cfg = load_config()
-        verifier = get_fire_verifier()
-        verify_kwargs = dict(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None)
-        try:
-            claims = await _call_verifier(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire.
-            logger.exception("cron fire: verifier crashed; rejecting token")
-            claims = None
+
+        # Two legitimate callers: the external scheduler's NAS JWT (below) and
+        # co-located Hermes processes with API_SERVER_KEY (the desktop ticker
+        # forwards here so fires execute with live adapters + session context).
+        # Constant-time: the token is client-supplied.
+        expected_key = self._expected_api_key()
+        if token and expected_key and hmac.compare_digest(token.encode(), expected_key.encode()):
+            claims = {"subject": "api-server-key"}
+        else:
+            cfg = load_config()
+            verifier = get_fire_verifier()
+            verify_kwargs = dict(
+                token=token,
+                expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
+                jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
+                issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None)
+            try:
+                claims = await _call_verifier(verifier, **verify_kwargs)
+            except Exception:
+                # Fail closed: a crashing verifier must never admit a fire.
+                logger.exception("cron fire: verifier crashed; rejecting token")
+                claims = None
         if claims is None:
             logger.warning("cron fire: rejected invalid token: %s", self._request_audit_log_suffix(request))
             return web.json_response({"error": "invalid fire token"}, status=401)
@@ -3506,6 +3518,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             job_id = (body or {}).get("job_id")
             if not job_id:
                 return web.json_response({"error": "missing job_id"}, status=400)
+            # Manual dashboard triggers ride the same endpoint and pass
+            # force=True for paused jobs; scheduled fires never send it.
+            force_claim = bool((body or {}).get("force"))
+
             from cron.scheduler_provider import provider_supports_split_fire, resolve_cron_scheduler
             provider = resolve_cron_scheduler()
             loop = asyncio.get_running_loop()
@@ -3533,7 +3549,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Persist the attempt + exact store owner before acknowledging NAS; a failure here
             # is retryable and the reservation remains attached.
             try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
+                # ``force`` rides only to providers that accept it; minimal
+                # doubles and older providers keep plain claim_fire(job_id).
+                accepts_force = "force" in inspect.signature(
+                    provider.claim_fire
+                ).parameters
+                if accepts_force:
+                    claimed_job = await asyncio.to_thread(
+                        provider.claim_fire, job_id, force=force_claim
+                    )
+                else:
+                    claimed_job = await asyncio.to_thread(
+                        provider.claim_fire, job_id
+                    )
             except Exception as exc:
                 logger.error("cron fire admission failed for %s: %s", job_id, exc)
                 return web.json_response({"error": "cron fire admission failed", "job_id": job_id}, status=503)

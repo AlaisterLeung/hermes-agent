@@ -1410,6 +1410,64 @@ class MatrixAdapter(BasePlatformAdapter):
             self._client.send_message_event(RoomID(chat_id), EventType.ROOM_MESSAGE, msg_content), timeout=45)
         return str(event_id)
 
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a fresh Matrix thread rooted in ``parent_chat_id``.
+
+        Implements the base-class handoff hook so continuable cron deliveries
+        open a dedicated thread; the returned root event id is what the brief
+        is sent under and the session is seeded to. Accepts a ``!room:server``
+        id or a ``#alias:server`` alias (resolved via the directory API).
+        Returns the root event id, or ``None`` on any failure — callers fall
+        back to flat delivery and never fail the run.
+        """
+        if not self._client:
+            logger.debug("Matrix: create_handoff_thread skipped — client not connected")
+            return None
+
+        room_id = str(parent_chat_id or "").strip()
+        if not room_id:
+            return None
+
+        try:
+            if room_id.startswith("#"):
+                # Alias → resolve via the directory API; '#'/':' need URL-quoting.
+                from urllib.parse import quote
+
+                resolved = await asyncio.wait_for(
+                    self._client.api.request(
+                        "GET",
+                        f"/_matrix/client/v3/directory/room/{quote(room_id, safe='')}",
+                    ),
+                    timeout=30,
+                )
+                room_id = str((resolved or {}).get("room_id") or "").strip()
+                if not room_id:
+                    logger.debug(
+                        "Matrix: create_handoff_thread — alias %s resolved to no room",
+                        parent_chat_id,
+                    )
+                    return None
+
+            msg_content: Dict[str, Any] = {"msgtype": "m.text", "body": name}
+            event_id = await self._send_room_message(room_id, msg_content)
+            root = str(event_id)
+            logger.info(
+                "Matrix: opened continuable thread root %s in %s (%s)",
+                root, room_id, name,
+            )
+            return root
+        except Exception as exc:
+            logger.warning(
+                "Matrix: create_handoff_thread failed for %s (%s) — falling "
+                "back to flat delivery: %s",
+                parent_chat_id, name, exc,
+            )
+            return None
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         identity = await self._resolve_room_identity(chat_id)
         return {"name": identity.display_name, "type": "dm" if identity.chat_type == "dm" else "group"}

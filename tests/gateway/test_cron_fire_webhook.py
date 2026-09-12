@@ -1,9 +1,9 @@
-"""Tests for the Chronos cron-fire webhook (POST /api/cron/fire) — Phase 4E.2.
+"""Tests for the cron-fire webhook (POST /api/cron/fire) — Phase 4E.2.
 
-The webhook authenticates a NAS-minted JWT via the pluggable fire-verifier
-(NOT API_SERVER_KEY), then runs the job via the resolved provider's fire_due in
-the background, returning 202. These tests monkeypatch the verifier and
-resolve_cron_scheduler — the verifier itself is tested with real crypto in
+Two authenticated callers: a NAS-minted JWT (via the pluggable verifier) and
+co-located Hermes processes presenting API_SERVER_KEY (the desktop ticker's
+fire forwarder); the fire runs via the resolved provider's claim/fire path in
+the background (202). The verifier itself is tested with real crypto in
 test_chronos_verify.py.
 """
 
@@ -226,6 +226,64 @@ async def test_fire_does_not_require_api_server_key(adapter, monkeypatch):
             break
         await asyncio.sleep(0.01)
     assert spy.fired == ["j9"]
+
+
+@pytest.mark.asyncio
+async def test_fire_admits_colocated_caller_with_api_server_key(adapter, monkeypatch):
+    """Co-located Hermes processes — the desktop dashboard's cron ticker
+    forwards due fires here — authenticate with API_SERVER_KEY instead of a
+    NAS JWT; the fire verifier must not run for that caller."""
+    spy = _SpyProvider()
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: spy)
+
+    def _explode():
+        raise AssertionError("the JWT verifier must not run for the API-key caller")
+
+    monkeypatch.setattr("plugins.cron_providers.chronos.verify.get_fire_verifier", _explode)
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={"job_id": "j10"},
+        )
+        assert resp.status == 202
+    for _ in range(50):
+        if spy.fired:
+            break
+        await asyncio.sleep(0.01)
+    assert spy.fired == ["j10"]
+
+
+@pytest.mark.asyncio
+async def test_fire_forwards_force_to_claim_when_provider_accepts(adapter, monkeypatch):
+    """Manual dashboard triggers ride this endpoint with force=True so a
+    paused job resumes-and-claims atomically; providers with a plain
+    claim_fire(job_id) signature keep working unchanged (the sibling tests'
+    doubles pin the no-force call shape)."""
+    seen = {}
+
+    class ForceAwareProvider(_SpyProvider):
+        def claim_fire(self, job_id, *, force=False):
+            seen["force"] = force
+            return {"id": job_id, "execution_id": f"exec-{job_id}"}
+
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", ForceAwareProvider)
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={"job_id": "j11", "force": True},
+        )
+        assert resp.status == 202
+    assert seen["force"] is True
 
 
 @pytest.mark.asyncio

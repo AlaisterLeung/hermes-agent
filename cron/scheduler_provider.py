@@ -558,6 +558,105 @@ class InProcessCronScheduler(CronScheduler):
             stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
 
 
+class GatewayForwardingCronScheduler(CronScheduler):
+    """Ticker for adapter-less processes: forward due fires to the gateway.
+
+    A process without live platform adapters (the desktop dashboard backend)
+    cannot deliver cron output the way the gateway can — no E2EE / relay-fronted
+    delivery, no session context, so continuable delivery degrades and in-thread
+    replies land in empty sessions. Executing locally is worse than a delayed
+    fire, so each sweep POSTs every due job to the gateway api_server's
+    cron-fire endpoint, which claims (store CAS, at-most-once even if a gateway
+    tick races the forward) and runs with live adapters. An unreachable gateway
+    leaves jobs due and stamps ``last_fire_error``, visible in ``cronjob list``.
+    """
+
+    def __init__(self, fire_url_resolver, api_key_resolver):
+        self._fire_url_resolver = fire_url_resolver
+        self._api_key_resolver = api_key_resolver
+
+    @property
+    def name(self) -> str:
+        return "gateway-forward"
+
+    def start(self, stop_event, *, adapters=None, loop=None, interval=60, **_):
+        import logging
+
+        from cron.jobs import get_due_jobs, note_fire_forward_failure
+        from cron.jobs import record_ticker_heartbeat
+
+        logger = logging.getLogger("cron.scheduler_provider")
+        logger.info(
+            "Gateway-forwarding cron scheduler started (interval=%ds)", interval
+        )
+        consecutive_failures = 0
+        while not stop_event.is_set():
+            ok = False
+            try:
+                due = get_due_jobs()
+                if due:
+                    url = self._fire_url_resolver()
+                    key = self._api_key_resolver()
+                    if not url or not key:
+                        raise RuntimeError(
+                            "gateway fire endpoint or API_SERVER_KEY unresolved"
+                        )
+                    import httpx
+
+                    with httpx.Client(timeout=10.0) as client:
+                        for job in due:
+                            job_id = str(job.get("id") or "")
+                            if not job_id:
+                                continue
+                            try:
+                                resp = client.post(
+                                    url,
+                                    json={"job_id": job_id},
+                                    headers={
+                                        "Authorization": f"Bearer {key}"
+                                    },
+                                )
+                                # 200/202 = handled or intentionally skipped;
+                                # anything else is a transient miss.
+                                if resp.status_code in (200, 202):
+                                    logger.info(
+                                        "Forwarded cron fire for job %s to the "
+                                        "gateway (%s)", job_id, resp.status_code,
+                                    )
+                                else:
+                                    _note_forward_miss(
+                                        job_id, resp.status_code, resp.text,
+                                        note_fire_forward_failure, logger,
+                                    )
+                            except Exception as exc:
+                                _note_forward_miss(
+                                    job_id, None, f"{type(exc).__name__}: {exc}",
+                                    note_fire_forward_failure, logger,
+                                )
+                ok = True
+            except Exception as e:
+                logger.error("Gateway-forward cron sweep failed: %s", e, exc_info=True)
+                consecutive_failures = _note_tick_failure(e, consecutive_failures)
+            record_ticker_heartbeat(success=ok)
+            if ok:
+                consecutive_failures = 0
+            stop_event.wait(_backoff_wait_seconds(interval, consecutive_failures))
+
+
+def _note_forward_miss(job_id, status, body, note_fn, logger) -> None:
+    """Stamp + log one failed forward; jobs stay due for the next sweep."""
+    detail = (
+        f"gateway fire endpoint returned {status}"
+        if status is not None
+        else f"gateway fire endpoint unreachable ({body})"
+    )
+    logger.warning("Cron fire forward failed for job %s: %s", job_id, detail)
+    try:
+        note_fn(job_id, detail)
+    except Exception:
+        logger.debug("could not stamp last_fire_error for %s", job_id, exc_info=True)
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
