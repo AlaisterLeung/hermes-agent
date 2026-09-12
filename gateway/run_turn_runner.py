@@ -1163,6 +1163,41 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
+        # Quiet chat profiles suppress ordinary interim narration, but a clarify poll is not
+        # self-explanatory without the decision prose that precedes it — deliver that one message
+        # class even with interims off (#102413).
+        if want_interim_messages:
+            agent.clarify_context_callback = None
+        else:
+            def clarify_context_cb(text: str, *, already_streamed: bool = False) -> None:
+                """Deliver decision-critical prose even when generic interims are off."""
+                if (
+                    already_streamed
+                    or not ctx._run_still_current()
+                    or not ctx._status_adapter
+                    or not str(text or "").strip()
+                ):
+                    return
+                fut = self._schedule(
+                    ctx._status_adapter.send(
+                        ctx._status_chat_id,
+                        text,
+                        metadata=ctx._status_thread_metadata,
+                    ),
+                    "clarify context delivery scheduling error",
+                )
+                if fut is None:
+                    return
+                try:
+                    # The clarify poll is sent from a separate blocking callback; waiting here
+                    # guarantees its explanatory packet arrives before the choices.
+                    fut.result(timeout=15)
+                except Exception:
+                    logger.warning(
+                        "Clarify context delivery failed before prompt",
+                        exc_info=True,
+                    )
+            agent.clarify_context_callback = clarify_context_cb
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync

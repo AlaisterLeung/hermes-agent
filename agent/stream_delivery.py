@@ -160,9 +160,12 @@ class StreamDeliveryMixin:
                 self._delivered_interim_texts = set()
             self._delivered_interim_texts.add(normalized)
 
-    def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
-        """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
-        cb = getattr(self, "interim_assistant_callback", None)
+    def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str], cb=None) -> None:
+        """Hand ``visible`` to the interim callback (``interim_assistant_callback`` unless ``cb``
+        overrides it — e.g. the clarify-context fallback) and mark ``record`` delivered; swallows
+        callback errors."""
+        if cb is None:
+            cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
         try:
@@ -187,6 +190,13 @@ class StreamDeliveryMixin:
         different final summary."""
         if not isinstance(assistant_msg, dict):
             return
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is None and self._assistant_message_calls_tool(assistant_msg, "clarify"):
+            # A clarify poll is not self-explanatory when the model put the
+            # decision packet in commentary immediately before the tool call.
+            # Quiet chat profiles may intentionally suppress ordinary interim
+            # narration, but must still receive this decision-critical context.
+            cb = getattr(self, "clarify_context_callback", None)
         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
         # Dedup within this message and against earlier deliveries, first occurrence wins.
         pending: dict[str, str] = {}
@@ -200,7 +210,26 @@ class StreamDeliveryMixin:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         self._enqueue_stream_hook("on_interim_message", text=visible, already_streamed=already_streamed)
-        self._deliver_interim(visible, already_streamed=already_streamed, record=undelivered_parts or [visible])
+        self._deliver_interim(visible, already_streamed=already_streamed, record=undelivered_parts or [visible], cb=cb)
+
+    @staticmethod
+    def _assistant_message_calls_tool(assistant_msg: Dict[str, Any], tool_name: str) -> bool:
+        """Return whether a persisted assistant turn invokes ``tool_name``."""
+        expected = str(tool_name or "").rsplit(".", 1)[-1]
+        for tool_call in assistant_msg.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function") or {}
+                name = (
+                    function.get("name") if isinstance(function, dict) else None
+                ) or tool_call.get("name")
+            else:
+                function = getattr(tool_call, "function", None)
+                name = getattr(function, "name", None) or getattr(
+                    tool_call, "name", None
+                )
+            if str(name or "").rsplit(".", 1)[-1] == expected:
+                return True
+        return False
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).
