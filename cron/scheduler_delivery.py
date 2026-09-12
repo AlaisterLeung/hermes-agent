@@ -91,6 +91,27 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _cron_session_id_from_job(job: dict) -> Optional[str]:
+    """Best-effort cron session id from job metadata (digest fallback only).
+
+    Secondary source only — the primary is the ``HERMES_SESSION_ID`` session
+    ContextVar (ContextVar-first via ``gateway.session_context.
+    get_session_env``, env fallback for cron workers; compression-proof via
+    the lineage-tip resolution in ``cron.scheduler``). Job metadata carries an
+    id only in legacy/manual shapes: a ``session_id`` key, a dict ``origin``
+    stamping the origin session, or ``last_session_id``.
+    """
+    direct = job.get("session_id") or job.get("last_session_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    origin = job.get("origin")
+    if isinstance(origin, dict):
+        origin_session = origin.get("session_id")
+        if isinstance(origin_session, str) and origin_session.strip():
+            return origin_session.strip()
+    return None
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery is also mirrored into the target chat's session transcript.
 
@@ -1818,6 +1839,27 @@ def _deliver_result(
     # attach_to_session=false and cron.mirror_delivery=false, else the seed gets "" and fails.
     _, mirror_text = BasePlatformAdapter.extract_media(content)
     mirror_text = (mirror_text or "").strip()
+
+    # Digest enrichment: with mirroring on, seed a bounded digest of the run's
+    # own cron session transcript (tool timeline + final response + session
+    # pointer) instead of the bare final response — pure enrichment, any
+    # failure falls back to the plain mirror_text above. Session id comes from
+    # get_session_env("HERMES_SESSION_ID") first (ContextVar, env fallback for
+    # CLI/cron workers), job metadata second — never read os.environ here.
+    if mirror_enabled:
+        try:
+            from gateway.session_context import get_session_env
+            from cron.digest import build_cron_digest
+
+            _digest_session_id = get_session_env("HERMES_SESSION_ID") or _cron_session_id_from_job(job)
+            _digest_seed = build_cron_digest(job, _digest_session_id, mirror_text)
+            if _digest_seed:
+                mirror_text = _digest_seed
+        except Exception as e:
+            logger.debug(
+                "Job '%s': cron digest build failed, seeding plain final response: %s",
+                job.get("id", "?"), e,
+            )
 
     try:
         config = load_gateway_config()
