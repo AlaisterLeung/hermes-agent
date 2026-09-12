@@ -181,7 +181,7 @@ class TestSchemaAndHandler:
         src = _make_png(tmp_path / "img.png", 100, 50)
         seen = {}
 
-        async def _fake_native(image_url, question, task_id=None, region=None):
+        async def _fake_native(image_url, question, task_id=None, region=None, target=None):
             seen["region"] = region
             return {"_multimodal": True, "content": []}
 

@@ -111,7 +111,14 @@ class VisionMessagePrepMixin:
         try:
             from tools.vision_tools import vision_analyze_tool
 
-            result_json = asyncio.run(vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt))
+            # target="local": the materialized temp file lives on THIS host, not
+            # the execution target; an omitted target follows terminal.default_target,
+            # pinned remote by `hermes acp -t <name>` ("File not found inside the backend").
+            result_json = asyncio.run(
+                vision_analyze_tool(
+                    image_url=vision_source, user_prompt=analysis_prompt, target="local"
+                )
+            )
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()
         except Exception as e:
