@@ -320,9 +320,14 @@ class SSHEnvironment(BaseEnvironment):
         ``terminal.env_passthrough``) the way docker does: ``SendEnv`` carries the names, the ssh
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
-        scope are unset remotely so a shared host cannot serve another profile's value."""
+        scope are unset remotely so a shared host cannot serve another profile's value.
+
+        The payload is double-quote escaped (``_double_quote``): the remote login shell parses
+        it first and may not be bash, but ``bash -c`` still receives the exact original content.
+        """
         values, unset_names = resolve_passthrough_env(hermes_env_loader=_load_hermes_env_vars)
-        cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
+        cmd = self._build_ssh_command(send_env=values)
+        cmd.extend(bash_argv(_double_quote(prepend_unset(cmd_string, unset_names)), login))
         client_env = client_env_with(values)
         return _popen_bash(cmd, stdin_data, env=client_env) if client_env is not None else _popen_bash(cmd, stdin_data)
 
