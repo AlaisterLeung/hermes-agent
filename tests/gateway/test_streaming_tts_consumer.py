@@ -247,7 +247,7 @@ def gateway_tts_turn(monkeypatch, tmp_path):
         tts = StreamingTTSConsumer(adapter, "voice", {}, loop)
         ctx = TurnContext(
             streaming_tts_consumer_holder=[tts], user_config={},
-            resolve_display_setting=lambda *args: True, interim_assistant_messages_enabled=True,
+            resolve_display_setting=lambda *args, **kwargs: True, interim_assistant_messages_enabled=True,
             source=SimpleNamespace(platform=SimpleNamespace(value="realtime"), chat_id="voice"),
             _run_still_current=lambda: True,
         )

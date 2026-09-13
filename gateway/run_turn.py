@@ -1441,6 +1441,7 @@ class GatewayTurnMixin:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
+                chat=source,
                 require_platform_override_for={Platform.MATTERMOST},
             )
         except Exception:
@@ -1462,6 +1463,7 @@ class GatewayTurnMixin:
             from gateway.display_config import resolve_display_setting
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
+                chat=source,
             )
         except Exception:
             _reasoning_style = "code"
@@ -2474,7 +2476,9 @@ class GatewayTurnMixin:
             from gateway.config import StreamingConfig
             _scfg = StreamingConfig()
         from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(_load_gateway_config(), _platform_config_key(source.platform), "streaming")
+        _plat_streaming = resolve_display_setting(
+            _load_gateway_config(), _platform_config_key(source.platform), "streaming", chat=source,
+        )
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off" if _plat_streaming is None else bool(_plat_streaming)
         )
@@ -2704,11 +2708,12 @@ class GatewayTurnMixin:
         ):
             with suppress(Exception):
                 from agent import display as _agent_display
-                _val = resolve_display_setting(user_config, platform_key, _setting, _default)
+                _val = resolve_display_setting(user_config, platform_key, _setting, _default, chat=source)
                 getattr(_agent_display, _setter)(_cast(_val))
 
-        # Tool progress mode; HERMES_TOOL_PROGRESS_MODE wins only when the config never set it.
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
+        # Tool progress mode; HERMES_TOOL_PROGRESS_MODE wins only when the config never set it
+        # (a per-chat override counts as configured).
+        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress", chat=source)
         _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
         _platform_cfg = (_display_cfg.get("platforms") or {}).get(platform_key) or {}
         _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
@@ -2716,9 +2721,17 @@ class GatewayTurnMixin:
             isinstance(cfg, dict) and key in cfg
             for cfg, key in ((_platform_cfg, "tool_progress"), (_legacy_tp_overrides, platform_key))
         )
+        if not _tool_progress_configured:
+            from gateway.display_config import has_chat_display_override
+
+            _tool_progress_configured = has_chat_display_override(
+                user_config, platform_key, "tool_progress", source,
+            )
         progress_mode = _env_tp if _env_tp and not _tool_progress_configured else (_resolved_tp or _env_tp or "all")
         # "accumulate" (edit one bubble) or "separate" (one msg per tool)
-        progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        progress_grouping = resolve_display_setting(
+            user_config, platform_key, "tool_progress_grouping", chat=source,
+        ) or "accumulate"
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
 
@@ -2726,16 +2739,16 @@ class GatewayTurnMixin:
             setting: str, *, default: bool = False,
             require_platform_override_for: set[Any] | None = None, allow_generic: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return off|raw|generic for a gateway visibility surface (per-chat aware)."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {_gateway_platform_value(item) for item in require_platform_override_for}
                 if (
                     current_platform in platform_only
-                    and not _has_platform_display_override(user_config, platform_key, setting)
+                    and not _has_platform_display_override(user_config, platform_key, setting, chat=source)
                 ):
                     return "off"
-            value = resolve_display_setting(user_config, platform_key, setting, default)
+            value = resolve_display_setting(user_config, platform_key, setting, default, chat=source)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
             return "raw" if bool(value) else "off"
@@ -2754,7 +2767,7 @@ class GatewayTurnMixin:
         is_webhook = source.platform == Platform.WEBHOOK
         tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
-        _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
+        _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full", chat=source)
         _live_status_adapter = (
             adapter if getattr(adapter, "supports_status_text", False) and _live_status_mode != "off" else None
         )
@@ -2825,7 +2838,7 @@ class GatewayTurnMixin:
         # Auto-cleanup of temporary progress bubbles needs a real ``delete_message`` (getattr on the
         # type: a fake adapter without it means "can't delete", not a crash).
         _cleanup_progress = bool(
-            disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress")
+            disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress", chat=source)
         )
         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
         if _cleanup_adapter is not None and getattr(type(_cleanup_adapter), "delete_message", None) in (
@@ -3861,7 +3874,7 @@ class GatewayTurnMixin:
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""
             _want_iteration_detail = bool(
-                disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True)
+                disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True, chat=source)
             )
             _a = self._agent_activity_summary(agent_holder[0])
             with suppress(Exception):
