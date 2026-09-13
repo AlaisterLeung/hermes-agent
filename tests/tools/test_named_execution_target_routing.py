@@ -2019,6 +2019,8 @@ def test_idle_reaper_and_deferred_cleanup_wait_for_file_only_tool_lease(
     monkeypatch, isolated_target_state,
 ):
     terminal_mod, _ = isolated_target_state
+    import tools.terminal_tool_lifecycle as terminal_tool_lifecycle
+
     cleaned = []
     deferred = []
     environment_key = ("default", "dev")
@@ -2030,7 +2032,7 @@ def test_idle_reaper_and_deferred_cleanup_wait_for_file_only_tool_lease(
     terminal_mod._active_environments[environment_key] = Environment()
     terminal_mod._last_activity[environment_key] = 0.0
     monkeypatch.setattr(
-        terminal_mod,
+        terminal_tool_lifecycle,
         "cleanup_vm",
         lambda task_id, **kw: deferred.append((task_id, kw)),
     )

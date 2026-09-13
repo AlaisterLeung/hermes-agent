@@ -353,8 +353,10 @@ def _turn_scope_key(task_id: Hashable) -> Hashable:
 
 
 def _run_deferred_environment_cleanup(task_id: Hashable) -> None:
+    from tools import terminal_tool_lifecycle
+
     try:
-        cleanup_vm(
+        terminal_tool_lifecycle.cleanup_vm(
             task_id,
             preserve_persistent=True,
             include_collapsed=True,
@@ -3208,12 +3210,14 @@ from tools.terminal_tool_lifecycle import is_persistent_env  # noqa: E402,F401
 
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
+    from tools import terminal_tool_lifecycle
+
     task_ids = list(_active_environments.keys())
     cleaned = 0
     
     for task_id in task_ids:
         try:
-            cleanup_vm(task_id)
+            terminal_tool_lifecycle.cleanup_vm(task_id)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
