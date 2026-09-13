@@ -524,16 +524,16 @@ def _is_recoverable_error_job(job: Dict[str, Any]) -> bool:
 
 
 def _secure_dir(path: Path):
-    """Set directory to owner-only access (0700). No-op where chmod is unsupported (Windows)."""
-    with contextlib.suppress(OSError, NotImplementedError):
-        os.chmod(path, 0o700)
+    """Owner-only (0700) via the shared helper, so cron/ and cron/output honor the same managed/
+    container/HERMES_HOME_MODE rules as the rest of HERMES_HOME (#10757)."""
+    from hermes_cli.config import _secure_dir as _shared_secure_dir
+    _shared_secure_dir(path)
 
 
 def _secure_file(path: Path):
-    """Set file to owner-only read/write (0600). No-op where chmod is unsupported (Windows)."""
-    with contextlib.suppress(OSError, NotImplementedError):
-        if path.exists():
-            os.chmod(path, 0o600)
+    """Owner-only (0600) via the shared helper (managed/container skip included)."""
+    from hermes_cli.config import _secure_file as _shared_secure_file
+    _shared_secure_file(path)
 
 
 def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> None:
@@ -2009,6 +2009,78 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return _with_job(job_id, apply)
 
 
+def resnapshot_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Refresh provider/model snapshots for a job's UNPINNED axes to the
+    current global resolution.
+
+    This is the "adopt the current global default" companion to pinning
+    (#44585). Where pinning a job (``provider=... model=...``) makes it stop
+    tracking the global default forever, ``resnapshot_job`` re-captures the
+    current resolution so an unpinned job follows the user's deliberately
+    changed default — while remaining unpinned and tracking future changes.
+
+    Semantics:
+      - Pinned axes (job has an explicit provider/model) keep their snapshot
+        None and are left untouched.
+      - no_agent script jobs carry no snapshot and are left untouched.
+      - If the current resolution fails, the previous snapshot is left in
+        place (fail-open, matching create_job semantics).
+
+    Makes no inference call — it only recomputes the snapshot string from
+    config. Returns the normalized updated job, or None if not found.
+    """
+    job = resolve_job_ref(job_id)
+    if not job:
+        return None
+    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+        provider=job.get("provider"),
+        model=job.get("model"),
+        base_url=job.get("base_url"),
+        no_agent=job.get("no_agent"),
+    )
+    jobs = load_jobs()
+    for i, stored in enumerate(jobs):
+        if stored["id"] != job["id"]:
+            continue
+        jobs[i]["provider_snapshot"] = provider_snapshot
+        jobs[i]["model_snapshot"] = model_snapshot
+        save_jobs(jobs)
+        return _normalize_job_record(jobs[i])
+    return None
+
+
+def resnapshot_all_unpinned() -> List[Dict[str, Any]]:
+    """Refresh provider/model snapshots for every job that has any unpinned
+    axis, adopting the current global resolution for each.
+
+    Skips no_agent jobs and jobs pinned on all inference axes (nothing
+    unpinned to refresh). Equivalent to calling ``resnapshot_job`` for each
+    eligible job. Returns the list of updated jobs.
+    """
+    updated: List[Dict[str, Any]] = []
+    jobs = load_jobs()
+    changed = False
+    for job in jobs:
+        if bool(job.get("no_agent")):
+            continue
+        if job.get("provider") and job.get("model"):
+            # Pinned on every axis — nothing unpinned to refresh.
+            continue
+        provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+            provider=job.get("provider"),
+            model=job.get("model"),
+            base_url=job.get("base_url"),
+            no_agent=job.get("no_agent"),
+        )
+        job["provider_snapshot"] = provider_snapshot
+        job["model_snapshot"] = model_snapshot
+        changed = True
+        updated.append(_normalize_job_record(job))
+    if changed:
+        save_jobs(jobs)
+    return updated
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -2298,6 +2370,7 @@ def mark_job_run(
     status: Optional[str] = None,
     *,
     expected_fire_owner: Optional[str] = None,
+    model_unreachable: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2306,6 +2379,11 @@ def mark_job_run(
     ``last_status = "delivery_failed"`` (never "ok") while ``failure_streak`` is left alone. An
     explicit ``status`` (e.g. "blocked_config") overrides the derived value. False when the fence
     can't be taken, the job is missing, or ``expected_fire_owner`` no longer holds the fire claim.
+
+    ``model_unreachable``: this failed run never reached the model (transient network/DNS error,
+    zero API calls). Recurring jobs then get a bounded automatic re-run — ``next_run_at`` is pulled
+    earlier per ``cron.unreachable_retry.RETRY_DELAYS_SECONDS`` — instead of waiting a full period
+    (Cowork-style; see cron/unreachable_retry.py).
     """
     def apply(jobs, _i, job):
         if expected_fire_owner is not None:
@@ -2318,6 +2396,13 @@ def mark_job_run(
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
         _advance_after_run(job, now)
+        from cron.unreachable_retry import clear_state, plan_retry
+
+        if not success and model_unreachable and not is_terminal_job(job):
+            plan_retry(job)
+        else:
+            # Any run that reached the model (either outcome) resets the re-run ladder.
+            clear_state(job)
         save_jobs(jobs)
         return True
 
@@ -2600,11 +2685,14 @@ def claim_job_for_fire(
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     """Refresh an active ``fire_claim`` without extending another owner's lease: an execution may
-    outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim."""
+    outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim.
+    Deliberately NOT under ``_under_fire_fence``: the run thread holds the per-job fence across
+    delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
+    report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    return _with_job(job_id, apply, False)
 
 
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by
