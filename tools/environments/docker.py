@@ -1217,9 +1217,10 @@ class DockerEnvironment(BaseEnvironment):
         """Recreate a container removed out-of-band: label-based reuse first (another process
         may have recreated it), else a fresh one from the saved image/run-args. False when
         recovery fails so the caller surfaces the original error."""
-        logger.warning("Container %s appears to be gone — attempting recovery", (self._container_id or "")[:12])
+        old_container_id = self._container_id or ""
+        logger.warning("Container %s appears to be gone — attempting recovery", old_container_id[:12])
         self._container_id = None
-        _release_runtime_tracking(old_container_id, self._lease_root)
+        _release_runtime_tracking(old_container_id, getattr(self, "_lease_root", None))
 
         existing = self._find_reusable_container(
             self._labels.get("hermes-task-id", ""),
@@ -1261,6 +1262,7 @@ class DockerEnvironment(BaseEnvironment):
             return False
 
         logger.info("Recovery successful — new container %s", (self._container_id or "")[:12])
+        self._mark_recreated()
         return True
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
