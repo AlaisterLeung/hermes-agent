@@ -34,8 +34,7 @@ from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
     _user_deny_block_result,
 )
-from tools.approval_gateway_wait import _await_gateway_decision
-from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
+
 from tools.approval_smart import _smart_verdict
 
 logger = logging.getLogger(__name__)
@@ -657,7 +656,7 @@ _ACTION_GATE = _GateSpec(
 
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
-                human_present: bool) -> tuple[dict | None, bool]:
+                human_present: bool) -> tuple[dict | None, bool, str]:
     """Guardian-LLM step -> ``(result, smart_denied_for_owner)``: a result ends the gate;
     ``smart_denied_for_owner`` means an interactive owner may still override the DENY for this
     one operation (once/deny only, nothing persists).
@@ -671,12 +670,12 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
     if verdict == "approve":
         _reset_denials(session_key)
         logger.debug(spec.smart_log.format(command=command[:60], description=description, session_key=session_key))
-        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False
+        return {"approved": True, "message": None, "smart_approved": True, "description": description}, False, verdict
     if verdict != "deny":
-        return None, False
+        return None, False, verdict
     _record_denial(session_key)
     if human_present:
-        return None, True
+        return None, True, verdict
     return {
         # Unattended programmatic platforms (webhook/msgraph_webhook/ api_server): respect unattended_mode
         # config. Resolves instantly — never a pending approval nobody can answer (#37284, #87509).
@@ -684,14 +683,65 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
         "message": (f"BLOCKED by smart approval: {description}. The command was assessed as genuinely "
                     f"dangerous. Do NOT retry.{_denial_breaker_addendum(session_key)}"),
         "smart_denied": True,
-    }, True
+    }, True, verdict
+
+
+def _prepare_smart_approval_observer(
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: list[str],
+    session_key: str,
+    execution_target: str = "",
+    execution_backend: str = "",
+) -> dict | None:
+    """Redact and emit the pre-decision smart approval observer hook.
+
+    Redaction is part of observer payload preparation, not approval policy. If
+    it fails, skip all observability rather than leaking raw data or preventing
+    the auxiliary LLM from making its decision.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        hook_command = redact_sensitive_text(command, force=True)
+        hook_description = redact_sensitive_text(description, force=True)
+    except Exception as exc:
+        logger.debug("Smart approval hook redaction failed: %s", exc)
+        return None
+
+    payload = {
+        "command": hook_command,
+        "description": hook_description,
+        "pattern_key": pattern_key,
+        "pattern_keys": list(pattern_keys),
+        "session_key": session_key,
+        "surface": "smart",
+        "target": execution_target,
+        "backend": execution_backend,
+    }
+    _fire_approval_hook("pre_approval_request", **payload)
+    return payload
+
+
+def _observe_smart_approval_verdict(payload: dict | None, verdict: str) -> None:
+    """Emit a smart verdict after the auxiliary LLM decision, if safe."""
+    if payload is None or verdict not in {"approve", "deny"}:
+        return
+    _fire_approval_hook(
+        "post_approval_response",
+        **payload,
+        choice=f"smart_{verdict}",
+        decided_by="aux_llm",
+    )
 
 
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None,
+                    execution_target: str = "", execution_backend: str = "") -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -704,8 +754,21 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     smart_denied = False
     if smart:
-        result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
-                                           session_key, human_present=is_cli or is_gateway or is_ask)
+        observer_payload = _prepare_smart_approval_observer(
+            command=command,
+            description=description,
+            pattern_key=pattern_key,
+            pattern_keys=pattern_keys,
+            session_key=session_key,
+            execution_target=execution_target,
+            execution_backend=execution_backend,
+        )
+        result, smart_denied, verdict = _smart_gate(
+            spec, command, description, pattern_key, pattern_keys,
+            session_key, human_present=is_cli or is_gateway or is_ask)
+        # Observe the RAW verdict (approve/deny), including the deny that
+        # falls through to an owner override; escalate emits no post hook.
+        _observe_smart_approval_verdict(observer_payload, verdict)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
@@ -761,6 +824,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 "pattern_keys": pattern_keys, "description": display_description,
                 "allow_permanent": permanent_capable and not smart_denied,
                 "allow_session": not smart_denied,
+                "target": execution_target,
+                "backend": execution_backend,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -801,11 +866,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         prompt_command = redact_sensitive_text(command)
         prompt_description = redact_sensitive_text(description)
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
-                       pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
-    approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
+                       pattern_keys=list(pattern_keys), session_key=session_key, surface="cli",
+                       target=execution_target, backend=execution_backend)
+    _fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
                                        smart_denied=smart_denied, approval_callback=approval_callback)
-    approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
+    _fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
     if choice == "deny":
@@ -1022,9 +1088,45 @@ def _tirith_scan(command: str) -> dict:
         }]}
 
 
+def _execution_scoped_pattern_key(
+    pattern_key: str, execution_target: str, named: bool,
+    execution_target_scope: str = "",
+) -> str:
+    """Scope persisted approvals to a named target without key collisions."""
+    if not named:
+        return pattern_key
+    target = str(execution_target or "")
+    if execution_target_scope:
+        return f"target:{execution_target_scope}:{pattern_key}"
+    try:
+        from tools.execution_targets import _active_profile_scope
+
+        profile_scope = _active_profile_scope()
+    except Exception:
+        profile_scope = ""
+    digest = hashlib.sha256(
+        f"{profile_scope}:{target}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"target:{digest}:{pattern_key}"
+
+
+def _fire_approval_hook(hook_name: str, **payload) -> None:
+    """Module-level indirection so tests can patch hook emission."""
+    approval_context._fire_approval_hook(hook_name, **payload)
+
+
+def _get_approval_mode() -> str:
+    """Module-level indirection so tests (and plugins) can patch the mode lookup."""
+    return approval_context._get_approval_mode()
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             execution_target: str = "default",
+                             execution_backend: Optional[str] = None,
+                             execution_target_named: bool = False,
+                             execution_target_scope: str = "") -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
@@ -1036,7 +1138,7 @@ def check_all_command_guards(command: str, env_type: str,
     if blocked is not None:
         return blocked
 
-    approval_mode = approval_context._get_approval_mode()
+    approval_mode = _get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
     if _command_matches_permanent_allowlist(command):
@@ -1061,15 +1163,31 @@ def check_all_command_guards(command: str, env_type: str,
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
-        tirith_key = f"tirith:{rule_id}"
+        tirith_key = _execution_scoped_pattern_key(
+            f"tirith:{rule_id}", execution_target, execution_target_named,
+            execution_target_scope,
+        )
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
-    if is_dangerous and not is_approved(session_key, pattern_key):
-        warnings.append((pattern_key, description, False))
+    if is_dangerous:
+        pattern_key = _execution_scoped_pattern_key(
+            pattern_key, execution_target, execution_target_named,
+            execution_target_scope,
+        )
+        if not is_approved(session_key, pattern_key):
+            warnings.append((pattern_key, description, False))
     if not warnings:
         return _approved()
 
-    combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    execution_backend = execution_backend or env_type
+
+    def _target_description(description: str) -> str:
+        return (
+            f"{description} [execution target: {execution_target!r}; "
+            f"backend: {execution_backend}]"
+        )
+
+    combined_desc = _target_description("; ".join(desc for _, desc, _ in warnings))
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
 
@@ -1082,6 +1200,7 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
         permanent_capable=any(not is_t for _, _, is_t in warnings),
+        execution_target=execution_target, execution_backend=execution_backend,
     )
 
 
@@ -1091,7 +1210,11 @@ _EXECUTE_CODE_DESCRIPTION = (
 )
 
 
-def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = False) -> dict:
+def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = False,
+                             execution_target: str = "default",
+                             execution_backend: Optional[str] = None,
+                             execution_target_named: bool = False,
+                             execution_target_scope: str = "") -> dict:
     """Approve an execute_code script before its child process is spawned.
 
     The script can call ``subprocess``/``os.system``/``ctypes`` directly, none of which pass
@@ -1106,15 +1229,23 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     arbitrary code headlessly without any approval surface is trusted-by-config (set a gateway/ask surface
     or ``approvals.cron_mode`` to require approval). See #30882.
     """
-    pattern_key = "execute_code"
+    pattern_key = _execution_scoped_pattern_key(
+        "execute_code", execution_target, execution_target_named,
+        execution_target_scope,
+    )
     description = _EXECUTE_CODE_DESCRIPTION
+    execution_backend = execution_backend or env_type
+    description += (
+        f" [execution target: {execution_target!r}; "
+        f"backend: {execution_backend}]"
+    )
 
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
         return _approved()
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _approved()
-    approval_mode = approval_context._get_approval_mode()
+    approval_mode = _get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
 
@@ -1158,6 +1289,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
         smart=approval_mode == "smart",
         pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
+        execution_target=execution_target, execution_backend=execution_backend,
     )
 
 
@@ -1182,6 +1314,28 @@ import unicodedata  # noqa: F401,E402
 import uuid  # noqa: F401,E402
 
 
+def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
+    """Module-level indirection (lazy import breaks the approval cycle);
+    tests patch this name on tools.approval."""
+    from tools.approval_gateway_wait import _impl as _gateway_impl
+    return _gateway_impl(session_key, notify_cb, approval_data, surface=surface)
+
+
+def _present_with_selected_transport(*args, **kwargs):
+    from tools.approval_prompt import _present_with_selected_transport as _impl
+    return _impl(*args, **kwargs)
+
+
+def _transport_choice(*args, **kwargs):
+    from tools.approval_prompt import _transport_choice as _impl
+    return _impl(*args, **kwargs)
+
+
+def prompt_dangerous_approval(*args, **kwargs):
+    from tools.approval_prompt import prompt_dangerous_approval as _impl
+    return _impl(*args, **kwargs)
+
+
 _PLUGIN_COMPAT_LAZY = {
     'DANGEROUS_PATTERNS': ('tools.approval_detection', 'DANGEROUS_PATTERNS'),
     'DANGEROUS_PATTERNS_COMPILED': ('tools.approval_detection', 'DANGEROUS_PATTERNS_COMPILED'),
@@ -1194,6 +1348,10 @@ _PLUGIN_COMPAT_LAZY = {
     'human_wait_seconds': ('tools.approval_human_wait', 'human_wait_seconds'),
     'human_wait_window': ('tools.approval_human_wait', 'human_wait_window'),
     'is_interrupted': ('tools.interrupt', 'is_interrupted'),
+    '_present_with_selected_transport': ('tools.approval_prompt', '_present_with_selected_transport'),
+    '_transport_choice': ('tools.approval_prompt', '_transport_choice'),
+    '_await_gateway_decision': ('tools.approval_gateway_wait', '_await_gateway_decision'),
+    'prompt_dangerous_approval': ('tools.approval_prompt', 'prompt_dangerous_approval'),
     'request_elicitation_consent': ('tools.approval_prompt', 'request_elicitation_consent'),
     'reset_current_observability_context': ('tools.approval_context', 'reset_current_observability_context'),
     'reset_current_session_key': ('tools.approval_context', 'reset_current_session_key'),

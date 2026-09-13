@@ -580,7 +580,11 @@ class CLIStreamMixin:
                 _cprint(f"  {_DIM}👁️  analyzing {img_path.name} ({size_kb}KB)...{_RST}")
             try:
                 result_json = _asyncio.run(
-                    vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt))
+                    # target="local": attached images come from THIS host; omitted
+                    # target follows terminal.default_target (pinned by `hermes
+                    # acp -t <name>`) and fails "File not found inside the backend".
+                    vision_analyze_tool(
+                        image_url=str(img_path), user_prompt=analysis_prompt, target="local"))
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from typing import Any, Dict, Hashable, Optional
 
 from utils import env_var_enabled
 
@@ -27,32 +28,74 @@ _sudo_password_cache: dict[str, str] = {}
 _sudo_password_cache_lock = threading.Lock()
 
 
-def _get_sudo_password_cache_scope() -> str:
-    """Return the cache scope for interactive sudo passwords."""
-    from tools.terminal_tool import _current_session_key, _get_sudo_password_callback
+def _get_sudo_password_cache_scope(
+    execution_target: str | None = None,
+    execution_backend: str | None = None,
+    execution_target_scope: str | None = None,
+) -> str:
+    """Return the session + target scope for interactive sudo passwords."""
+    from tools.terminal_tool import (
+        _current_session_key, _get_sudo_password_callback, _sudo_execution_context,
+    )
     session_key = _current_session_key()
     if session_key:
-        return f"session:{session_key}"
-    callback = _get_sudo_password_callback()
-    if callback is None:
-        return f"thread:{threading.get_ident()}"
-    owner = getattr(callback, "__self__", None)
-    func = getattr(callback, "__func__", None)
-    if owner is not None and func is not None:
-        return f"callback-owner:{id(owner)}:{id(func)}"
-    return f"callback:{id(callback)}"
+        base_scope = f"session:{session_key}"
+    else:
+        callback = _get_sudo_password_callback()
+        if callback is not None:
+            owner = getattr(callback, "__self__", None)
+            func = getattr(callback, "__func__", None)
+            if owner is not None and func is not None:
+                base_scope = f"callback-owner:{id(owner)}:{id(func)}"
+            else:
+                base_scope = f"callback:{id(callback)}"
+        else:
+            base_scope = f"thread:{threading.get_ident()}"
 
+    active_context = _sudo_execution_context.get()
+    if execution_target is None and active_context is not None:
+        execution_target = active_context[0]
+    if execution_backend is None and active_context is not None:
+        execution_backend = active_context[1]
+    if execution_target is None and execution_backend is None:
+        return base_scope
+    target_scope = execution_target_scope or ""
+    if (
+        execution_target_scope is None
+        and active_context is not None
+        and execution_target == active_context[0]
+        and execution_backend == active_context[1]
+    ):
+        target_scope = active_context[4]
+    return (
+        f"{base_scope}|target:{execution_target!r}"
+        f"|backend:{str(execution_backend or '').lower()}"
+        f"|scope:{target_scope}"
+    )
 
-def _get_cached_sudo_password() -> str:
+def _get_cached_sudo_password(
+    execution_target: str | None = None,
+    execution_backend: str | None = None,
+    execution_target_scope: str | None = None,
+) -> str:
     """Return the cached sudo password for the current scope."""
-    scope = _get_sudo_password_cache_scope()
+    scope = _get_sudo_password_cache_scope(
+        execution_target, execution_backend, execution_target_scope,
+    )
     with _sudo_password_cache_lock:
         return _sudo_password_cache.get(scope, "")
 
 
-def _set_cached_sudo_password(password: str) -> None:
+def _set_cached_sudo_password(
+    password: str,
+    execution_target: str | None = None,
+    execution_backend: str | None = None,
+    execution_target_scope: str | None = None,
+) -> None:
     """Persist a sudo password for the current scope ("" drops the entry)."""
-    scope = _get_sudo_password_cache_scope()
+    scope = _get_sudo_password_cache_scope(
+        execution_target, execution_backend, execution_target_scope,
+    )
     with _sudo_password_cache_lock:
         if password:
             _sudo_password_cache[scope] = password
@@ -114,19 +157,32 @@ def _sudo_wrong_password_failure(output: str) -> bool:
     return any(marker in lowered for marker in _SUDO_WRONG_PASSWORD_MARKERS)
 
 
-def _invalidate_cached_sudo_on_auth_failure(command: str | None, output: str) -> bool:
-    """Drop a session-cached sudo password after sudo rejects it. Env-configured
-    ``SUDO_PASSWORD`` is left alone — an explicit operator choice, not a cache entry."""
-    if (
-        "SUDO_PASSWORD" in os.environ
-        or not _sudo_wrong_password_failure(output)
-        or _count_real_sudo_invocations(command or "") == 0
-        or not _get_cached_sudo_password()
+def _invalidate_cached_sudo_on_auth_failure(
+    command: str | None,
+    output: str,
+    execution_target: str | None = None,
+    execution_backend: str | None = None,
+    execution_target_scope: str | None = None,
+) -> bool:
+    """Drop a session-cached sudo password after sudo rejects it.
+
+    Env-configured ``SUDO_PASSWORD`` is left alone — that is an explicit
+    operator choice, not an interactive cache entry.
+    """
+    if "SUDO_PASSWORD" in os.environ:
+        return False
+    if not _sudo_wrong_password_failure(output):
+        return False
+    if _count_real_sudo_invocations(command or "") == 0:
+        return False
+    if not _get_cached_sudo_password(
+        execution_target, execution_backend, execution_target_scope,
     ):
         return False
-    _set_cached_sudo_password("")
+    _set_cached_sudo_password(
+        "", execution_target, execution_backend, execution_target_scope,
+    )
     return True
-
 
 def _release_tty(tty_fd, old_attrs) -> None:
     """Restore echo and close the /dev/tty fd opened by the password reader (best effort)."""
@@ -362,6 +418,36 @@ def _count_real_sudo_invocations(command: str) -> int:
     return _rewrite_real_sudo_invocations(command)[1]
 
 
+def _sudo_nopasswd_works() -> bool:
+    """Return True when local sudo currently works without prompting.
+
+    Only probes for the `local` terminal backend; Docker/SSH/Modal/etc. must
+    not inherit the host's sudo state. Re-probes every call (no process-level
+    cache) so an expired sudo timestamp cannot make a later command silently
+    block waiting for a password.
+    """
+    from tools.terminal_tool import _sudo_execution_context, _tenv
+
+    active_context = _sudo_execution_context.get()
+    if active_context is not None:
+        terminal_env = active_context[1].strip().lower() or "local"
+    else:
+        terminal_env = _tenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    if terminal_env != "local":
+        return False
+
+    try:
+        probe = subprocess.run(
+            ["sudo", "-n", "true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        return probe.returncode == 0
+    except Exception:
+        return False
 def _rewrite_compound_background(command: str) -> str:
     """Wrap `A && B &` (or `A || B &`) to `A && { B & }` at depth 0. Bash binds `&&` tighter
     than `&`, so `A && B &` backgrounds a subshell that runs B in the foreground and waits for
@@ -432,41 +518,99 @@ def _transform_sudo_command(
     an interactive prompt (45s timeout, cached on success) when a UI is reachable.
     ``sudo_nopasswd_check`` (supplied by ``BaseEnvironment``) runs ``sudo -n true`` inside the
     selected backend; a True result skips the prompt and the ``-S`` rewrite entirely."""
-    from tools.terminal_tool import _get_sudo_password_callback
     if command is None:
         return None, None
     transformed, sudo_count = _rewrite_real_sudo_invocations(command)
     if sudo_count == 0:
         return command, None
 
-    # Scope-aware read: under multiplex the process env may hold another profile's SUDO_PASSWORD;
-    # unscoped callers (UnscopedSecretError) keep the os.environ read.
-    try:
-        from agent.secret_scope import get_secret
-        _configured_password = get_secret("SUDO_PASSWORD")
-    except Exception:
-        _configured_password = os.environ.get("SUDO_PASSWORD")
-    has_configured_password = _configured_password is not None
-    sudo_password = _configured_password if has_configured_password else _get_cached_sudo_password()
+    from tools.terminal_tool import (
+        _sudo_execution_context, _get_sudo_password_callback,
+    )
+    active_context = _sudo_execution_context.get()
+    if active_context is not None and active_context[2]:
+        configured_password = active_context[3]
+        has_configured_password = configured_password is not None
+        sudo_password = str(configured_password) if has_configured_password else _get_cached_sudo_password()
+    else:
+        try:
+            from agent.secret_scope import UnscopedSecretError, get_secret
+            try:
+                configured_password = get_secret("SUDO_PASSWORD")
+            except UnscopedSecretError:
+                configured_password = os.environ.get("SUDO_PASSWORD")
+        except Exception:
+            configured_password = os.environ.get("SUDO_PASSWORD")
+        has_configured_password = configured_password is not None
+        sudo_password = configured_password if has_configured_password else _get_cached_sudo_password()
 
-    # delegate_task children inherit HERMES_INTERACTIVE=1 (and possibly a stale thread-local
-    # callback on a recycled worker) but have no user on the other side — always headless;
-    # configured password and session cache still apply.
+    has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+    # Children inherit HERMES_INTERACTIVE=1 but have no user behind them:
+    # prompting fights the parent's TUI for /dev/tty and blocks the full
+    # timeout. They run headless — SUDO_PASSWORD, cache, and NOPASSWD still work.
     should_prompt_for_sudo = (
-        env_var_enabled("HERMES_INTERACTIVE") or _get_sudo_password_callback() is not None
+        env_var_enabled("HERMES_INTERACTIVE") or has_sudo_prompt_callback
     ) and not _in_delegated_child_context()
     if not has_configured_password and not sudo_password and should_prompt_for_sudo:
         # sudoers NOPASSWD must not be forced through the prompt or the -S pipe. The probe is
         # a round trip on the selected backend (an ssh exec for SSH), so it only runs when a
         # prompt would otherwise fire: headless callers end up at ``(command, None)`` either
         # way. Re-probed every call so an expired sudo timestamp cannot silently block.
-        if sudo_nopasswd_check is not None and sudo_nopasswd_check():
+        nopasswd_check = (
+            sudo_nopasswd_check if sudo_nopasswd_check is not None
+            else _sudo_nopasswd_works
+        )
+        if nopasswd_check():
             return command, None
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
         if sudo_password:
             _set_cached_sudo_password(sudo_password)
 
     if has_configured_password or sudo_password:
-        # sudo -S reads one line per invocation: compound `sudo a && sudo b` needs one line each.
-        return transformed, (sudo_password + "\n") * sudo_count
+        # Trailing newline is required: sudo -S reads one line per invocation.
+        # Compound commands (`sudo a && sudo b`) need one password line each.
+        password_line = sudo_password + "\n"
+        return transformed, password_line * sudo_count
+
     return command, None
+
+
+# Environment classes now live in tools/environments/
+from tools.environments.base import EnvironmentConnectionError
+from tools.environments.local import LocalEnvironment as _LocalEnvironment
+from tools.environments.singularity import SingularityEnvironment as _SingularityEnvironment
+from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
+from tools.environments.docker import DockerEnvironment as _DockerEnvironment
+from tools.environments.modal import ModalEnvironment as _ModalEnvironment
+from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
+from tools.managed_tool_gateway import is_managed_tool_gateway_ready
+import sys
+
+
+# Tool description for LLM
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on the selected execution target (bash/Linux shell semantics). The host OS, shell, and terminal backend are stated in your environment section — write commands for THAT platform. Filesystem, current working directory, and exported environment variables persist between calls.
+
+Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
+Environment state persists: activate a virtualenv or export variables once per session, not before every command.
+
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
+Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
+PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
+"""
+
+# Global state for environment lifecycle management
+_active_environments: Dict[Hashable, Any] = {}
+_last_activity: Dict[Hashable, float] = {}
+_env_lock = threading.Lock()
+_retired_environments: list[tuple[Hashable, Any, float]] = []
+_retired_environments_lock = threading.Lock()
+_creation_locks: Dict[Hashable, threading.Lock] = {}  # Per-target locks for sandbox creation
+_creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+_cleanup_thread = None
+_cleanup_running = False
+
+# Once-per-process guard for the docker orphan reaper (issue #20561): set on
+# first run so parallel subagent creation doesn't re-trigger the sweep.
+_docker_orphan_reaper_ran = False
+_docker_orphan_reaper_lock = threading.Lock()

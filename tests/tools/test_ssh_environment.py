@@ -287,6 +287,44 @@ class TestSSHProbeOnly:
         assert not first_probe.control_socket.exists()
         assert len(control_exit_calls) == 1
 
+    def test_file_sync_false_skips_sync_manager_and_remote_dirs(self, monkeypatch):
+        """file_sync=False must not build a FileSyncManager nor create the
+        ~/.hermes dir tree — real self-managed hosts shouldn't be mirrored."""
+        import tools.environments.ssh as ssh_mod
+        sync_created = {"count": 0}
+        mkdir_called = {"count": 0}
+
+        monkeypatch.setattr(ssh_mod.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "init_session", lambda self: None)
+
+        def _fake_ensure_remote_dirs(self):
+            mkdir_called["count"] += 1
+
+        def _fake_syncmanager(**kw):
+            sync_created["count"] += 1
+            class _M:
+                def sync(self, **k): return None
+                def sync_back(self): return None
+            return _M()
+
+        monkeypatch.setattr(ssh_mod.SSHEnvironment, "_ensure_remote_dirs", _fake_ensure_remote_dirs)
+        monkeypatch.setattr(ssh_mod, "FileSyncManager", _fake_syncmanager)
+
+        off = ssh_mod.SSHEnvironment(host="example.com", user="alice", file_sync=False)
+        assert off._sync_manager is None
+        assert off.file_sync is False
+        assert sync_created["count"] == 0
+        assert mkdir_called["count"] == 0
+        off._before_execute()   # must be a no-op with no manager
+        off.cleanup()           # must not call sync_back
+
+        on = ssh_mod.SSHEnvironment(host="example.com", user="bob", file_sync=True)
+        assert on.file_sync is True
+        assert sync_created["count"] == 1
+        assert mkdir_called["count"] == 1
+
 
 def _setup_ssh_env(monkeypatch, persistent: bool):
     monkeypatch.setenv("TERMINAL_ENV", "ssh")
@@ -347,3 +385,169 @@ class TestPersistentSSH:
         assert len(lines) == 1000
         assert lines[0] == "1"
         assert lines[-1] == "1000"
+
+
+def test_control_socket_identity_includes_key_scope_and_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(ssh_env, "_ensure_ssh_available", lambda: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+    monkeypatch.setattr(
+        ssh_env,
+        "FileSyncManager",
+        lambda **kw: type(
+            "M", (), {
+                "sync": lambda self, **k: None,
+                "sync_back": lambda self, **k: None,
+            },
+        )(),
+    )
+    key_a = tmp_path / "keys" / "a"
+    key_b = tmp_path / "keys" / "b"
+    key_a.parent.mkdir()
+    key_a.write_text("a")
+    key_b.write_text("b")
+
+    base = SSHEnvironment(
+        host="h", user="u", port=22, key_path=str(key_a),
+        runtime_scope="scope-a", profile_name="profile-a",
+    )
+    equivalent = SSHEnvironment(
+        host="h", user="u", port=22,
+        key_path=str(key_a.parent / ".." / "keys" / "a"),
+        runtime_scope="scope-a", profile_name="profile-a",
+    )
+    different_key = SSHEnvironment(
+        host="h", user="u", port=22, key_path=str(key_b),
+        runtime_scope="scope-a", profile_name="profile-a",
+    )
+    different_scope = SSHEnvironment(
+        host="h", user="u", port=22, key_path=str(key_a),
+        runtime_scope="scope-b", profile_name="profile-a",
+    )
+    different_profile = SSHEnvironment(
+        host="h", user="u", port=22, key_path=str(key_a),
+        runtime_scope="scope-a", profile_name="profile-b",
+    )
+
+    assert base.control_socket == equivalent.control_socket
+    assert len({
+        base.control_socket,
+        different_key.control_socket,
+        different_scope.control_socket,
+        different_profile.control_socket,
+    }) == 4
+
+
+def test_cleanup_of_one_scoped_ssh_socket_does_not_terminate_sibling(
+    monkeypatch, tmp_path,
+):
+    calls = []
+    monkeypatch.setattr(ssh_env, "_ensure_ssh_available", lambda: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/u")
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+    monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+    monkeypatch.setattr(
+        ssh_env.subprocess,
+        "run",
+        lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0),
+    )
+    monkeypatch.setattr(
+        ssh_env,
+        "FileSyncManager",
+        lambda **kw: type(
+            "M", (), {
+                "sync": lambda self, **k: None,
+                "sync_back": lambda self, **k: None,
+            },
+        )(),
+    )
+    first = SSHEnvironment(
+        host="h", user="u", runtime_scope="one", profile_name="p",
+    )
+    second = SSHEnvironment(
+        host="h", user="u", runtime_scope="two", profile_name="p",
+    )
+    first.control_socket.touch()
+    second.control_socket.touch()
+
+    first.cleanup()
+
+    assert not first.control_socket.exists()
+    assert second.control_socket.exists()
+    assert len(calls) == 1
+    assert f"ControlPath={first.control_socket}" in calls[0]
+    assert f"ControlPath={second.control_socket}" not in calls[0]
+
+
+class TestRunBashQuoting:
+    """Guards _run_bash quoting for remote login shells that are not bash.
+    The double-quote escaping keeps the payload a single intact argument."""
+
+    @staticmethod
+    def _bare_env() -> SSHEnvironment:
+        """SSHEnvironment without __init__'s connection handshake (which
+        would spawn a real ssh process in tests)."""
+        from pathlib import Path
+        env = SSHEnvironment.__new__(SSHEnvironment)
+        env.host, env.user, env.port, env.key_path = "h", "u", 22, ""
+        env.control_socket = Path("/tmp/hermes-ssh/test.sock")
+        return env
+
+    def test_double_quote_roundtrip(self):
+        """_double_quote must produce a shell-string that round-trips the
+        original content through a POSIX shell exactly."""
+        samples = [
+            "echo hello",
+            "echo 'a'b'",
+            "echo \"double\"",
+            "x=$(echo hi); echo $x",
+            "echo `date`",
+            "back\\slash",
+            "no_quotes_here",
+            "$HOME/ûnïcode  space",
+        ]
+        for s in samples:
+            quoted = ssh_env._double_quote(s)
+            assert quoted.startswith('"') and quoted.endswith('"')
+            # Round-trip through bash.
+            out = subprocess.run(
+                ["bash", "-c", "printf '%s' " + quoted],
+                capture_output=True, text=True,
+            )
+            assert out.returncode == 0, (s, quoted, out.stderr)
+            assert out.stdout == s
+
+    def test_run_bash_uses_double_quote_escaping(self, monkeypatch):
+        """_run_bash must quote with _double_quote so the argv stays
+        parseable by non-bash login shells."""
+        import shlex
+        real_popen = subprocess.Popen
+        calls = []
+        monkeypatch.setattr(
+            ssh_env.subprocess, "Popen",
+            lambda cmd, *a, **k: (calls.append(cmd), MagicMock())[1],
+        )
+        env = self._bare_env()
+        env._run_bash("echo 'a'")
+        assert calls, "Popen was not invoked"
+        argv = calls[0]
+        assert argv[0] == "ssh"
+        # find the bash -c argument
+        assert argv[-2] == "-c"
+        payload = argv[-1]
+        assert payload.startswith('"') and payload.endswith('"')
+        # the payload must be exactly the original string as ONE argument
+        assert shlex.split(payload) == ["echo 'a'"]
+        # No single-quote splice may remain in the payload.
+        assert "\"'\"" not in payload
+        # Round-trip through bash using the real Popen.
+        monkeypatch.setattr(ssh_env.subprocess, "Popen", real_popen)
+        out = subprocess.run(
+            ["bash", "-c", "printf '%s' " + payload],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 0
+        assert out.stdout == "echo 'a'"

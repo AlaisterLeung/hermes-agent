@@ -2639,7 +2639,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "targets", "tools", "uninstall", "update",
         "vault",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -3264,6 +3264,15 @@ def _build_cli_parser():
     build_import_cmd_parser(subparsers, cmd_import=cmd_import)
     build_import_agent_parser(subparsers, cmd_import_agent=cmd_import_agent)
     build_config_parser(subparsers, cmd_config=cmd_config)
+
+    # Runtime execution-target registry management
+    targets_parser = subparsers.add_parser(
+        "targets",
+        help="Register and manage runtime execution targets without restart",
+    )
+    from hermes_cli.targets import register_cli as _register_targets_cli
+
+    _register_targets_cli(targets_parser)
     build_skin_parser(subparsers, cmd_skin=cmd_skin)
     build_console_parser(subparsers, cmd_console=cmd_console)
     build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)

@@ -96,15 +96,14 @@ def _install_fake_tools_package():
     sys.modules["tools.environments"] = env_package
 
     agent_package = types.ModuleType("agent")
-    agent_package.__path__ = [str(REPO_ROOT / "agent")]  # type: ignore[attr-defined]
+    agent_package.__path__ = []  # type: ignore[attr-defined]
     sys.modules["agent"] = agent_package
     sys.modules["agent.auxiliary_client"] = types.SimpleNamespace(
         call_llm=lambda *args, **kwargs: "",
     )
-    # Keep unrelated imports real; only replace the collaborators this fixture
-    # isolates. tools.browser_tool imports redact_cdp_url;
-    # hermes_cli.auth (imported transitively by nous_account /
-    # tool_backend_helpers) imports sanitize_borrowed_credential_payload.
+    # The fake `agent` package has an empty __path__: every real agent.*
+    # submodule production imports needs a stand-in here — tools.browser_tool
+    # needs redact_cdp_url, hermes_cli.auth sanitize_borrowed_credential_payload.
     sys.modules["agent.redact"] = types.SimpleNamespace(
         redact_cdp_url=lambda value: str(value),
     )
@@ -113,7 +112,8 @@ def _install_fake_tools_package():
     )
 
     # Stubs for the browser-provider plugin layer introduced in PR #25214.
-    # Install just enough stand-ins to isolate
+    # The fake `agent` package has an empty __path__ so real submodules
+    # aren't reachable; we install just enough stand-ins to satisfy
     # ``tools.browser_tool``'s top-level imports. The actual lifecycle
     # tests instantiate the real plugin classes via _load_tool_module
     # below, so the stubs only need to satisfy import + isinstance.
@@ -202,6 +202,7 @@ def _install_fake_tools_package():
     sys.modules["tools.environments.base"] = types.SimpleNamespace(
         BaseEnvironment=_DummyEnvironment,
         EnvironmentConnectionError=_DummyConnectionError,
+        get_sandbox_dir=lambda: Path(tempfile.gettempdir()),
     )
     sys.modules["tools.environments.local"] = types.SimpleNamespace(LocalEnvironment=_DummyEnvironment)
     sys.modules["tools.environments.singularity"] = types.SimpleNamespace(

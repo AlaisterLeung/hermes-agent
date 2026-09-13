@@ -1924,6 +1924,11 @@ def _bridge_max_turns_to_env(agent_cfg: Any) -> None:
 
 def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
     """Bridge nested ``terminal.*`` config to TERMINAL_* env vars (config.yaml overrides .env here)."""
+    from hermes_cli.config import effective_terminal_config
+
+    # Legacy consumers read TERMINAL_* as the backend for target-less calls:
+    # in named mode that's the selected default target, not the inheritance map.
+    _terminal_cfg = effective_terminal_config(_terminal_cfg)
     _terminal_backend = str(
         _terminal_cfg.get("backend") or os.environ.get("TERMINAL_ENV") or "").strip().lower()
     _terminal_env_map = {

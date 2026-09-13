@@ -214,7 +214,7 @@ class TestVideoAnalyzeTool:
         """Non-local terminal backends must not read local host video paths.
 
         The read routes through the shared media resolver
-        (tools.image_source, ``permitted=("video",)``) which exec-reads the
+        (tools.image_source, ``permitted=("video",)``) which reads the
         bytes inside the sandbox — so the analyzed video is the container's
         file, never the host's.
         """
@@ -226,18 +226,18 @@ class TestVideoAnalyzeTool:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
         import tools.image_source as isrc
-        import tools.terminal_tool as tt
 
         env_lookups = []
 
-        def fake_get_active(task_id):
-            env_lookups.append(task_id)
-            return SimpleNamespace(
-                execute=lambda cmd, **kw: {"returncode": 0, "output": remote_b64}
-            )
+        class _FakeOps:
+            def __init__(self, task_id, resolution, target=None):
+                env_lookups.append(task_id)
 
-        monkeypatch.setattr(tt, "ensure_task_env", lambda *a, **k: None)
-        monkeypatch.setattr(isrc, "_get_active_env", fake_get_active)
+            def read_file_bytes(self, path, max_bytes=None):
+                return SimpleNamespace(
+                    error=None, base64_content=remote_b64, is_binary=True)
+
+        monkeypatch.setattr(isrc, "_backend_file_ops", _FakeOps, raising=False)
 
         captured_kwargs = {}
 

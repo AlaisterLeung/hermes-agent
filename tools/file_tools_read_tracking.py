@@ -28,6 +28,26 @@ _read_tracker: dict = {}
 # when the model keeps failing the same file. Reset on a successful patch.
 _patch_failure_lock = threading.Lock()
 _patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
+
+
+def _live_trackers() -> tuple[dict, dict]:
+    """Resolve the LIVE ``(read_tracker, patch_failure_tracker)`` dicts.
+
+    ``tools.file_tools`` re-exports these names and tests (runtime-generation
+    isolation) patch them there; resolving through the imported module keeps
+    one shared state even when either module's global is rebound — import-time
+    copies would fork the coordination state and a provider repoint could
+    inherit stale read/patch history.
+    """
+    import sys
+
+    ft = sys.modules.get("tools.file_tools")
+    if ft is not None:
+        return (
+            ft.__dict__.get("_read_tracker", _read_tracker),
+            ft.__dict__.get("_patch_failure_tracker", _patch_failure_tracker),
+        )
+    return _read_tracker, _patch_failure_tracker
 _PATCH_FAILURE_PATHS_CAP = 64
 
 # Only the most recent reads matter for dedup, loop detection and external-edit
@@ -42,7 +62,8 @@ _NOT_FOUND_TTL_SECONDS = 60.0  # a path that didn't exist may be created soon
 def _task_data(task_id: str) -> dict:
     """Get-or-create the tracker entry for *task_id*, back-filling missing containers
     (search_tool / tests create partial entries). Lock must be held."""
-    task_data = _read_tracker.setdefault(task_id, {
+    read_tracker, _ = _live_trackers()
+    task_data = read_tracker.setdefault(task_id, {
         "last_key": None, "consecutive": 0, "read_history": set()})
     for key in ("dedup", "dedup_hits", "read_timestamps"):
         task_data.setdefault(key, {})
@@ -53,7 +74,8 @@ def _task_data(task_id: str) -> dict:
 def _record_patch_failure(task_id: str, resolved_path: str) -> int:
     """Increment and return the consecutive-failure count for this path."""
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.setdefault(task_id, {})
+        _, patch_failures = _live_trackers()
+        task_failures = patch_failures.setdefault(task_id, {})
         # Evict the oldest entry once a task has failed on many distinct files.
         if resolved_path not in task_failures:
             _evict_oldest(task_failures, _PATCH_FAILURE_PATHS_CAP - 1)
@@ -66,7 +88,8 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
     if not resolved_paths:
         return
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(task_id)
+        _, patch_failures = _live_trackers()
+        task_failures = patch_failures.get(task_id)
         for rp in resolved_paths if task_failures else ():
             task_failures.pop(rp, None)
 
@@ -95,20 +118,26 @@ def _resolved_or_none(filepath: str, task_id: str) -> str | None:
 
 def _pop_not_found(op: str, resolved_str: str, task_id: str) -> None:
     """Drop the negative-cache entry for *(op, resolved_str)*. Lock must be held."""
-    task_data = _read_tracker.get(task_id)
+    read_tracker, _ = _live_trackers()
+    task_data = read_tracker.get(task_id)
     nf = task_data.get("not_found") if task_data else None
     if nf:
         nf.pop((op, resolved_str), None)
 
 
-def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | None:
+def _check_not_found_cache(op: str, resolved_str: str, task_id: str,
+                           *, check_host_filesystem: bool = True) -> str | None:
     """Return cached not-found JSON for *(op, resolved_str)* if still fresh.
 
     *op* is "read" or "search" (different error JSON shapes). Evicted by TTL,
     by write_file/patch on the path, or by any other tool call.
+    ``check_host_filesystem=False`` (remote/container targets) skips the
+    host-side existence stat: a host path matching a remote path must not
+    invalidate the remote miss cache.
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        read_tracker, _ = _live_trackers()
+        task_data = read_tracker.get(task_id)
         entry = (task_data.get("not_found") or {}).get((op, resolved_str)) if task_data else None
         if entry is None:
             return None
@@ -119,7 +148,7 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     # "check → create → read" is common, so never serve a stale miss for a path
     # that now exists. The stat runs OUTSIDE the tracker lock: a hung stat on a
     # dead network mount must not stall every task.
-    if os.path.exists(resolved_str):
+    if check_host_filesystem and os.path.exists(resolved_str):
         with _read_tracker_lock:
             _pop_not_found(op, resolved_str, task_id)
         return None
@@ -152,31 +181,84 @@ def reset_file_dedup(task_id: str = None):
     compaction returns full content the summary may have dropped. Stub-hit counters
     are cleared so the hard block restarts fresh."""
     with _read_tracker_lock:
+        read_tracker, _ = _live_trackers()
         if task_id:
-            targets = [_read_tracker[task_id]] if _read_tracker.get(task_id) else []
+            try:
+                from tools.execution_targets import resolve_execution_target
+
+                scoped_task_id = resolve_execution_target().scope_task_key(task_id)
+            except Exception:
+                scoped_task_id = task_id
+            targets = [
+                read_tracker[key] for key in list(read_tracker)
+                if key == task_id or key == scoped_task_id
+                or (isinstance(key, tuple) and len(key) == 2 and key[0] in {task_id, scoped_task_id})
+            ]
         else:
-            targets = list(_read_tracker.values())
+            targets = list(read_tracker.values())
         for task_data in targets:
+            if "dedup" in task_data:
+                task_data["dedup"].clear()
             if "dedup_hits" in task_data:
                 task_data["dedup_hits"].clear()
             task_data.setdefault("dedup_generation_reads", set()).clear()
 
 
-def notify_other_tool_call(task_id: str = "default"):
+def notify_other_tool_call(
+    task_id: str = "default", execution_target: str | None = None,
+):
     """Reset the consecutive read/search counter for a task.
 
     Called by the dispatcher for every tool OTHER than read_file/search_files.
     Also clears stub-hit counters and the not-found cache: any other tool may
     have created a previously-missing path (or flipped its permissions).
+    Target-aware: resets every tracker key that could hold this task's state
+    (legacy task id, scoped task key, or the selected target's coordination key).
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
-        if task_data:
+        if execution_target is None:
+            try:
+                from tools.execution_targets import resolve_execution_target
+
+                scoped_task_id = resolve_execution_target().scope_task_key(task_id)
+            except Exception:
+                scoped_task_id = task_id
+            read_tracker, _ = _live_trackers()
+            keys = [task_id, scoped_task_id] + [
+                key for key in read_tracker
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and key[0] in {task_id, scoped_task_id}
+                )
+            ]
+        else:
+            try:
+                from tools.execution_targets import resolve_execution_target
+
+                keys = [
+                    resolve_execution_target(execution_target).file_coordination_key(
+                        task_id
+                    )
+                ]
+            except Exception:
+                keys = [task_id]
+        for key in keys:
+            task_data = read_tracker.get(key)
+            if not task_data:
+                continue
             task_data["last_key"] = None
             task_data["consecutive"] = 0
-            for key in ("dedup_hits", "not_found"):
-                if task_data.get(key):
-                    task_data[key].clear()
+            # An intervening non-read tool call breaks any stub-loop in
+            # progress, so clear per-key dedup hit counters too.
+            if "dedup_hits" in task_data:
+                task_data["dedup_hits"].clear()
+            # Any other tool (terminal, delegate, ...) may have created a missing
+            # path, so a cached miss is no longer trustworthy — clearing keeps the
+            # cache honest and covers cases the serve-side stat can't (permission flips).
+            nf = task_data.get("not_found")
+            if nf:
+                nf.clear()
 
 
 def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
@@ -186,7 +268,8 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     if resolved is None:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        read_tracker, _ = _live_trackers()
+        task_data = read_tracker.get(task_id)
         if task_data is None:
             return
         dedup = task_data.get("dedup")
@@ -213,7 +296,8 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     except OSError:
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        read_tracker, _ = _live_trackers()
+        task_data = read_tracker.get(task_id)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
             _cap_read_tracker_data(task_data)
@@ -226,7 +310,8 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     if resolved is None:
         return None
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        read_tracker, _ = _live_trackers()
+        task_data = read_tracker.get(task_id)
         read_mtime = task_data.get("read_timestamps", {}).get(resolved) if task_data else None
     if read_mtime is None:
         return None
