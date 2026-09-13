@@ -514,7 +514,11 @@ describe('useVirtualHistory offset cache reuse', () => {
     }
   })
 
-  it('corrects and compensates a same-layout row measured at unmount', async () => {
+  // The compensate fires only when the stale-cache adoption and the window
+  // move land in one commit; a split interleaving is also correct (cache is
+  // corrected without an unmount), so re-roll the setup on a split instead
+  // of only waiting longer.
+  it('corrects and compensates a same-layout row measured at unmount', { retry: 3 }, async () => {
     const items = Array.from({ length: 20 }, (_, index) => ({ height: 2, key: `item-${index}` }))
     const expose = { current: null as Exposed | null }
     const streams = makeStreams()
@@ -539,7 +543,7 @@ describe('useVirtualHistory offset cache reuse', () => {
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalled(), { timeout: 20_000 })
+      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalled(), { timeout: 4_000 })
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
