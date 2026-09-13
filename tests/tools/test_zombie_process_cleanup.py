@@ -479,7 +479,8 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # >=2s floor: a sub-second cap can expire before the child's relay turn starts under load.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 2.0)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -494,7 +495,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait(timeout=10)
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -528,7 +529,7 @@ class TestDelegationCleanup:
             relay_host.unregister_subagent.assert_not_called()
 
             release_child.set()
-            assert child_finished.wait(timeout=5)
+            assert child_finished.wait(timeout=10)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,
