@@ -400,7 +400,7 @@ def _finalize(
     rejects undecodable input — so a wrong guess is a clean rejection there
     rather than a hole here.
     """
-    from tools.vision_tools import _detect_image_mime_type_from_bytes
+    from tools.vision_tools_image_prep import _detect_image_mime_type_from_bytes
 
     if len(data) > _MAX_INGEST_BYTES:
         raise SourceTooLarge("media exceeds size limit", src=src, origin=origin)
