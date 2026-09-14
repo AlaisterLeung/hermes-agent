@@ -1660,32 +1660,31 @@ async def vision_analyze_tool(
                 )
 
 
-def check_vision_requirements() -> bool:
-    """Check if the configured runtime vision path can resolve a client.
+def check_video_requirements() -> bool:
+    """True when ``call_llm(task="vision")`` could resolve a client.
 
-    Mirrors the fallback chain that ``call_llm(task="vision")`` actually uses
-    at runtime: first the explicit ``auxiliary.vision.provider`` (if any),
-    and if that fails, the auto chain (main provider → openrouter → nous).
-    Without the auto-fallback step the tool would disappear from the model's
-    tool list whenever the explicit provider name was unresolvable, even
-    when the auto chain would have served the request (issue #31179).
+    Mirrors its fallback chain: explicit ``auxiliary.vision.provider``, then auto (main
+    provider → openrouter → nous) — without the auto step the tool would vanish whenever
+    the explicit name was unresolvable. Probe mode skips real SDK client construction.
+
+    See #31179.
     """
-    try:
-        from agent.auxiliary_client import aux_probe_mode, resolve_vision_provider_client
-    except ImportError:
-        return False
-    try:
-# Probe mode: skip real SDK client construction (openai import + httpx/SSL) on
-# the tool-gating path; resolution policy is identical.
-        with aux_probe_mode():
-            _provider, client, _model = resolve_vision_provider_client()
-            if client is not None:
-                return True
-            # Same "auto" fallback call_llm performs when the configured provider can't be resolved.
-            _provider, client, _model = resolve_vision_provider_client(provider="auto")
-            return client is not None
-    except Exception:
-        return False
+    from agent.auxiliary_client import aux_probe_mode, resolve_vision_provider_client
+    # No blanket except: a resolver crash must reach the registry, which logs it with a
+    # traceback; a swallowed exception reads as "no vision backend configured" (#87950).
+    with aux_probe_mode():
+        return any(
+            resolve_vision_provider_client(**kw)[1] is not None for kw in ({}, {"provider": "auto"})
+        )
+
+
+def check_vision_requirements() -> bool:
+    """Image gate (``vision_analyze``, ``browser_vision``): an aux vision client OR the native fast
+    path. Both handlers attach pixels straight to a vision-capable main model, so a main model on a
+    provider the aux resolver does not know (OAuth, local vLLM) must not hide a working tool (#47149).
+    ``video_analyze`` keeps the aux-only gate — its handler has no native path.
+    """
+    return _should_use_native_vision_fast_path() or check_video_requirements()
 
 
 
@@ -2274,7 +2273,7 @@ registry.register(
     toolset="video",
     schema=VIDEO_ANALYZE_SCHEMA,
     handler=_handle_video_analyze,
-    check_fn=check_vision_requirements,
+    check_fn=check_video_requirements,
     is_async=True,
     emoji="🎬",
 )
