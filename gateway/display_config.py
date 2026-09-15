@@ -128,6 +128,18 @@ def _chat_override_entries(user_config: dict, platform_key: str, chat: Any):
             yield entry
 
 
+def _chat_display_value(user_config: dict, platform_key: str, setting: str, chat: Any) -> Any:
+    """First non-None per-chat override value for ``setting`` (most specific chat wins)."""
+    if chat is None:
+        return None
+    for entry in _chat_override_entries(user_config, platform_key, chat):
+        if isinstance(entry, dict):
+            val = entry.get(setting)
+            if val is not None:
+                return val
+    return None
+
+
 def has_chat_display_override(
     user_config: dict, platform_key: str, setting: str, chat: Any = None,
 ) -> bool:
@@ -150,30 +162,53 @@ def resolve_display_setting(
     consult the per-chat layer (``display.platforms.<platform>.chats.<chat_id>``); threads
     inherit their parent chat's entry. Returns *fallback* when nothing is configured.
     """
-    display_cfg = user_config.get("display") or {}
-
     # 0. Per-chat override (display.platforms.<platform>.chats.<chat_id>.<key>)
-    if chat is not None:
-        for entry in _chat_override_entries(user_config, platform_key, chat):
-            if isinstance(entry, dict):
-                val = entry.get(setting)
-                if val is not None:
-                    return _normalise(setting, val)
-
-    # 1. Explicit per-platform override (display.platforms.<platform>.<key>)
-    plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
-    if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
-        return _normalise(setting, plat_overrides[setting])
-    if setting == "tool_progress":  # legacy display.tool_progress_overrides.<platform>
-        legacy = display_cfg.get("tool_progress_overrides")
-        if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
-            return _normalise(setting, legacy[platform_key])
-    if setting != "streaming" and display_cfg.get(setting) is not None:  # display.streaming is CLI-only
-        return _normalise(setting, display_cfg[setting])
+    configured = _chat_display_value(user_config, platform_key, setting, chat)
+    if configured is not None:
+        return _normalise(setting, configured)
+    # 1. Explicit per-platform / legacy / global value, then tier defaults.
+    configured = _configured_display_value(user_config, platform_key, setting)
+    if configured is not None:
+        return _normalise(setting, configured)
     val = _PLATFORM_DEFAULTS.get(platform_key, {}).get(setting)
     if val is None:
         val = _GLOBAL_DEFAULTS.get(setting)
     return fallback if val is None else val
+
+
+def _configured_display_value(user_config: dict, platform_key: str, setting: str) -> Any:
+    """First non-None operator value, without introducing tier defaults."""
+    display_cfg = user_config.get("display") or {}
+    plat_overrides = (display_cfg.get("platforms") or {}).get(platform_key)
+    if isinstance(plat_overrides, dict) and plat_overrides.get(setting) is not None:
+        return plat_overrides[setting]
+    if setting == "tool_progress":
+        legacy = display_cfg.get("tool_progress_overrides")
+        if isinstance(legacy, dict) and legacy.get(platform_key) is not None:
+            return legacy[platform_key]
+    if setting != "streaming":  # display.streaming is CLI-only
+        return display_cfg.get(setting)
+    return None
+
+
+def resolve_tool_progress(
+    user_config: dict, platform_key: str, env_mode: str | None = None, chat: Any = None,
+) -> tuple[str, bool]:
+    """Return (mode, explicit intent) from the same winning source.
+
+    Non-None YAML wins over the legacy env bridge; a per-chat override counts as
+    intent. Null inherits through to env, then tier defaults. A tier's off is not
+    an operator request to disable cards.
+    """
+    configured = _chat_display_value(user_config, platform_key, "tool_progress", chat)
+    if configured is not None:
+        return _normalise("tool_progress", configured), True
+    configured = _configured_display_value(user_config, platform_key, "tool_progress")
+    if configured is not None:
+        return _normalise("tool_progress", configured), True
+    if env_mode:
+        return _normalise("tool_progress", env_mode), True
+    return resolve_display_setting(user_config, platform_key, "tool_progress"), False
 
 
 # --- Normalisation of YAML quirks (bare ``off`` → False in YAML 1.1, etc.) ---
