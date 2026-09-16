@@ -1643,6 +1643,68 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_job_max_turns(value: Any) -> Optional[Union[int, str]]:
+    """Per-job iteration-cap override: positive int, unlimited spelling, or numeric string; None /
+    empty string clears so the run follows ``agent.max_turns`` again. Stricter than config
+    resolution — an unparseable value raises here instead of silently meaning unlimited."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    from hermes_cli.config import _UNLIMITED_SPELLINGS  # single source of truth for spellings
+
+    _n = None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _UNLIMITED_SPELLINGS:
+            return "unlimited"
+        try:
+            _n = int(text)
+        except ValueError:
+            try:
+                _n = int(float(text))
+            except ValueError:
+                pass
+    elif isinstance(value, bool):
+        pass  # bool is an int subclass; True/False must never become 1/0
+    elif isinstance(value, (int, float)):
+        try:
+            _n = int(value)
+        except (ValueError, OverflowError):
+            pass
+    if _n is None:
+        raise ValueError(
+            f"Invalid max_turns {value!r}. Pass a whole number of iterations, an unlimited "
+            "spelling (none/unlimited/inf/0/-1/... — same semantics as agent.max_turns), or "
+            "leave empty to follow the global setting.")
+    return "unlimited" if _n <= 0 else _n
+
+
+def _normalize_job_run_budget_seconds(value: Any) -> Optional[float]:
+    """Per-job wall-clock budget in seconds: positive number keeps the override, None / empty
+    string clears it so the run follows ``agent.run_budget_seconds`` again. Bools and non-positive
+    values raise — turning the budget on or off stays a deliberate, auditable choice."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        value = value.strip()
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Invalid run_budget_seconds {value!r}: pass a positive number of seconds, or leave "
+            "empty to follow the global agent.run_budget_seconds.")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid run_budget_seconds {value!r}: pass a positive number of seconds, or leave "
+            "empty to follow the global agent.run_budget_seconds.") from None
+    if not seconds > 0:  # NaN-safe
+        raise ValueError(
+            f"run_budget_seconds must be positive (got {value!r}); leave empty to follow the "
+            "global agent.run_budget_seconds.")
+    return seconds
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1657,12 +1719,16 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "max_turns": _normalize_job_max_turns,
+    "run_budget_seconds": _normalize_job_run_budget_seconds,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "max_turns": _normalize_job_max_turns,
+    "run_budget_seconds": _normalize_job_run_budget_seconds,
 }
 
 
@@ -1773,6 +1839,8 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_turns: Optional[Union[int, str]] = None,
+    run_budget_seconds: Optional[Union[int, float, str]] = None,
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1784,7 +1852,8 @@ def create_job(
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
-    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
+    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
+    max_turns/run_budget_seconds: per-job budget overrides; absent = follow the agent.* globals."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1872,6 +1941,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("max_turns", f["max_turns"]), ("run_budget_seconds", f["run_budget_seconds"]),
     ):
         if value is not None:
             job[key] = value
