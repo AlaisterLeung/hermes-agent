@@ -38,6 +38,15 @@ Whichever provider a job resolves to, its provider-specific request settings (e.
 **Per-job reasoning effort.** A job can pin its own thinking level, independent of the model pin: one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. When set, it overrides both the global `agent.reasoning_effort` and per-model `agent.reasoning_overrides` for that job's runs (`none` disables thinking). Set it via `hermes cron create/edit --reasoning-effort high`; pass an empty string on edit to clear the pin and follow config again. (It is deliberately not exposed on the agent's `cronjob` tool — model configuration stays a user decision.) Levels a model doesn't support are clamped or omitted by the provider at request time — pinning `xhigh` on a model that caps at `high` runs at `high`. The pin has no effect on `no_agent` jobs (there is no LLM call to tune). Use it to run heavy scheduled analyses at `high` while cheap recurring jobs run at `minimal`, without touching your global default.
 :::
 
+:::tip
+**Per-job run budgets.** Two knobs bound what one fire may consume; each overrides its global default for this job only:
+
+- `max_turns` — the tool-calling iteration cap for one run. Overrides `agent.max_turns` (unlimited unless you set it). `hermes cron create/edit --max-turns 400` caps this job at 400 iterations; any unlimited spelling (`none`, `unlimited`, `inf`, `0`, `-1`, ...) re-opens the cap; an empty string on edit clears the override and follows config again.
+- `run_budget_seconds` — the wall-clock budget for one run, in seconds. Overrides `agent.run_budget_seconds` (default: off). It is advisory, never a hard kill: as the budget nears, the run gets a wrap-up notice on its next tool result, and stale provider calls are cut sooner. `hermes cron create/edit --run-budget-seconds 900`; an empty string clears it.
+
+Both are per-job only — there is no cron-fleet default — and user-owned like the model pin (the agent's `cronjob` tool cannot set them). An absent key follows the global setting at fire time. Neither has any effect on `no_agent` jobs (there is no LLM call to bound).
+:::
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::

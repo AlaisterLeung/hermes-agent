@@ -48,3 +48,18 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_budget_flags_on_create_and_edit():
+    parser = _build()
+    # Per-job run budgets pass through verbatim (the job store normalizes/validates).
+    ns = parser.parse_args(["cron", "edit", "j", "--max-turns", "400", "--run-budget-seconds", "900"])
+    assert ns.max_turns == "400"
+    assert ns.run_budget_seconds == "900"
+    # Empty string clears on edit; unlimited spellings round-trip as typed.
+    ns = parser.parse_args(["cron", "edit", "j", "--max-turns", "", "--run-budget-seconds", ""])
+    assert ns.max_turns == ""
+    assert ns.run_budget_seconds == ""
+    ns = parser.parse_args(["cron", "create", "30m", "--max-turns", "unlimited"])
+    assert ns.max_turns == "unlimited"
+    assert ns.run_budget_seconds is None

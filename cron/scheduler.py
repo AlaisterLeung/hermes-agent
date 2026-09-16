@@ -2116,6 +2116,31 @@ class _CronAgentSetup:
     reasoning_config: Any = None
     fallback_model: Any = None
     credential_pool: Any = None
+    run_budget_seconds: Any = None
+
+
+def _resolve_job_max_turns(job: dict, cfg: dict) -> int:
+    """Iteration cap for one fire: per-job override → ``agent.max_turns`` → legacy top-level
+    ``max_turns``. ``resolve_turn_limit()`` honors none/unlimited (sys.maxsize) and explicit 0/null."""
+    from hermes_cli.config import resolve_turn_limit
+
+    _mt = job.get("max_turns")
+    if _mt is None:
+        _mt = cfg.get("agent", {}).get("max_turns")
+    if _mt is None:
+        _mt = cfg.get("max_turns")
+    return resolve_turn_limit(_mt)
+
+
+def _resolve_job_run_budget(job: dict, cfg: dict) -> Optional[float]:
+    """Wall-clock budget (seconds) for one fire: per-job override → ``agent.run_budget_seconds``;
+    None = feature off. Same normalizer as agent init (positive float or None)."""
+    from agent.agent_init import _normalize_run_budget_seconds
+
+    _rb = job.get("run_budget_seconds")
+    if _rb is None:
+        _rb = cfg.get("agent", {}).get("run_budget_seconds")
+    return _normalize_run_budget_seconds(_rb)
 
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
@@ -2125,12 +2150,10 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup = _CronAgentSetup(model=jc.model)
     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
 
-    # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
-    from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-    _mt = _cfg.get("agent", {}).get("max_turns")
-    if _mt is None:
-        _mt = _cfg.get("max_turns")
-    setup.max_iterations = _resolve_turn_limit(_mt)
+    # Per-job budget overrides (max_turns / run_budget_seconds); each falls back to its global
+    # config knob when the job doesn't set one.
+    setup.max_iterations = _resolve_job_max_turns(job, _cfg)
+    setup.run_budget_seconds = _resolve_job_run_budget(job, _cfg)
 
     # Runtime backstop (CWE-200/522): fail closed BEFORE resolution on a provider/base_url pair
     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.
@@ -2171,6 +2194,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
+        run_budget_seconds=setup.run_budget_seconds,
         reasoning_config=setup.reasoning_config,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
