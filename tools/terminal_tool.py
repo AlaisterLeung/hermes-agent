@@ -61,6 +61,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
+    _record_unavailable_reason, terminal_backend_unavailable_reason,  # noqa: F401 — re-exported
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
@@ -180,8 +181,8 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on the selected execution 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds and fixed waits.
+Background: set background=true (returns a session_id) only for commands that must keep running independently after this tool call returns; add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. Do not start sleep, timers, cooldowns, delays, or polling loops with background=true — to wait a fixed time, run the wait as a normal foreground command with a high enough timeout. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
@@ -1456,7 +1457,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked"))
+        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
+                                    **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
         return _ApprovalVerdict(
@@ -1711,20 +1713,139 @@ def _run_foreground(
     )
 
 
+# Floor for the pre-exec guard's share of the command deadline: a short command timeout
+# (1s in tests, a few seconds in practice) must not turn the guard's own cold-start cost
+# (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
+_PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
+
+
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, _resolution: Any = None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
-    blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
-    )
-    if blocked:
-        raise _Rejected(blocked)
+    from tools.process_registry import _is_supervised_gateway_process
+
+    if _is_supervised_gateway_process():
+        from cron.lifecycle_guard import (
+            _MAX_REFERENCED_SCRIPT_BYTES,
+            contains_gateway_lifecycle_command_or_referenced_script,
+            contains_launchctl_submit_command,
+            lifecycle_scan_root_within_budget,
+        )
+        # Keep the specific launchctl diagnostic when this optional pre-scan
+        # fits the budget; the full fail-closed guard below still runs otherwise.
+        if (
+            lifecycle_scan_root_within_budget(command)
+            and contains_launchctl_submit_command(command)
+        ):
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: launchctl submit/bootstrap registers a persistent "
+                    "KeepAlive job and is unsafe from inside the gateway process. "
+                    "Use Hermes cron for one-shot delayed work, or install an "
+                    "explicit LaunchAgent from a separate shell."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
+        selected_target = (
+            _resolution.target
+            if _resolution is not None and getattr(_resolution, "named", False)
+            else None
+        )
+        guard_cwd_base = get_session_cwd(
+            session_key, selected_target, _resolution=_resolution,
+        )
+        if guard_cwd_base is None:
+            guard_cwd_base = getattr(env, "cwd", None) or cwd
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=guard_cwd_base,
+            session_key=session_key,
+            env_type=env_type,
+            _resolution=_resolution,
+        )
+
+        def _read_script_in_env(
+            script_path: str,
+        ) -> Optional[str] | tuple[Optional[str], bool]:
+            """Read a script without crossing the selected target boundary.
+
+            Host filesystem reads are allowed only for a local target. Other
+            targets, and local-read misses, use the selected environment at
+            ``guard_cwd``. All reads are bounded and NUL-bearing binary content
+            is skipped before it can re-enter the lifecycle-command scanner.
+            """
+            if env is None:
+                return None
+            if _resolution is None or _resolution.backend == "local":
+                try:
+                    from cron.lifecycle_guard import _read_referenced_script
+
+                    local_path = Path(script_path).expanduser()
+                    if not local_path.is_absolute():
+                        local_path = Path(guard_cwd) / local_path
+                    local_result = _read_referenced_script(local_path)
+                    if local_result[0] is not None or local_result[1]:
+                        return local_result
+                except Exception:
+                    return None
+            # Remote / sandboxed backend: read via the environment's shell,
+            # bounded at the source with `head -c` so an oversized file (a 166MB
+            # ELF pinned the tool thread 30+ min on a superlinear shlex scan)
+            # never crosses the wire; one byte over budget fails closed in
+            # lifecycle_guard. `< path` keeps leading-dash paths out of argv.
+            try:
+                result = env.execute(
+                    f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
+                    f"< {shlex.quote(script_path)}",
+                    cwd=guard_cwd,
+                )
+                if isinstance(result, dict):
+                    returncode = result.get(
+                        "returncode", result.get("exit_code", -1)
+                    )
+                    output = result.get("output", "")
+                else:
+                    returncode = getattr(
+                        result,
+                        "returncode",
+                        getattr(result, "exit_code", -1),
+                    )
+                    output = getattr(result, "output", "")
+                if returncode == 0:
+                    if output and "\x00" in output:
+                        # Binary content from a remote read: skip for the
+                        # same reason as the local branch above (#77703).
+                        return None
+                    return output
+            except Exception:
+                pass
+            return None
+
+        if contains_gateway_lifecycle_command_or_referenced_script(
+            command,
+            cwd=guard_cwd,
+            read_remote_script=_read_script_in_env,
+        ):
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: command or referenced script cannot restart, stop, or "
+                    "uninstall the gateway from inside the gateway process. The gateway would "
+                    "kill this command before it could complete (SIGTERM propagates "
+                    "to child processes). Run `hermes gateway restart` from a "
+                    "separate shell outside the running gateway."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
     if workdir:
         workdir_error = _validate_workdir(workdir)
         if workdir_error:
@@ -1824,6 +1945,15 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        # Pre-exec guards share the command's own wall-clock deadline (#111922):
+        # resolve the plan up front so the bounded guard below can size against
+        # its effective timeout. The per-target resolution that follows refines
+        # the values the fork flow actually executes with.
+        plan = _plan_execution(
+            command, task_id=task_id, timeout=timeout, background=background,
+            _host_local=_host_local,
+        )
 
         # Resolve configuration per call. Named targets read merged config
         # directly; legacy flat config keeps the existing env-driven path.
@@ -2118,122 +2248,39 @@ def terminal_tool(
         # the gateway process — the restart SIGTERMs this subprocess before it can
         # finish; force=True can't help. Gate on the SUPERVISED-gateway probe: the
         # raw _HERMES_GATEWAY marker leaks into serve/CLI/web-server importers.
-        from tools.process_registry import _is_supervised_gateway_process
+        #
+        # The supervised-gateway identity probe ends in a kernel process query
+        # (psutil create_time) that has wedged for the better part of an hour on
+        # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
+        # chain ran ahead of it, so the tool call never returned and the cron
+        # slot stayed occupied (#111922). Share the command's own deadline. A
+        # guard that never rendered a verdict fails CLOSED: these checks apply
+        # unconditionally (``force`` cannot bypass them), so the command is
+        # refused with a retryable error instead of running unguarded.
+        from agent.deadline import run_bounded_sync
+        from tools.interrupt import acting_for_tid
 
-        if _is_supervised_gateway_process():
-            from cron.lifecycle_guard import (
-                _MAX_REFERENCED_SCRIPT_BYTES,
-                contains_gateway_lifecycle_command_or_referenced_script,
-                contains_launchctl_submit_command,
-                lifecycle_scan_root_within_budget,
+        # The guard chain runs on the deadline worker; keep it answerable to /stop
+        # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
+        guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+        _acting_token = acting_for_tid.set(threading.current_thread().ident)
+        try:
+            bounded_guard = run_bounded_sync(
+                lambda: _pre_exec_block(
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+                    session_key=session_key, _resolution=target_resolution,
+                ),
+                guard_timeout,
+                label="terminal.pre-exec-guard",
             )
-            # Keep the specific launchctl diagnostic when this optional pre-scan
-            # fits the budget; the full fail-closed guard below still runs otherwise.
-            if (
-                lifecycle_scan_root_within_budget(command)
-                and contains_launchctl_submit_command(command)
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: launchctl submit/bootstrap registers a persistent "
-                        "KeepAlive job and is unsafe from inside the gateway process. "
-                        "Use Hermes cron for one-shot delayed work, or install an "
-                        "explicit LaunchAgent from a separate shell."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-            selected_target = (
-                target_resolution.target if target_resolution.named else None
-            )
-            guard_cwd_base = get_session_cwd(
-                session_key, selected_target, _resolution=target_resolution,
-            )
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=guard_cwd_base,
-                session_key=session_key,
-                env_type=env_type,
-                _resolution=target_resolution,
-            )
-
-            def _read_script_in_env(
-                script_path: str,
-            ) -> Optional[str] | tuple[Optional[str], bool]:
-                """Read a script without crossing the selected target boundary.
-
-                Host filesystem reads are allowed only for a local target. Other
-                targets, and local-read misses, use the selected environment at
-                ``guard_cwd``. All reads are bounded and NUL-bearing binary content
-                is skipped before it can re-enter the lifecycle-command scanner.
-                """
-                if env is None:
-                    return None
-                if target_resolution.backend == "local":
-                    try:
-                        from cron.lifecycle_guard import _read_referenced_script
-
-                        local_path = Path(script_path).expanduser()
-                        if not local_path.is_absolute():
-                            local_path = Path(guard_cwd) / local_path
-                        local_result = _read_referenced_script(local_path)
-                        if local_result[0] is not None or local_result[1]:
-                            return local_result
-                    except Exception:
-                        return None
-                # Remote / sandboxed backend: read via the environment's shell,
-                # bounded at the source with `head -c` so an oversized file (a 166MB
-                # ELF pinned the tool thread 30+ min on a superlinear shlex scan)
-                # never crosses the wire; one byte over budget fails closed in
-                # lifecycle_guard. `< path` keeps leading-dash paths out of argv.
-                try:
-                    result = env.execute(
-                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}",
-                        cwd=guard_cwd,
-                    )
-                    if isinstance(result, dict):
-                        returncode = result.get(
-                            "returncode", result.get("exit_code", -1)
-                        )
-                        output = result.get("output", "")
-                    else:
-                        returncode = getattr(
-                            result,
-                            "returncode",
-                            getattr(result, "exit_code", -1),
-                        )
-                        output = getattr(result, "output", "")
-                    if returncode == 0:
-                        if output and "\x00" in output:
-                            # Binary content from a remote read: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
-                except Exception:
-                    pass
-                return None
-
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
+        finally:
+            acting_for_tid.reset(_acting_token)
+        if bounded_guard.timed_out:
+            raise _Rejected(_error_json(
+                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
+                "(process-identity probe wedged); the command was not run. Retry the call.",
+                status="error",
+            ))
 
         # Validate before the source guard resolves an explicit workdir.
         if workdir:
@@ -2923,6 +2970,8 @@ def terminal_tool(
 
             return json.dumps(result_dict, ensure_ascii=False)
 
+    except _Rejected as r:
+        return r.result_json
     except EnvironmentConnectionError as e:
         # Infrastructure/connection-class failure (SSH host down, Docker daemon
         # unreachable), distinct from a command's nonzero exit. ``terminal.degraded_mode``:
@@ -2978,6 +3027,7 @@ def _check_terminal_config_requirements(config: Dict[str, Any]) -> bool:
         return checker(config)
     except Exception as e:
         logger.error("Terminal requirements check failed: %s", e, exc_info=True)
+        _record_unavailable_reason(f"the requirements check failed: {e}")
         return False
 
 

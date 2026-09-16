@@ -999,7 +999,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 # sees the pixels directly on its next turn.
 
 
-def _profile_rejects_tool_media(provider: str) -> bool:
+def _profile_rejects_tool_media(provider: str, model: str = "") -> bool:
     """Hard veto: the provider's ``ProviderProfile`` declares
     ``supports_vision_tool_messages=False`` — images are accepted in user
     messages but list-type tool-result content is rejected with 400
@@ -1008,37 +1008,18 @@ def _profile_rejects_tool_media(provider: str) -> bool:
     and the image never enters context (#89981).
     """
     try:
-        from providers import get_provider_profile
-        profile = get_provider_profile(str(provider or "").strip().lower())
-        return profile is not None and profile.supports_vision_tool_messages is False
+        from providers import routed_model_rejects_vision_tool_messages
+        return routed_model_rejects_vision_tool_messages(provider, model)
     except Exception:
         return False
 
 
 def _supports_media_in_tool_results(provider: str, model: str) -> bool:
-    """Whether the given provider+model combination accepts image content
-    inside a tool-result message.
-
-    Providers covered today (per spec docs verified Apr-2026):
-
-      * Anthropic Messages API (``anthropic`` provider, plus aggregators that
-        proxy Claude — ``openrouter``, ``nous``, ``vertex``, ``bedrock``):
-        ``tool_result`` blocks accept ``image`` content blocks.
-      * OpenAI Chat Completions: tool messages accept array content with
-        ``image_url`` parts.
-      * OpenAI Responses (``openai-codex``): ``function_call_output.output``
-        accepts an array of ``input_text``/``input_image`` items.
-      * Gemini 3 (and proxied via aggregators): supports multimodal tool
-        results. Older Gemini does NOT.
-
-    For unknown / legacy providers we conservatively return False — the
-    caller falls back to the legacy aux-LLM text path.  The check is relaxed
-    when the provider's ``ProviderProfile`` declares ``supports_vision=True``.
-    """
-    if not isinstance(provider, str):
-        return False
-    p = provider.strip().lower()
-    if not p or _profile_rejects_tool_media(p):
+    """Whether provider+model accepts image content inside a tool-result message. Unknown
+    providers are False (caller falls back to aux-LLM text) unless their ``ProviderProfile``
+    declares ``supports_vision``; ``supports_vision_tool_messages=False`` is a hard veto."""
+    p = provider.strip().lower() if isinstance(provider, str) else ""
+    if not p or _profile_rejects_tool_media(p, model):
         return False
 
 # Aggregators route to multiple vendors — assume support (users there pick
@@ -1106,7 +1087,7 @@ def _should_use_native_vision_fast_path() -> bool:
         # The profile veto applies ahead of the capability lookup too: a
         # model marked vision-capable by models.dev / custom_providers must
         # not re-open the multimodal-envelope route the profile rejects.
-        if _profile_rejects_tool_media(provider):
+        if _profile_rejects_tool_media(provider, model):
             return False
         return (
             _supports_media_in_tool_results(provider, model)
