@@ -1923,7 +1923,7 @@ def test_gateway_script_guard_reads_selected_named_target_cwd(
 def test_checkpoint_alias_flip_pins_dispatch_generation(monkeypatch, tmp_path):
     from agent import tool_executor
     import tools.execution_targets as targets_mod
-    from tools.file_tools import write_file_tool
+    from tools.file_tools import read_file_tool, write_file_tool
 
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -1934,6 +1934,10 @@ def test_checkpoint_alias_flip_pins_dispatch_generation(monkeypatch, tmp_path):
     config_b = _named_config({"dev": str(second)}, default="dev")
     targets_mod.set_execution_target_config_source(config_a)
     checkpoints = []
+    # Seed the whole-file write baseline the stale-overwrite guard requires
+    # (#65604) — reads don't checkpoint, so the flip below still rides the write.
+    read_result = read_file_tool("sample.txt", task_id="target-race", target="dev")
+    assert "before" in read_result
 
     class CheckpointManager:
         enabled = True

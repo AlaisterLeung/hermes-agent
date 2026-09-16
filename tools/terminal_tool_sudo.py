@@ -565,14 +565,10 @@ def _transform_sudo_command(
     ) and not _in_delegated_child_context()
     if not has_configured_password and not sudo_password and should_prompt_for_sudo:
         # sudoers NOPASSWD must not be forced through the prompt or the -S pipe. The probe is
-        # a round trip on the selected backend (an ssh exec for SSH), so it only runs when a
-        # prompt would otherwise fire: headless callers end up at ``(command, None)`` either
+        # a round trip on the selected backend (an ssh exec for SSH), so it only runs when the
+        # caller supplied a checker: headless callers end up at ``(command, None)`` either
         # way. Re-probed every call so an expired sudo timestamp cannot silently block.
-        nopasswd_check = (
-            sudo_nopasswd_check if sudo_nopasswd_check is not None
-            else _sudo_nopasswd_works
-        )
-        if nopasswd_check():
+        if sudo_nopasswd_check is not None and sudo_nopasswd_check():
             return command, None
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45, command=command)
         if sudo_password:

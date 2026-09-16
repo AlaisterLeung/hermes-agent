@@ -889,6 +889,14 @@ def read_file_tool(
     → negative-result cache → dedup stub → real read.
     """
     try:
+        # NT/device-namespace refusal on the RAW model-supplied string — before
+        # ANY resolution: the execution-target lookup below loads config and
+        # resolves paths, and resolving an NT-namespace path is itself the
+        # NTLM-leak trigger.
+        nt_err = get_nt_namespace_error(path, verb="Read")
+        if nt_err:
+            return tool_error(nt_err)
+
         from tools.execution_targets import resolve_execution_target
 
         pinned_file_ops = None
@@ -926,14 +934,6 @@ def read_file_tool(
             task_id, selected_target, _resolution=resolution,
         )
         offset, limit = normalize_read_pagination(offset, limit)
-
-        # On the RAW model-supplied string, before any expanduser()/resolve():
-        # on Windows resolving \??\UNC\host\share already sends SMB auth (NTLM
-        # leak); on POSIX the task-base join would anchor the prefix as a
-        # relative segment and hide it from every resolved-path check below.
-        nt_err = get_nt_namespace_error(path, verb="Read")
-        if nt_err:
-            return tool_error(nt_err)
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that hang the process (infinite output/blocking input); pure path check.
@@ -1635,6 +1635,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     the schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    # NT/device-namespace refusal on the RAW string — before ANY resolution
+    # (the target lookup below loads config and resolves paths).
+    nt_err = get_nt_namespace_error(path, verb="Write")
+    if nt_err:
+        return tool_error(nt_err)
     try:
         from tools.execution_targets import resolve_execution_target
         resolution = resolve_execution_target(target)
@@ -1810,6 +1815,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    # NT/device-namespace refusal on the RAW string — before ANY resolution
+    # (the target lookup below loads config and resolves paths).
+    if path:
+        nt_err = get_nt_namespace_error(path, verb="Write")
+        if nt_err:
+            return tool_error(nt_err)
     try:
         from tools.execution_targets import resolve_execution_target
         resolution = resolve_execution_target(target)
@@ -2057,6 +2068,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 task_id: str = "default", execution_target: str = None) -> str:
     """Search for content or files."""
     try:
+        # NT/device-namespace refusal on the RAW string — before ANY resolution
+        # (the target lookup below loads config and resolves paths).
+        nt_err = get_nt_namespace_error(path, verb="Search")
+        if nt_err:
+            return tool_error(nt_err)
+
         from tools.execution_targets import resolve_execution_target
 
         resolution = resolve_execution_target(execution_target)
@@ -2096,11 +2113,6 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
-        # Raw string before _resolve_path_for_task: resolving is the NTLM-leak
-        # trigger and the task-base join would hide the prefix (see read_file_tool).
-        nt_err = get_nt_namespace_error(path, verb="Search")
-        if nt_err:
-            return tool_error(nt_err)
         try:
             resolved_path = _resolve_path_for_task(
                 path, task_id, selected_target, _resolution=resolution,

@@ -1656,61 +1656,322 @@ def _yield_kwargs(command: str, **ctx) -> dict:
 
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
-    task_id: Optional[str], session_id: Optional[str], session_key: str,
-    workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    target_resolution: Any, cwd: Optional[str], task_id: Optional[str],
+    session_id: Optional[str], session_key: str, workdir: Optional[str],
+    approval_note: Optional[str], clear_interrupt: bool,
+    effective_base_task_id: Optional[str], backend_task_id: Optional[str],
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
+    env_type = plan.env_type
+    effective_timeout = plan.effective_timeout
+    effective_task_id = plan.effective_task_id
+
+    # Run foreground command with retry logic
     max_retries = 3
-    env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
+    retry_count = 0
+    result = None
+    command_cwd = None
 
     # Clean interrupt slate for an approved command, ONCE before the retry
-    # loop: drop a stale bit that landed during the approval-wait so it
-    # can't SIGINT the just-approved run. Do NOT re-clear inside the loop —
-    # a genuine interrupt during the backoff sleep must survive and abort
-    # the next attempt (rc 130).
+    # loop: drop the stale approval-wait bit so it can't SIGINT the run. Do NOT
+    # re-clear in the loop — a genuine interrupt must survive to abort (-> 130).
     if clear_interrupt:
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
-    for retry_count in range(max_retries + 1):
+    while retry_count <= max_retries:
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+                env_type=env_type,
+                _resolution=target_resolution,
             )
-            # bounded_capture: model-facing output keeps a head/tail window
-            # while streaming so a verbose command can't OOM the gateway;
-            # internal env.execute() consumers stay unbounded.
-            result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
-            )
-            break
+            execute_kwargs = {
+                "timeout": effective_timeout,
+                "cwd": command_cwd,
+                # Foreground model-facing output: cap retention while streaming
+                # (head/tail window) so a verbose command can't OOM the gateway
+                # before truncation (#64435). Internal env.execute() stays unbounded.
+                "bounded_capture": True,
+                **_yield_kwargs(
+                    command, env_type=env_type, cwd=command_cwd,
+                    effective_task_id=effective_task_id, task_id=task_id,
+                    session_key=session_key,
+                ),
+            }
+            with _scoped_sudo_execution(
+                target_resolution.target,
+                target_resolution.backend,
+                named=target_resolution.named,
+                sudo_password=target_resolution.config.get("sudo_password"),
+                target_scope=(
+                    target_resolution.security_scope
+                    if target_resolution.named else ""
+                ),
+            ):
+                result = env.execute(command, **execute_kwargs)
         except Exception as e:
-            if "timeout" in str(e).lower():
-                return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124)
+            error_str = str(e).lower()
+            if "timeout" in error_str:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 124,
+                    "error": f"Command timed out after {effective_timeout} seconds"
+                }, ensure_ascii=False)
+            
             # Retry on transient errors
             if retry_count < max_retries:
-                wait_time = 2 ** (retry_count + 1)
+                retry_count += 1
+                wait_time = 2 ** retry_count
                 logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                               wait_time, retry_count + 1, max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
+                               wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                 time.sleep(wait_time)
                 continue
+            
             logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                         max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
-            return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
+                         max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _redact_terminal_error_text(
+                    f"Command execution failed: {type(e).__name__}: {e}"
+                )
+            }, ensure_ascii=False)
+        
+        # Got a result
+        break
 
-    if result.get("yielded_session_id"):
+    if (result or {}).get("yielded_session_id"):
+        # Redirected mid-command: the process now runs as a registry-tracked
+        # notify-on-complete session — return without killing it or post-processing.
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
         }, ensure_ascii=False)
-    return finalize_foreground_result(
-        command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
-        task_id=task_id, session_id=session_id, session_key=session_key, workdir=workdir,
-        command_cwd=command_cwd, approval_note=approval_note,
+
+    # Dual-write (cwd rearch step 1): record the env's post-command cwd
+    # under the session key so the durable record never depends on the
+    # shared env surviving. Skip when a transient per-command ``workdir``
+    # override is set, and when the command reported no cwd (interrupted/
+    # killed: env.cwd may hold another session's dir — silent re-homing).
+    observed_cwd = None
+    if (result or {}).get("cwd_observed"):
+        # New/current environments return the CWD observed by THIS command;
+        # env.cwd is shared mutable compat state that may belong to a concurrent
+        # command, so keep the fallback for providers on the older contract.
+        observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
+    if not workdir and observed_cwd:
+        record_session_cwd(
+            session_key, observed_cwd,
+            _resolution=target_resolution,
+        )
+
+    # Extract output
+    output = result.get("output", "")
+    returncode = result.get("returncode", 0)
+    # Spill metadata from the bounded collector: present only when
+    # output overflowed the capture window (see _wait_for_process).
+    spill_total_chars = result.get("output_total_chars")
+    spill_file_path = result.get("full_output_path")
+
+    # Add helpful message for sudo failures in messaging context
+    output = _handle_sudo_failure(output, env_type)
+
+    sudo_auth_failed = _sudo_wrong_password_failure(output)
+    sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
+        command,
+        output,
+        target_resolution.target,
+        target_resolution.backend,
+        (
+            target_resolution.security_scope
+            if target_resolution.named else ""
+        ),
     )
+    if sudo_cache_cleared:
+        has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+        can_reprompt = (
+            has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE")
+        ) and not _in_delegated_child_context()
+        if can_reprompt:
+            output += (
+                "\n\n⚠️ Sudo authentication failed — cached password "
+                "cleared. You will be prompted again on the next sudo "
+                "command."
+            )
+
+    # Foreground output canonicalization seam: BaseEnvironment already bounded
+    # the capture; plugins may replace that string (fail-open, first valid
+    # return wins), still subject to the final output limit below.
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        hook_kwargs = {
+            "command": command,
+            "output": output,
+            "returncode": returncode,
+            "task_id": effective_base_task_id or "",
+            "env_type": env_type,
+        }
+        if target_resolution.named:
+            hook_kwargs.update({
+                "execution_target": target_resolution.target,
+                "execution_backend": target_resolution.backend,
+            })
+        hook_results = invoke_hook(
+            "transform_terminal_output",
+            **hook_kwargs,
+        )
+        for hook_result in hook_results:
+            if isinstance(hook_result, str):
+                output = hook_result
+                break
+    except Exception:
+        pass
+    
+    # Truncate output if too long, keeping both head and tail
+    from tools.tool_output_limits import get_max_bytes
+    MAX_OUTPUT_CHARS = get_max_bytes()
+    if len(output) > MAX_OUTPUT_CHARS:
+        head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
+        tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
+        omitted = len(output) - head_chars - tail_chars
+        truncated_notice = (
+            f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            f"out of {len(output)} total] ...\n\n"
+        )
+        output = output[:head_chars] + truncated_notice + output[-tail_chars:]
+
+    # Strip ANSI escape sequences so the model never sees terminal
+    # formatting — prevents it from copying escapes into file writes.
+    from tools.ansi_strip import strip_ansi
+    output = strip_ansi(output)
+
+    # Redact secrets from command output: source/config dumps (MAX_TOKENS=100,
+    # "apiKey" fixtures, postgresql:// f-strings) skip the ENV/JSON/template
+    # passes (code_file=True) to avoid false positives; env-dump commands
+    # (env/printenv/set/export/declare) DO run the ENV pass (code_file=False) —
+    # a KEY=value credential dump. See issue #43025; real prefixes mask both.
+    from agent.redact import redact_terminal_output
+    output = redact_terminal_output(output.strip(), command) if output else ""
+
+    # Interpret non-zero exit codes that aren't real errors
+    # (e.g. grep=1 means "no matches", diff=1 means "files differ")
+    exit_note = _interpret_exit_code(command, returncode)
+
+    # Output-pattern failure hints: map well-known shapes (module-not-found,
+    # gh field drift, merge conflicts) to one hint. See tools/terminal_hints.py.
+    failure_hint = None
+    if returncode != 0 and not exit_note:
+        try:
+            from tools.terminal_hints import annotate_failure
+            failure_hint = annotate_failure(command, returncode, output)
+        except Exception:
+            failure_hint = None
+    elif returncode == 0:
+        # Masked-success backstop: pipelines (`cargo build | tail -20`) return
+        # the last command's exit 0 even when the build failed. If the shape can
+        # mask an upstream failure and output shows it, warn — advisory only.
+        try:
+            from tools.terminal_hints import annotate_masked_success
+            failure_hint = annotate_masked_success(command, output)
+        except Exception:
+            failure_hint = None
+
+    result_dict = {
+        "output": output,
+        "exit_code": returncode,
+        "error": None,
+    }
+    # cwd echo: when the command changed the session's working directory
+    # (cd, pushd, ...), tell the model where it ended up — 60% of terminal
+    # calls carry defensive 'cd X && ' because cwd is invisible. Gated on
+    # the observation flag: without it an interrupted command echoes the
+    # shared env's leftover cwd (possibly another session's).
+    result_dict.update(target_resolution.metadata(
+        cwd=command_cwd if target_resolution.named else None,
+    ))
+    try:
+        post_cwd = observed_cwd
+        if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
+            result_dict["cwd"] = str(post_cwd)
+    except Exception:
+        pass
+    if spill_file_path:
+        try:
+            _sp = Path(spill_file_path)
+            raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
+            from tools.spill_safety import write_text_exclusive
+
+            # Rewrite in place via lstat-checked unlink + exclusive create so the
+            # redacted copy can't be diverted through a planted symlink.
+            write_text_exclusive(
+                _sp,
+                redact_terminal_output(strip_ansi(raw_spill), command),
+                private=True,
+                overwrite=True,
+                errors="replace",
+            )
+            result_dict["output_total_chars"] = spill_total_chars
+            result_dict["full_output_path"] = spill_file_path
+            result_dict["truncation_note"] = (
+                "Output exceeded the capture window (head+tail shown). "
+                f"Full output ({spill_total_chars:,} chars) saved to "
+                f"{spill_file_path} — search it with search_files or page it "
+                "with read_file instead of re-running the command."
+            )
+        except Exception:
+            logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
+            try:
+                Path(spill_file_path).unlink()
+            except OSError:
+                pass
+    if target_resolution.backend == "local":
+        try:
+            from agent.verification_evidence import record_terminal_result
+
+            evidence = record_terminal_result(
+                command=command,
+                cwd=command_cwd,
+                session_id=(
+                    session_id or task_id or backend_task_id or "default"
+                ),
+                exit_code=returncode,
+                output=output,
+            )
+            if evidence:
+                result_dict["verification_evidence"] = {
+                    "status": evidence.get("status"),
+                    "kind": evidence.get("kind"),
+                    "scope": evidence.get("scope"),
+                    "canonical_command": evidence.get("canonical_command"),
+                }
+        except Exception:
+            logger.debug(
+                "verification evidence recording failed", exc_info=True,
+            )
+    if approval_note:
+        # Treat rc=130 as an interrupt only when the executor's marker is
+        # present — `bash -c 'exit 130'` exits 130 with no marker and must
+        # not be relabelled a user interrupt in the audit note.
+        if returncode == 130 and "[Command interrupted]" in output:
+            # Interrupted by a genuine Stop: keep the audit trail but never imply
+            # success — "...approved by the user." must not co-occur with rc=130.
+            result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
+        else:
+            result_dict["approval"] = approval_note
+    if exit_note:
+        result_dict["exit_code_meaning"] = exit_note
+    if failure_hint:
+        result_dict["hint"] = failure_hint
+    if sudo_auth_failed:
+        result_dict["sudo_auth_failed"] = True
+    if sudo_cache_cleared:
+        result_dict["sudo_cache_cleared"] = True
+
+    return json.dumps(result_dict, ensure_ascii=False)
 
 
 # Floor for the pre-exec guard's share of the command deadline: a short command timeout
@@ -2663,312 +2924,15 @@ def terminal_tool(
                     )
                 }, ensure_ascii=False)
         else:
-            # Run foreground command with retry logic
-            max_retries = 3
-            retry_count = 0
-            result = None
-            command_cwd = None
-
-            # Clean interrupt slate for an approved command, ONCE before the retry
-            # loop: drop the stale approval-wait bit so it can't SIGINT the run. Do NOT
-            # re-clear in the loop — a genuine interrupt must survive to abort (-> 130).
-            if _approved_run:
-                from tools.interrupt import clear_current_thread_interrupt
-                clear_current_thread_interrupt()
-
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                        env_type=env_type,
-                        _resolution=target_resolution,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while streaming
-                        # (head/tail window) so a verbose command can't OOM the gateway
-                        # before truncation (#64435). Internal env.execute() stays unbounded.
-                        "bounded_capture": True,
-                        **_yield_kwargs(
-                            command, env_type=env_type, cwd=command_cwd,
-                            effective_task_id=effective_task_id, task_id=task_id,
-                            session_key=session_key,
-                        ),
-                    }
-                    with _scoped_sudo_execution(
-                        target_resolution.target,
-                        target_resolution.backend,
-                        named=target_resolution.named,
-                        sudo_password=target_resolution.config.get("sudo_password"),
-                        target_scope=(
-                            target_resolution.security_scope
-                            if target_resolution.named else ""
-                        ),
-                    ):
-                        result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
-                        return json.dumps({
-                            "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": _redact_terminal_error_text(
-                            f"Command execution failed: {type(e).__name__}: {e}"
-                        )
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
-
-            if (result or {}).get("yielded_session_id"):
-                # Redirected mid-command: the process now runs as a registry-tracked
-                # notify-on-complete session — return without killing it or post-processing.
-                return json.dumps({
-                    "output": result.get("output", ""), "exit_code": None, "error": None,
-                    "status": "yielded_to_background", "session_id": result["yielded_session_id"],
-                    "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
-                }, ensure_ascii=False)
-
-            # Dual-write (cwd rearch step 1): record the env's post-command cwd
-            # under the session key so the durable record never depends on the
-            # shared env surviving. Skip when a transient per-command ``workdir``
-            # override is set, and when the command reported no cwd (interrupted/
-            # killed: env.cwd may hold another session's dir — silent re-homing).
-            observed_cwd = None
-            if (result or {}).get("cwd_observed"):
-                # New/current environments return the CWD observed by THIS command;
-                # env.cwd is shared mutable compat state that may belong to a concurrent
-                # command, so keep the fallback for providers on the older contract.
-                observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
-            if not workdir and observed_cwd:
-                record_session_cwd(
-                    session_key, observed_cwd,
-                    _resolution=target_resolution,
-                )
-
-            # Extract output
-            output = result.get("output", "")
-            returncode = result.get("returncode", 0)
-            # Spill metadata from the bounded collector: present only when
-            # output overflowed the capture window (see _wait_for_process).
-            spill_total_chars = result.get("output_total_chars")
-            spill_file_path = result.get("full_output_path")
-
-            # Add helpful message for sudo failures in messaging context
-            output = _handle_sudo_failure(output, env_type)
-
-            sudo_auth_failed = _sudo_wrong_password_failure(output)
-            sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
-                command,
-                output,
-                target_resolution.target,
-                target_resolution.backend,
-                (
-                    target_resolution.security_scope
-                    if target_resolution.named else ""
-                ),
+            return _run_foreground(
+                command, env, plan,
+                target_resolution=target_resolution, cwd=cwd,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=workdir, approval_note=approval_note,
+                clear_interrupt=_approved_run,
+                effective_base_task_id=effective_base_task_id,
+                backend_task_id=backend_task_id,
             )
-            if sudo_cache_cleared:
-                has_sudo_prompt_callback = _get_sudo_password_callback() is not None
-                can_reprompt = (
-                    has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE")
-                ) and not _in_delegated_child_context()
-                if can_reprompt:
-                    output += (
-                        "\n\n⚠️ Sudo authentication failed — cached password "
-                        "cleared. You will be prompted again on the next sudo "
-                        "command."
-                    )
-
-            # Foreground output canonicalization seam: BaseEnvironment already bounded
-            # the capture; plugins may replace that string (fail-open, first valid
-            # return wins), still subject to the final output limit below.
-            try:
-                from hermes_cli.lifecycle import invoke_hook
-                hook_kwargs = {
-                    "command": command,
-                    "output": output,
-                    "returncode": returncode,
-                    "task_id": effective_base_task_id or "",
-                    "env_type": env_type,
-                }
-                if target_resolution.named:
-                    hook_kwargs.update({
-                        "execution_target": target_resolution.target,
-                        "execution_backend": target_resolution.backend,
-                    })
-                hook_results = invoke_hook(
-                    "transform_terminal_output",
-                    **hook_kwargs,
-                )
-                for hook_result in hook_results:
-                    if isinstance(hook_result, str):
-                        output = hook_result
-                        break
-            except Exception:
-                pass
-            
-            # Truncate output if too long, keeping both head and tail
-            from tools.tool_output_limits import get_max_bytes
-            MAX_OUTPUT_CHARS = get_max_bytes()
-            if len(output) > MAX_OUTPUT_CHARS:
-                head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
-                tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
-                omitted = len(output) - head_chars - tail_chars
-                truncated_notice = (
-                    f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
-                )
-                output = output[:head_chars] + truncated_notice + output[-tail_chars:]
-
-            # Strip ANSI escape sequences so the model never sees terminal
-            # formatting — prevents it from copying escapes into file writes.
-            from tools.ansi_strip import strip_ansi
-            output = strip_ansi(output)
-
-            # Redact secrets from command output: source/config dumps (MAX_TOKENS=100,
-            # "apiKey" fixtures, postgresql:// f-strings) skip the ENV/JSON/template
-            # passes (code_file=True) to avoid false positives; env-dump commands
-            # (env/printenv/set/export/declare) DO run the ENV pass (code_file=False) —
-            # a KEY=value credential dump. See issue #43025; real prefixes mask both.
-            from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
-
-            # Interpret non-zero exit codes that aren't real errors
-            # (e.g. grep=1 means "no matches", diff=1 means "files differ")
-            exit_note = _interpret_exit_code(command, returncode)
-
-            # Output-pattern failure hints: map well-known shapes (module-not-found,
-            # gh field drift, merge conflicts) to one hint. See tools/terminal_hints.py.
-            failure_hint = None
-            if returncode != 0 and not exit_note:
-                try:
-                    from tools.terminal_hints import annotate_failure
-                    failure_hint = annotate_failure(command, returncode, output)
-                except Exception:
-                    failure_hint = None
-            elif returncode == 0:
-                # Masked-success backstop: pipelines (`cargo build | tail -20`) return
-                # the last command's exit 0 even when the build failed. If the shape can
-                # mask an upstream failure and output shows it, warn — advisory only.
-                try:
-                    from tools.terminal_hints import annotate_masked_success
-                    failure_hint = annotate_masked_success(command, output)
-                except Exception:
-                    failure_hint = None
-
-            result_dict = {
-                "output": output,
-                "exit_code": returncode,
-                "error": None,
-            }
-            # cwd echo: when the command changed the session's working directory
-            # (cd, pushd, ...), tell the model where it ended up — 60% of terminal
-            # calls carry defensive 'cd X && ' because cwd is invisible. Gated on
-            # the observation flag: without it an interrupted command echoes the
-            # shared env's leftover cwd (possibly another session's).
-            result_dict.update(target_resolution.metadata(
-                cwd=command_cwd if target_resolution.named else None,
-            ))
-            try:
-                post_cwd = observed_cwd
-                if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
-                    result_dict["cwd"] = str(post_cwd)
-            except Exception:
-                pass
-            if spill_file_path:
-                try:
-                    _sp = Path(spill_file_path)
-                    raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
-                    from tools.spill_safety import write_text_exclusive
-
-                    # Rewrite in place via lstat-checked unlink + exclusive create so the
-                    # redacted copy can't be diverted through a planted symlink.
-                    write_text_exclusive(
-                        _sp,
-                        redact_terminal_output(strip_ansi(raw_spill), command),
-                        private=True,
-                        overwrite=True,
-                        errors="replace",
-                    )
-                    result_dict["output_total_chars"] = spill_total_chars
-                    result_dict["full_output_path"] = spill_file_path
-                    result_dict["truncation_note"] = (
-                        "Output exceeded the capture window (head+tail shown). "
-                        f"Full output ({spill_total_chars:,} chars) saved to "
-                        f"{spill_file_path} — search it with search_files or page it "
-                        "with read_file instead of re-running the command."
-                    )
-                except Exception:
-                    logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
-                    try:
-                        Path(spill_file_path).unlink()
-                    except OSError:
-                        pass
-            if target_resolution.backend == "local":
-                try:
-                    from agent.verification_evidence import record_terminal_result
-
-                    evidence = record_terminal_result(
-                        command=command,
-                        cwd=command_cwd,
-                        session_id=(
-                            session_id or task_id or backend_task_id or "default"
-                        ),
-                        exit_code=returncode,
-                        output=output,
-                    )
-                    if evidence:
-                        result_dict["verification_evidence"] = {
-                            "status": evidence.get("status"),
-                            "kind": evidence.get("kind"),
-                            "scope": evidence.get("scope"),
-                            "canonical_command": evidence.get("canonical_command"),
-                        }
-                except Exception:
-                    logger.debug(
-                        "verification evidence recording failed", exc_info=True,
-                    )
-            if approval_note:
-                # Treat rc=130 as an interrupt only when the executor's marker is
-                # present — `bash -c 'exit 130'` exits 130 with no marker and must
-                # not be relabelled a user interrupt in the audit note.
-                if returncode == 130 and "[Command interrupted]" in output:
-                    # Interrupted by a genuine Stop: keep the audit trail but never imply
-                    # success — "...approved by the user." must not co-occur with rc=130.
-                    result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
-                else:
-                    result_dict["approval"] = approval_note
-            if exit_note:
-                result_dict["exit_code_meaning"] = exit_note
-            if failure_hint:
-                result_dict["hint"] = failure_hint
-            if sudo_auth_failed:
-                result_dict["sudo_auth_failed"] = True
-            if sudo_cache_cleared:
-                result_dict["sudo_cache_cleared"] = True
-
-            return json.dumps(result_dict, ensure_ascii=False)
 
     except _Rejected as r:
         return r.result_json
@@ -3063,6 +3027,7 @@ def check_terminal_requirements() -> bool:
         return _check_terminal_config_requirements(_get_env_config())
     except Exception as exc:
         logger.error("Invalid terminal configuration: %s", exc)
+        _record_unavailable_reason(f"the requirements check failed: {exc}")
         return False
 
 

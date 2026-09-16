@@ -198,6 +198,7 @@ options = json.loads(sys.argv[3])
 # Public method names of the real PluginContext, computed by the parent so the
 # stub's attribute surface cannot drift from the class plugins run against.
 context_methods = set(options["context_methods"])
+context_properties = set(options.get("context_properties") or [])
 provider_kind = options["kind"] == "model-provider"
 
 recorded = {"tools": [], "hooks": [], "middleware": [], "commands": [], "providers": []}
@@ -240,6 +241,14 @@ class RecordingContext:
                 return None
 
             return _noop
+        if name in context_properties:
+            # Cached-property facades are real context attributes, not callables.
+            # Only facades with a faithful empty-directory mirror are returned;
+            # the rest refuse like unknown names so plugins can't pass by luck.
+            if name == "state":
+                from hermes_cli.plugins_state import PluginState
+                return PluginState(self.plugin_id)
+            raise AttributeError(name)
         raise AttributeError(name)
 
 
@@ -303,7 +312,22 @@ emit(recorded)
 
 
 def _probe_options(manifest: dict) -> dict:
+    from functools import cached_property
+
     from hermes_cli.plugins import PluginContext
+
+    def _descriptor_names(kind) -> list:
+        out = []
+        for n in dir(PluginContext):
+            if n.startswith("_"):
+                continue
+            try:
+                value = getattr(PluginContext, n)
+            except Exception:
+                continue
+            if isinstance(value, kind):
+                out.append(n)
+        return sorted(out)
 
     return {
         "kind": str(manifest.get("kind") or ""),
@@ -311,6 +335,10 @@ def _probe_options(manifest: dict) -> dict:
             n for n in dir(PluginContext)
             if not n.startswith("_") and callable(getattr(PluginContext, n))
         ),
+        # Facades like ``state`` are cached_properties — real context attributes
+        # but not callables, so they need their own lane; the probe mirrors the
+        # ones it can reproduce faithfully and refuses the rest as unknown names.
+        "context_properties": _descriptor_names((property, cached_property)),
     }
 
 
