@@ -2470,6 +2470,18 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
+    # Per-fire context (webhook ``cron_job`` routes, manual ``cronjob(action='run', prompt=...)``)
+    # arrives as an in-process argument — but the managed-topology handoff below serializes ONLY
+    # this ``job`` dict to the external worker, so an argument alone never survives the process
+    # boundary and the run context would be silently dropped. Stamp it onto the dict first, using
+    # the same ``manual_run_prompt`` rail ``trigger_job`` stamps for forwarded runs; the worker's
+    # ``extra_prompt is None`` fallback then picks it back up. In-process paths keep using the
+    # argument.
+    if extra_prompt is not None:
+        job["manual_run_prompt"] = str(extra_prompt)
+        if not job.get("manual_run_at"):
+            job["manual_run_at"] = _hermes_now().isoformat()
+
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
