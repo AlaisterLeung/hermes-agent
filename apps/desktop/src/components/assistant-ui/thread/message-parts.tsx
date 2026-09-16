@@ -20,10 +20,10 @@ import { formatElapsed, useElapsedSeconds, useMeasuredDuration } from '@/compone
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
 import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
+import { useOnboardingChatActive } from '@/components/onboarding-chat/assembly'
 import { useI18n } from '@/i18n'
-import { connectorCalls } from '@/lib/connector-tools'
+import { connectorCalls, mcpTargets } from '@/lib/connector-tools'
 import { generatedImageFromResult } from '@/lib/generated-images'
-import { isOnboardingEnabled } from '@/lib/onboarding-enabled'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 import { isTodoToolName } from '@/lib/todos'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
@@ -105,6 +105,13 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   }
 
   if (props.toolName === 'clarify') {
+    // Stopped on this question, never answered: history. ClarifyTool reads
+    // the session's live clarify request, so a later turn's question would
+    // otherwise paint onto this row as a second live card.
+    if (settledWithoutResult(props)) {
+      return <ToolFallback {...props} />
+    }
+
     return (
       <>
         <TimelineTimestamp className="mb-0.5 block" completedAt={props.completedAt} timestamp={props.timestamp} />
@@ -113,16 +120,16 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
     )
   }
 
-  if (isOnboardingEnabled() && props.toolName === 'manage_connections') {
+  if (mcpTargets(props.toolName, props.args).length > 0) {
+    return <McpSetupTool {...props} />
+  }
+
+  if (props.toolName === 'manage_connections') {
     return <ConnectorTool {...props} />
   }
 
-  if (isOnboardingEnabled() && connectorCalls(props.toolName, props.args).length > 0) {
+  if (connectorCalls(props.toolName, props.args).length > 0) {
     return <ConnectorExecution {...props} />
-  }
-
-  if (props.toolName === 'setup_mcp') {
-    return <McpSetupTool {...props} />
   }
 
   return <ToolFallback {...props} />
@@ -280,6 +287,10 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
 }) => {
   const messageId = useAuiState(s => s.message.id)
   const messageRunning = useAuiState(s => s.message.status?.type === 'running')
+  // The guide's reasoning is it reading its own runbook ("Now step 4: offer
+  // the tour with ::ask"), and a first-time user reading that alongside the
+  // greeting breaks the one conversation the guide is trying to have.
+  const guidedChat = useOnboardingChatActive()
 
   const pending = useAuiState(
     s =>
@@ -318,7 +329,7 @@ const ReasoningAccordionGroup: FC<{ children?: ReactNode; endIndex: number; star
     }, undefined)
   )
 
-  if (!hasContent) {
+  if (!hasContent || guidedChat) {
     return null
   }
 

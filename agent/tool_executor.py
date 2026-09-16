@@ -85,7 +85,6 @@ def _ensure_file_checkpoint(
     file_path = function_args.get("path", "")
     if not file_path:
         return
-
     # Checkpointing is a host-filesystem operation. Never interpret an SSH or
     # container path with local path semantics merely because it resembles one.
     target_cwd = _selected_local_target_cwd(
@@ -94,9 +93,16 @@ def _ensure_file_checkpoint(
     if not target_cwd:
         return
 
+    from agent.file_safety import is_nt_namespace_path
+
+    # Resolving an NT-namespace path is itself the NTLM-leak trigger; leave the
+    # tool's raw-string guard to refuse it without a checkpoint stat.
+    if is_nt_namespace_path(file_path):
+        return
+
     # Resolve via the file tools' path pipeline (task live/session cwd, not the
     # process cwd — differs notably in Docker) before checkpoint root discovery.
-    from tools.file_tools import _resolve_path_for_task
+    from tools.file_tools_paths import _resolve_path_for_task
 
     target = function_args.get("target")
     resolved_path = _resolve_path_for_task(
@@ -1085,7 +1091,9 @@ def _resolve_sequential_tool_timeout() -> float | None:
 # 420 s deadline every real batch "timed out" while its children ran on as orphans, and the orchestrator
 # spent the following hours polling transcripts (measured: 332 timeouts, ~$4k of orchestrator turns in
 # one run).
-_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task"})
+# ``manage_connections`` waits on the connection operation's own deadline; the generic deadline
+# would return tool_timeout while its approval card is still open.
+_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections"})
 
 
 def _abandoned_sequential_result(agent, ref: _ToolCallRef, message: str, result_cls, **outcome) -> _ManagedToolResult:
@@ -1308,7 +1316,9 @@ def _commit_tool_result(
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, success_log_chars)
         if not blocked:
             try:
-                agent._record_file_mutation_result(function_name, function_args, function_result, is_error)
+                agent._record_file_mutation_result(
+                    function_name, function_args, function_result, is_error, task_id=effective_task_id,
+                )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
         if agent.verbose_logging:
@@ -1524,9 +1534,12 @@ class _ConcurrentBatch:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
         if is_error:
-            logger.info("tool %s failed (%.2fs): %s", ref.name, duration, result[:200])
+            logger.info("tool %s failed (%.2fs): %s", ref.name, duration, str(result)[:200])
         else:
-            logger.info("tool %s completed (%.2fs, %d chars)", ref.name, duration, len(result))
+            result_chars = len(result) if isinstance(result, str) else len(str(result))
+            logger.info(
+                "tool %s completed (%.2fs, %d chars)", ref.name, duration, result_chars
+            )
         return _ToolOutcome(ref, result, duration, is_error, blocked)
 
     def run_worker(self, index: int, start_order: int) -> None:

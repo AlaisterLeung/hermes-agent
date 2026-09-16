@@ -61,6 +61,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
+    _record_unavailable_reason, terminal_backend_unavailable_reason,  # noqa: F401 — re-exported
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
@@ -180,8 +181,8 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on the selected execution 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds and fixed waits.
+Background: set background=true (returns a session_id) only for commands that must keep running independently after this tool call returns; add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. Do not start sleep, timers, cooldowns, delays, or polling loops with background=true — to wait a fixed time, run the wait as a normal foreground command with a high enough timeout. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
 PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
@@ -1456,7 +1457,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked"))
+        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
+                                    **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
         return _ApprovalVerdict(
@@ -1654,77 +1656,457 @@ def _yield_kwargs(command: str, **ctx) -> dict:
 
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
-    task_id: Optional[str], session_id: Optional[str], session_key: str,
-    workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    target_resolution: Any, cwd: Optional[str], task_id: Optional[str],
+    session_id: Optional[str], session_key: str, workdir: Optional[str],
+    approval_note: Optional[str], clear_interrupt: bool,
+    effective_base_task_id: Optional[str], backend_task_id: Optional[str],
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
+    env_type = plan.env_type
+    effective_timeout = plan.effective_timeout
+    effective_task_id = plan.effective_task_id
+
+    # Run foreground command with retry logic
     max_retries = 3
-    env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
+    retry_count = 0
+    result = None
+    command_cwd = None
 
     # Clean interrupt slate for an approved command, ONCE before the retry
-    # loop: drop a stale bit that landed during the approval-wait so it
-    # can't SIGINT the just-approved run. Do NOT re-clear inside the loop —
-    # a genuine interrupt during the backoff sleep must survive and abort
-    # the next attempt (rc 130).
+    # loop: drop the stale approval-wait bit so it can't SIGINT the run. Do NOT
+    # re-clear in the loop — a genuine interrupt must survive to abort (-> 130).
     if clear_interrupt:
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
-    for retry_count in range(max_retries + 1):
+    while retry_count <= max_retries:
         try:
             command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                workdir=workdir,
+                default_cwd=cwd,
+                session_key=session_key,
+                env_type=env_type,
+                _resolution=target_resolution,
             )
-            # bounded_capture: model-facing output keeps a head/tail window
-            # while streaming so a verbose command can't OOM the gateway;
-            # internal env.execute() consumers stay unbounded.
-            result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
-            )
-            break
+            execute_kwargs = {
+                "timeout": effective_timeout,
+                "cwd": command_cwd,
+                # Foreground model-facing output: cap retention while streaming
+                # (head/tail window) so a verbose command can't OOM the gateway
+                # before truncation (#64435). Internal env.execute() stays unbounded.
+                "bounded_capture": True,
+                **_yield_kwargs(
+                    command, env_type=env_type, cwd=command_cwd,
+                    effective_task_id=effective_task_id, task_id=task_id,
+                    session_key=session_key,
+                ),
+            }
+            with _scoped_sudo_execution(
+                target_resolution.target,
+                target_resolution.backend,
+                named=target_resolution.named,
+                sudo_password=target_resolution.config.get("sudo_password"),
+                target_scope=(
+                    target_resolution.security_scope
+                    if target_resolution.named else ""
+                ),
+            ):
+                result = env.execute(command, **execute_kwargs)
         except Exception as e:
-            if "timeout" in str(e).lower():
-                return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124)
+            error_str = str(e).lower()
+            if "timeout" in error_str:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 124,
+                    "error": f"Command timed out after {effective_timeout} seconds"
+                }, ensure_ascii=False)
+            
             # Retry on transient errors
             if retry_count < max_retries:
-                wait_time = 2 ** (retry_count + 1)
+                retry_count += 1
+                wait_time = 2 ** retry_count
                 logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                               wait_time, retry_count + 1, max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
+                               wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                 time.sleep(wait_time)
                 continue
+            
             logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                         max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
-            return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
+                         max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _redact_terminal_error_text(
+                    f"Command execution failed: {type(e).__name__}: {e}"
+                )
+            }, ensure_ascii=False)
+        
+        # Got a result
+        break
 
-    if result.get("yielded_session_id"):
+    if (result or {}).get("yielded_session_id"):
+        # Redirected mid-command: the process now runs as a registry-tracked
+        # notify-on-complete session — return without killing it or post-processing.
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
         }, ensure_ascii=False)
-    return finalize_foreground_result(
-        command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
-        task_id=task_id, session_id=session_id, session_key=session_key, workdir=workdir,
-        command_cwd=command_cwd, approval_note=approval_note,
+
+    # Dual-write (cwd rearch step 1): record the env's post-command cwd
+    # under the session key so the durable record never depends on the
+    # shared env surviving. Skip when a transient per-command ``workdir``
+    # override is set, and when the command reported no cwd (interrupted/
+    # killed: env.cwd may hold another session's dir — silent re-homing).
+    observed_cwd = None
+    if (result or {}).get("cwd_observed"):
+        # New/current environments return the CWD observed by THIS command;
+        # env.cwd is shared mutable compat state that may belong to a concurrent
+        # command, so keep the fallback for providers on the older contract.
+        observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
+    if not workdir and observed_cwd:
+        record_session_cwd(
+            session_key, observed_cwd,
+            _resolution=target_resolution,
+        )
+
+    # Extract output
+    output = result.get("output", "")
+    returncode = result.get("returncode", 0)
+    # Spill metadata from the bounded collector: present only when
+    # output overflowed the capture window (see _wait_for_process).
+    spill_total_chars = result.get("output_total_chars")
+    spill_file_path = result.get("full_output_path")
+
+    # Add helpful message for sudo failures in messaging context
+    output = _handle_sudo_failure(output, env_type)
+
+    sudo_auth_failed = _sudo_wrong_password_failure(output)
+    sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
+        command,
+        output,
+        target_resolution.target,
+        target_resolution.backend,
+        (
+            target_resolution.security_scope
+            if target_resolution.named else ""
+        ),
     )
+    if sudo_cache_cleared:
+        has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+        can_reprompt = (
+            has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE")
+        ) and not _in_delegated_child_context()
+        if can_reprompt:
+            output += (
+                "\n\n⚠️ Sudo authentication failed — cached password "
+                "cleared. You will be prompted again on the next sudo "
+                "command."
+            )
+
+    # Foreground output canonicalization seam: BaseEnvironment already bounded
+    # the capture; plugins may replace that string (fail-open, first valid
+    # return wins), still subject to the final output limit below.
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        hook_kwargs = {
+            "command": command,
+            "output": output,
+            "returncode": returncode,
+            "task_id": effective_base_task_id or "",
+            "env_type": env_type,
+        }
+        if target_resolution.named:
+            hook_kwargs.update({
+                "execution_target": target_resolution.target,
+                "execution_backend": target_resolution.backend,
+            })
+        hook_results = invoke_hook(
+            "transform_terminal_output",
+            **hook_kwargs,
+        )
+        for hook_result in hook_results:
+            if isinstance(hook_result, str):
+                output = hook_result
+                break
+    except Exception:
+        pass
+    
+    # Truncate output if too long, keeping both head and tail
+    from tools.tool_output_limits import get_max_bytes
+    MAX_OUTPUT_CHARS = get_max_bytes()
+    if len(output) > MAX_OUTPUT_CHARS:
+        head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
+        tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
+        omitted = len(output) - head_chars - tail_chars
+        truncated_notice = (
+            f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            f"out of {len(output)} total] ...\n\n"
+        )
+        output = output[:head_chars] + truncated_notice + output[-tail_chars:]
+
+    # Strip ANSI escape sequences so the model never sees terminal
+    # formatting — prevents it from copying escapes into file writes.
+    from tools.ansi_strip import strip_ansi
+    output = strip_ansi(output)
+
+    # Redact secrets from command output: source/config dumps (MAX_TOKENS=100,
+    # "apiKey" fixtures, postgresql:// f-strings) skip the ENV/JSON/template
+    # passes (code_file=True) to avoid false positives; env-dump commands
+    # (env/printenv/set/export/declare) DO run the ENV pass (code_file=False) —
+    # a KEY=value credential dump. See issue #43025; real prefixes mask both.
+    from agent.redact import redact_terminal_output
+    output = redact_terminal_output(output.strip(), command) if output else ""
+
+    # Interpret non-zero exit codes that aren't real errors
+    # (e.g. grep=1 means "no matches", diff=1 means "files differ")
+    exit_note = _interpret_exit_code(command, returncode)
+
+    # Output-pattern failure hints: map well-known shapes (module-not-found,
+    # gh field drift, merge conflicts) to one hint. See tools/terminal_hints.py.
+    failure_hint = None
+    if returncode != 0 and not exit_note:
+        try:
+            from tools.terminal_hints import annotate_failure
+            failure_hint = annotate_failure(command, returncode, output)
+        except Exception:
+            failure_hint = None
+    elif returncode == 0:
+        # Masked-success backstop: pipelines (`cargo build | tail -20`) return
+        # the last command's exit 0 even when the build failed. If the shape can
+        # mask an upstream failure and output shows it, warn — advisory only.
+        try:
+            from tools.terminal_hints import annotate_masked_success
+            failure_hint = annotate_masked_success(command, output)
+        except Exception:
+            failure_hint = None
+
+    result_dict = {
+        "output": output,
+        "exit_code": returncode,
+        "error": None,
+    }
+    # cwd echo: when the command changed the session's working directory
+    # (cd, pushd, ...), tell the model where it ended up — 60% of terminal
+    # calls carry defensive 'cd X && ' because cwd is invisible. Gated on
+    # the observation flag: without it an interrupted command echoes the
+    # shared env's leftover cwd (possibly another session's).
+    result_dict.update(target_resolution.metadata(
+        cwd=command_cwd if target_resolution.named else None,
+    ))
+    try:
+        post_cwd = observed_cwd
+        if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
+            result_dict["cwd"] = str(post_cwd)
+    except Exception:
+        pass
+    if spill_file_path:
+        try:
+            _sp = Path(spill_file_path)
+            raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
+            from tools.spill_safety import write_text_exclusive
+
+            # Rewrite in place via lstat-checked unlink + exclusive create so the
+            # redacted copy can't be diverted through a planted symlink.
+            write_text_exclusive(
+                _sp,
+                redact_terminal_output(strip_ansi(raw_spill), command),
+                private=True,
+                overwrite=True,
+                errors="replace",
+            )
+            result_dict["output_total_chars"] = spill_total_chars
+            result_dict["full_output_path"] = spill_file_path
+            result_dict["truncation_note"] = (
+                "Output exceeded the capture window (head+tail shown). "
+                f"Full output ({spill_total_chars:,} chars) saved to "
+                f"{spill_file_path} — search it with search_files or page it "
+                "with read_file instead of re-running the command."
+            )
+        except Exception:
+            logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
+            try:
+                Path(spill_file_path).unlink()
+            except OSError:
+                pass
+    if target_resolution.backend == "local":
+        try:
+            from agent.verification_evidence import record_terminal_result
+
+            evidence = record_terminal_result(
+                command=command,
+                cwd=command_cwd,
+                session_id=(
+                    session_id or task_id or backend_task_id or "default"
+                ),
+                exit_code=returncode,
+                output=output,
+            )
+            if evidence:
+                result_dict["verification_evidence"] = {
+                    "status": evidence.get("status"),
+                    "kind": evidence.get("kind"),
+                    "scope": evidence.get("scope"),
+                    "canonical_command": evidence.get("canonical_command"),
+                }
+        except Exception:
+            logger.debug(
+                "verification evidence recording failed", exc_info=True,
+            )
+    if approval_note:
+        # Treat rc=130 as an interrupt only when the executor's marker is
+        # present — `bash -c 'exit 130'` exits 130 with no marker and must
+        # not be relabelled a user interrupt in the audit note.
+        if returncode == 130 and "[Command interrupted]" in output:
+            # Interrupted by a genuine Stop: keep the audit trail but never imply
+            # success — "...approved by the user." must not co-occur with rc=130.
+            result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
+        else:
+            result_dict["approval"] = approval_note
+    if exit_note:
+        result_dict["exit_code_meaning"] = exit_note
+    if failure_hint:
+        result_dict["hint"] = failure_hint
+    if sudo_auth_failed:
+        result_dict["sudo_auth_failed"] = True
+    if sudo_cache_cleared:
+        result_dict["sudo_cache_cleared"] = True
+
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
+# Floor for the pre-exec guard's share of the command deadline: a short command timeout
+# (1s in tests, a few seconds in practice) must not turn the guard's own cold-start cost
+# (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
+_PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 
 def _pre_exec_block(
     command: str, *, env: Any, env_type: str, cwd: str,
-    workdir: Optional[str], session_key: str,
+    workdir: Optional[str], session_key: str, _resolution: Any = None,
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
     Order matters: gateway lifecycle first (protects the running gateway),
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
-    blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
-    )
-    if blocked:
-        raise _Rejected(blocked)
+    from tools.process_registry import _is_supervised_gateway_process
+
+    if _is_supervised_gateway_process():
+        from cron.lifecycle_guard import (
+            _MAX_REFERENCED_SCRIPT_BYTES,
+            contains_gateway_lifecycle_command_or_referenced_script,
+            contains_launchctl_submit_command,
+            lifecycle_scan_root_within_budget,
+        )
+        # Keep the specific launchctl diagnostic when this optional pre-scan
+        # fits the budget; the full fail-closed guard below still runs otherwise.
+        if (
+            lifecycle_scan_root_within_budget(command)
+            and contains_launchctl_submit_command(command)
+        ):
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: launchctl submit/bootstrap registers a persistent "
+                    "KeepAlive job and is unsafe from inside the gateway process. "
+                    "Use Hermes cron for one-shot delayed work, or install an "
+                    "explicit LaunchAgent from a separate shell."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
+        selected_target = (
+            _resolution.target
+            if _resolution is not None and getattr(_resolution, "named", False)
+            else None
+        )
+        guard_cwd_base = get_session_cwd(
+            session_key, selected_target, _resolution=_resolution,
+        )
+        if guard_cwd_base is None:
+            guard_cwd_base = getattr(env, "cwd", None) or cwd
+        guard_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=guard_cwd_base,
+            session_key=session_key,
+            env_type=env_type,
+            _resolution=_resolution,
+        )
+
+        def _read_script_in_env(
+            script_path: str,
+        ) -> Optional[str] | tuple[Optional[str], bool]:
+            """Read a script without crossing the selected target boundary.
+
+            Host filesystem reads are allowed only for a local target. Other
+            targets, and local-read misses, use the selected environment at
+            ``guard_cwd``. All reads are bounded and NUL-bearing binary content
+            is skipped before it can re-enter the lifecycle-command scanner.
+            """
+            if env is None:
+                return None
+            if _resolution is None or _resolution.backend == "local":
+                try:
+                    from cron.lifecycle_guard import _read_referenced_script
+
+                    local_path = Path(script_path).expanduser()
+                    if not local_path.is_absolute():
+                        local_path = Path(guard_cwd) / local_path
+                    local_result = _read_referenced_script(local_path)
+                    if local_result[0] is not None or local_result[1]:
+                        return local_result
+                except Exception:
+                    return None
+            # Remote / sandboxed backend: read via the environment's shell,
+            # bounded at the source with `head -c` so an oversized file (a 166MB
+            # ELF pinned the tool thread 30+ min on a superlinear shlex scan)
+            # never crosses the wire; one byte over budget fails closed in
+            # lifecycle_guard. `< path` keeps leading-dash paths out of argv.
+            try:
+                result = env.execute(
+                    f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
+                    f"< {shlex.quote(script_path)}",
+                    cwd=guard_cwd,
+                )
+                if isinstance(result, dict):
+                    returncode = result.get(
+                        "returncode", result.get("exit_code", -1)
+                    )
+                    output = result.get("output", "")
+                else:
+                    returncode = getattr(
+                        result,
+                        "returncode",
+                        getattr(result, "exit_code", -1),
+                    )
+                    output = getattr(result, "output", "")
+                if returncode == 0:
+                    if output and "\x00" in output:
+                        # Binary content from a remote read: skip for the
+                        # same reason as the local branch above (#77703).
+                        return None
+                    return output
+            except Exception:
+                pass
+            return None
+
+        if contains_gateway_lifecycle_command_or_referenced_script(
+            command,
+            cwd=guard_cwd,
+            read_remote_script=_read_script_in_env,
+        ):
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: command or referenced script cannot restart, stop, or "
+                    "uninstall the gateway from inside the gateway process. The gateway would "
+                    "kill this command before it could complete (SIGTERM propagates "
+                    "to child processes). Run `hermes gateway restart` from a "
+                    "separate shell outside the running gateway."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
     if workdir:
         workdir_error = _validate_workdir(workdir)
         if workdir_error:
@@ -1824,6 +2206,15 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        # Pre-exec guards share the command's own wall-clock deadline (#111922):
+        # resolve the plan up front so the bounded guard below can size against
+        # its effective timeout. The per-target resolution that follows refines
+        # the values the fork flow actually executes with.
+        plan = _plan_execution(
+            command, task_id=task_id, timeout=timeout, background=background,
+            _host_local=_host_local,
+        )
 
         # Resolve configuration per call. Named targets read merged config
         # directly; legacy flat config keeps the existing env-driven path.
@@ -2118,122 +2509,39 @@ def terminal_tool(
         # the gateway process — the restart SIGTERMs this subprocess before it can
         # finish; force=True can't help. Gate on the SUPERVISED-gateway probe: the
         # raw _HERMES_GATEWAY marker leaks into serve/CLI/web-server importers.
-        from tools.process_registry import _is_supervised_gateway_process
+        #
+        # The supervised-gateway identity probe ends in a kernel process query
+        # (psutil create_time) that has wedged for the better part of an hour on
+        # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
+        # chain ran ahead of it, so the tool call never returned and the cron
+        # slot stayed occupied (#111922). Share the command's own deadline. A
+        # guard that never rendered a verdict fails CLOSED: these checks apply
+        # unconditionally (``force`` cannot bypass them), so the command is
+        # refused with a retryable error instead of running unguarded.
+        from agent.deadline import run_bounded_sync
+        from tools.interrupt import acting_for_tid
 
-        if _is_supervised_gateway_process():
-            from cron.lifecycle_guard import (
-                _MAX_REFERENCED_SCRIPT_BYTES,
-                contains_gateway_lifecycle_command_or_referenced_script,
-                contains_launchctl_submit_command,
-                lifecycle_scan_root_within_budget,
+        # The guard chain runs on the deadline worker; keep it answerable to /stop
+        # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
+        guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+        _acting_token = acting_for_tid.set(threading.current_thread().ident)
+        try:
+            bounded_guard = run_bounded_sync(
+                lambda: _pre_exec_block(
+                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir,
+                    session_key=session_key, _resolution=target_resolution,
+                ),
+                guard_timeout,
+                label="terminal.pre-exec-guard",
             )
-            # Keep the specific launchctl diagnostic when this optional pre-scan
-            # fits the budget; the full fail-closed guard below still runs otherwise.
-            if (
-                lifecycle_scan_root_within_budget(command)
-                and contains_launchctl_submit_command(command)
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: launchctl submit/bootstrap registers a persistent "
-                        "KeepAlive job and is unsafe from inside the gateway process. "
-                        "Use Hermes cron for one-shot delayed work, or install an "
-                        "explicit LaunchAgent from a separate shell."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-            selected_target = (
-                target_resolution.target if target_resolution.named else None
-            )
-            guard_cwd_base = get_session_cwd(
-                session_key, selected_target, _resolution=target_resolution,
-            )
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
-            guard_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=guard_cwd_base,
-                session_key=session_key,
-                env_type=env_type,
-                _resolution=target_resolution,
-            )
-
-            def _read_script_in_env(
-                script_path: str,
-            ) -> Optional[str] | tuple[Optional[str], bool]:
-                """Read a script without crossing the selected target boundary.
-
-                Host filesystem reads are allowed only for a local target. Other
-                targets, and local-read misses, use the selected environment at
-                ``guard_cwd``. All reads are bounded and NUL-bearing binary content
-                is skipped before it can re-enter the lifecycle-command scanner.
-                """
-                if env is None:
-                    return None
-                if target_resolution.backend == "local":
-                    try:
-                        from cron.lifecycle_guard import _read_referenced_script
-
-                        local_path = Path(script_path).expanduser()
-                        if not local_path.is_absolute():
-                            local_path = Path(guard_cwd) / local_path
-                        local_result = _read_referenced_script(local_path)
-                        if local_result[0] is not None or local_result[1]:
-                            return local_result
-                    except Exception:
-                        return None
-                # Remote / sandboxed backend: read via the environment's shell,
-                # bounded at the source with `head -c` so an oversized file (a 166MB
-                # ELF pinned the tool thread 30+ min on a superlinear shlex scan)
-                # never crosses the wire; one byte over budget fails closed in
-                # lifecycle_guard. `< path` keeps leading-dash paths out of argv.
-                try:
-                    result = env.execute(
-                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}",
-                        cwd=guard_cwd,
-                    )
-                    if isinstance(result, dict):
-                        returncode = result.get(
-                            "returncode", result.get("exit_code", -1)
-                        )
-                        output = result.get("output", "")
-                    else:
-                        returncode = getattr(
-                            result,
-                            "returncode",
-                            getattr(result, "exit_code", -1),
-                        )
-                        output = getattr(result, "output", "")
-                    if returncode == 0:
-                        if output and "\x00" in output:
-                            # Binary content from a remote read: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
-                except Exception:
-                    pass
-                return None
-
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
-            ):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: command or referenced script cannot restart, stop, or "
-                        "uninstall the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
+        finally:
+            acting_for_tid.reset(_acting_token)
+        if bounded_guard.timed_out:
+            raise _Rejected(_error_json(
+                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
+                "(process-identity probe wedged); the command was not run. Retry the call.",
+                status="error",
+            ))
 
         # Validate before the source guard resolves an explicit workdir.
         if workdir:
@@ -2616,313 +2924,18 @@ def terminal_tool(
                     )
                 }, ensure_ascii=False)
         else:
-            # Run foreground command with retry logic
-            max_retries = 3
-            retry_count = 0
-            result = None
-            command_cwd = None
-
-            # Clean interrupt slate for an approved command, ONCE before the retry
-            # loop: drop the stale approval-wait bit so it can't SIGINT the run. Do NOT
-            # re-clear in the loop — a genuine interrupt must survive to abort (-> 130).
-            if _approved_run:
-                from tools.interrupt import clear_current_thread_interrupt
-                clear_current_thread_interrupt()
-
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                        env_type=env_type,
-                        _resolution=target_resolution,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while streaming
-                        # (head/tail window) so a verbose command can't OOM the gateway
-                        # before truncation (#64435). Internal env.execute() stays unbounded.
-                        "bounded_capture": True,
-                        **_yield_kwargs(
-                            command, env_type=env_type, cwd=command_cwd,
-                            effective_task_id=effective_task_id, task_id=task_id,
-                            session_key=session_key,
-                        ),
-                    }
-                    with _scoped_sudo_execution(
-                        target_resolution.target,
-                        target_resolution.backend,
-                        named=target_resolution.named,
-                        sudo_password=target_resolution.config.get("sudo_password"),
-                        target_scope=(
-                            target_resolution.security_scope
-                            if target_resolution.named else ""
-                        ),
-                    ):
-                        result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
-                        return json.dumps({
-                            "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
-                        }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": _redact_terminal_error_text(
-                            f"Command execution failed: {type(e).__name__}: {e}"
-                        )
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
-
-            if (result or {}).get("yielded_session_id"):
-                # Redirected mid-command: the process now runs as a registry-tracked
-                # notify-on-complete session — return without killing it or post-processing.
-                return json.dumps({
-                    "output": result.get("output", ""), "exit_code": None, "error": None,
-                    "status": "yielded_to_background", "session_id": result["yielded_session_id"],
-                    "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
-                }, ensure_ascii=False)
-
-            # Dual-write (cwd rearch step 1): record the env's post-command cwd
-            # under the session key so the durable record never depends on the
-            # shared env surviving. Skip when a transient per-command ``workdir``
-            # override is set, and when the command reported no cwd (interrupted/
-            # killed: env.cwd may hold another session's dir — silent re-homing).
-            observed_cwd = None
-            if (result or {}).get("cwd_observed"):
-                # New/current environments return the CWD observed by THIS command;
-                # env.cwd is shared mutable compat state that may belong to a concurrent
-                # command, so keep the fallback for providers on the older contract.
-                observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
-            if not workdir and observed_cwd:
-                record_session_cwd(
-                    session_key, observed_cwd,
-                    _resolution=target_resolution,
-                )
-
-            # Extract output
-            output = result.get("output", "")
-            returncode = result.get("returncode", 0)
-            # Spill metadata from the bounded collector: present only when
-            # output overflowed the capture window (see _wait_for_process).
-            spill_total_chars = result.get("output_total_chars")
-            spill_file_path = result.get("full_output_path")
-
-            # Add helpful message for sudo failures in messaging context
-            output = _handle_sudo_failure(output, env_type)
-
-            sudo_auth_failed = _sudo_wrong_password_failure(output)
-            sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
-                command,
-                output,
-                target_resolution.target,
-                target_resolution.backend,
-                (
-                    target_resolution.security_scope
-                    if target_resolution.named else ""
-                ),
+            return _run_foreground(
+                command, env, plan,
+                target_resolution=target_resolution, cwd=cwd,
+                task_id=task_id, session_id=session_id, session_key=session_key,
+                workdir=workdir, approval_note=approval_note,
+                clear_interrupt=_approved_run,
+                effective_base_task_id=effective_base_task_id,
+                backend_task_id=backend_task_id,
             )
-            if sudo_cache_cleared:
-                has_sudo_prompt_callback = _get_sudo_password_callback() is not None
-                can_reprompt = (
-                    has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE")
-                ) and not _in_delegated_child_context()
-                if can_reprompt:
-                    output += (
-                        "\n\n⚠️ Sudo authentication failed — cached password "
-                        "cleared. You will be prompted again on the next sudo "
-                        "command."
-                    )
 
-            # Foreground output canonicalization seam: BaseEnvironment already bounded
-            # the capture; plugins may replace that string (fail-open, first valid
-            # return wins), still subject to the final output limit below.
-            try:
-                from hermes_cli.lifecycle import invoke_hook
-                hook_kwargs = {
-                    "command": command,
-                    "output": output,
-                    "returncode": returncode,
-                    "task_id": effective_base_task_id or "",
-                    "env_type": env_type,
-                }
-                if target_resolution.named:
-                    hook_kwargs.update({
-                        "execution_target": target_resolution.target,
-                        "execution_backend": target_resolution.backend,
-                    })
-                hook_results = invoke_hook(
-                    "transform_terminal_output",
-                    **hook_kwargs,
-                )
-                for hook_result in hook_results:
-                    if isinstance(hook_result, str):
-                        output = hook_result
-                        break
-            except Exception:
-                pass
-            
-            # Truncate output if too long, keeping both head and tail
-            from tools.tool_output_limits import get_max_bytes
-            MAX_OUTPUT_CHARS = get_max_bytes()
-            if len(output) > MAX_OUTPUT_CHARS:
-                head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
-                tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
-                omitted = len(output) - head_chars - tail_chars
-                truncated_notice = (
-                    f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
-                )
-                output = output[:head_chars] + truncated_notice + output[-tail_chars:]
-
-            # Strip ANSI escape sequences so the model never sees terminal
-            # formatting — prevents it from copying escapes into file writes.
-            from tools.ansi_strip import strip_ansi
-            output = strip_ansi(output)
-
-            # Redact secrets from command output: source/config dumps (MAX_TOKENS=100,
-            # "apiKey" fixtures, postgresql:// f-strings) skip the ENV/JSON/template
-            # passes (code_file=True) to avoid false positives; env-dump commands
-            # (env/printenv/set/export/declare) DO run the ENV pass (code_file=False) —
-            # a KEY=value credential dump. See issue #43025; real prefixes mask both.
-            from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
-
-            # Interpret non-zero exit codes that aren't real errors
-            # (e.g. grep=1 means "no matches", diff=1 means "files differ")
-            exit_note = _interpret_exit_code(command, returncode)
-
-            # Output-pattern failure hints: map well-known shapes (module-not-found,
-            # gh field drift, merge conflicts) to one hint. See tools/terminal_hints.py.
-            failure_hint = None
-            if returncode != 0 and not exit_note:
-                try:
-                    from tools.terminal_hints import annotate_failure
-                    failure_hint = annotate_failure(command, returncode, output)
-                except Exception:
-                    failure_hint = None
-            elif returncode == 0:
-                # Masked-success backstop: pipelines (`cargo build | tail -20`) return
-                # the last command's exit 0 even when the build failed. If the shape can
-                # mask an upstream failure and output shows it, warn — advisory only.
-                try:
-                    from tools.terminal_hints import annotate_masked_success
-                    failure_hint = annotate_masked_success(command, output)
-                except Exception:
-                    failure_hint = None
-
-            result_dict = {
-                "output": output,
-                "exit_code": returncode,
-                "error": None,
-            }
-            # cwd echo: when the command changed the session's working directory
-            # (cd, pushd, ...), tell the model where it ended up — 60% of terminal
-            # calls carry defensive 'cd X && ' because cwd is invisible. Gated on
-            # the observation flag: without it an interrupted command echoes the
-            # shared env's leftover cwd (possibly another session's).
-            result_dict.update(target_resolution.metadata(
-                cwd=command_cwd if target_resolution.named else None,
-            ))
-            try:
-                post_cwd = observed_cwd
-                if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
-                    result_dict["cwd"] = str(post_cwd)
-            except Exception:
-                pass
-            if spill_file_path:
-                try:
-                    _sp = Path(spill_file_path)
-                    raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
-                    from tools.spill_safety import write_text_exclusive
-
-                    # Rewrite in place via lstat-checked unlink + exclusive create so the
-                    # redacted copy can't be diverted through a planted symlink.
-                    write_text_exclusive(
-                        _sp,
-                        redact_terminal_output(strip_ansi(raw_spill), command),
-                        private=True,
-                        overwrite=True,
-                        errors="replace",
-                    )
-                    result_dict["output_total_chars"] = spill_total_chars
-                    result_dict["full_output_path"] = spill_file_path
-                    result_dict["truncation_note"] = (
-                        "Output exceeded the capture window (head+tail shown). "
-                        f"Full output ({spill_total_chars:,} chars) saved to "
-                        f"{spill_file_path} — search it with search_files or page it "
-                        "with read_file instead of re-running the command."
-                    )
-                except Exception:
-                    logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
-                    try:
-                        Path(spill_file_path).unlink()
-                    except OSError:
-                        pass
-            if target_resolution.backend == "local":
-                try:
-                    from agent.verification_evidence import record_terminal_result
-
-                    evidence = record_terminal_result(
-                        command=command,
-                        cwd=command_cwd,
-                        session_id=(
-                            session_id or task_id or backend_task_id or "default"
-                        ),
-                        exit_code=returncode,
-                        output=output,
-                    )
-                    if evidence:
-                        result_dict["verification_evidence"] = {
-                            "status": evidence.get("status"),
-                            "kind": evidence.get("kind"),
-                            "scope": evidence.get("scope"),
-                            "canonical_command": evidence.get("canonical_command"),
-                        }
-                except Exception:
-                    logger.debug(
-                        "verification evidence recording failed", exc_info=True,
-                    )
-            if approval_note:
-                # Treat rc=130 as an interrupt only when the executor's marker is
-                # present — `bash -c 'exit 130'` exits 130 with no marker and must
-                # not be relabelled a user interrupt in the audit note.
-                if returncode == 130 and "[Command interrupted]" in output:
-                    # Interrupted by a genuine Stop: keep the audit trail but never imply
-                    # success — "...approved by the user." must not co-occur with rc=130.
-                    result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
-                else:
-                    result_dict["approval"] = approval_note
-            if exit_note:
-                result_dict["exit_code_meaning"] = exit_note
-            if failure_hint:
-                result_dict["hint"] = failure_hint
-            if sudo_auth_failed:
-                result_dict["sudo_auth_failed"] = True
-            if sudo_cache_cleared:
-                result_dict["sudo_cache_cleared"] = True
-
-            return json.dumps(result_dict, ensure_ascii=False)
-
+    except _Rejected as r:
+        return r.result_json
     except EnvironmentConnectionError as e:
         # Infrastructure/connection-class failure (SSH host down, Docker daemon
         # unreachable), distinct from a command's nonzero exit. ``terminal.degraded_mode``:
@@ -2978,6 +2991,7 @@ def _check_terminal_config_requirements(config: Dict[str, Any]) -> bool:
         return checker(config)
     except Exception as e:
         logger.error("Terminal requirements check failed: %s", e, exc_info=True)
+        _record_unavailable_reason(f"the requirements check failed: {e}")
         return False
 
 
@@ -3013,6 +3027,7 @@ def check_terminal_requirements() -> bool:
         return _check_terminal_config_requirements(_get_env_config())
     except Exception as exc:
         logger.error("Invalid terminal configuration: %s", exc)
+        _record_unavailable_reason(f"the requirements check failed: {exc}")
         return False
 
 

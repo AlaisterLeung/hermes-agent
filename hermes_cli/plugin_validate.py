@@ -184,7 +184,9 @@ def _check_requires_env(report: ValidationReport, manifest: dict) -> None:
 # module using the same file-location mechanics PluginManager uses, calls
 # register() against a recording stub ctx, and prints a sentinel-prefixed
 # JSON line of what was actually registered. Deliberately imports NOTHING
-# from hermes so a hostile plugin only sees a bare interpreter.
+# from hermes so a hostile plugin only sees a bare interpreter — the one
+# exception is `providers` for `kind: model-provider`, whose contract IS
+# calling providers.register_provider at import.
 _PROBE_SCRIPT = r"""
 import importlib.util
 import json
@@ -192,13 +194,20 @@ import sys
 
 plugin_dir = sys.argv[1]
 sentinel = sys.argv[2]
+options = json.loads(sys.argv[3])
+# Public method names of the real PluginContext, computed by the parent so the
+# stub's attribute surface cannot drift from the class plugins run against.
+context_methods = set(options["context_methods"])
+context_properties = set(options.get("context_properties") or [])
+provider_kind = options["kind"] == "model-provider"
 
-recorded = {"tools": [], "hooks": [], "middleware": [], "commands": []}
+recorded = {"tools": [], "hooks": [], "middleware": [], "commands": [], "providers": []}
 
 
 class RecordingContext:
     plugin_config = {}
     profile_name = "default"
+    plugin_id = "hermes_validate_probe_plugin"
 
     def register_tool(self, name, *args, **kwargs):
         recorded["tools"].append(str(name))
@@ -220,19 +229,51 @@ class RecordingContext:
         # plugins do `int(ctx.get_config("timeout", 180))` in register().
         return default
 
-    def __getattr__(self, _name):
-        # Any other registration surface (platforms, providers, skills,
-        # context engines, ...) is accepted as a no-op — the probe only
-        # audits the declared-capability categories.
-        def _noop(*args, **kwargs):
-            return None
+    def __getattr__(self, name):
+        # Any other REAL registration surface (platforms, providers, skills,
+        # context engines, ...) is accepted as a no-op — the probe only audits
+        # the declared-capability categories. Names the real PluginContext does
+        # not have raise AttributeError exactly like it would; handing back a
+        # callable made `getattr(ctx, "profile_path", None)` truthy and crashed
+        # register() in the probe alone.
+        if name in context_methods:
+            def _noop(*args, **kwargs):
+                return None
 
-        return _noop
+            return _noop
+        if name in context_properties:
+            # Cached-property facades are real context attributes, not callables.
+            # Only facades with a faithful empty-directory mirror are returned;
+            # the rest refuse like unknown names so plugins can't pass by luck.
+            if name == "state":
+                from hermes_cli.plugins_state import PluginState
+                return PluginState(self.plugin_id)
+            raise AttributeError(name)
+        raise AttributeError(name)
 
 
 def emit(payload):
     print(sentinel + json.dumps(payload))
 
+
+if provider_kind:
+    # `kind: model-provider` plugins register at import via
+    # providers.register_provider(ProviderProfile) — the PluginManager never
+    # calls a register(ctx) on them (plugins_discovery skips the kind), so the
+    # probe records that call instead of demanding an entry point that would
+    # be dead code.
+    try:
+        import providers as _providers
+    except Exception as exc:
+        emit({"error": "model-provider probe could not import providers: %s" % exc})
+        sys.exit(0)
+    _real_register_provider = _providers.register_provider
+
+    def _recording_register_provider(profile):
+        recorded["providers"].append(str(getattr(profile, "name", profile)))
+        return _real_register_provider(profile)
+
+    _providers.register_provider = _recording_register_provider
 
 try:
     spec = importlib.util.spec_from_file_location(
@@ -246,6 +287,13 @@ try:
     spec.loader.exec_module(module)
 except Exception as exc:
     emit({"error": "import failed: %s" % exc})
+    sys.exit(0)
+
+if provider_kind:
+    if not recorded["providers"]:
+        emit({"error": "model-provider plugin registered no ProviderProfile at import"})
+    else:
+        emit(recorded)
     sys.exit(0)
 
 register = getattr(module, "register", None)
@@ -263,12 +311,43 @@ emit(recorded)
 """
 
 
-def _run_capability_probe(plugin_dir: Path) -> Tuple[Optional[dict], str]:
+def _probe_options(manifest: dict) -> dict:
+    from functools import cached_property
+
+    from hermes_cli.plugins import PluginContext
+
+    def _descriptor_names(kind) -> list:
+        out = []
+        for n in dir(PluginContext):
+            if n.startswith("_"):
+                continue
+            try:
+                value = getattr(PluginContext, n)
+            except Exception:
+                continue
+            if isinstance(value, kind):
+                out.append(n)
+        return sorted(out)
+
+    return {
+        "kind": str(manifest.get("kind") or ""),
+        "context_methods": sorted(
+            n for n in dir(PluginContext)
+            if not n.startswith("_") and callable(getattr(PluginContext, n))
+        ),
+        # Facades like ``state`` are cached_properties — real context attributes
+        # but not callables, so they need their own lane; the probe mirrors the
+        # ones it can reproduce faithfully and refuses the rest as unknown names.
+        "context_properties": _descriptor_names((property, cached_property)),
+    }
+
+
+def _run_capability_probe(plugin_dir: Path, manifest: dict) -> Tuple[Optional[dict], str]:
     """Run the recording probe in a scratch subprocess.
 
     Returns ``(recorded, error)`` — exactly one is meaningful: *recorded*
-    is the ``{tools, hooks, middleware, commands}`` dict on success, and
-    *error* is a human-readable failure description otherwise.
+    is the ``{tools, hooks, middleware, commands, providers}`` dict on
+    success, and *error* is a human-readable failure description otherwise.
     """
     with tempfile.TemporaryDirectory(prefix="hermes-validate-") as scratch:
         env = dict(os.environ)
@@ -281,6 +360,7 @@ def _run_capability_probe(plugin_dir: Path) -> Tuple[Optional[dict], str]:
                     _PROBE_SCRIPT,
                     str(plugin_dir),
                     _PROBE_SENTINEL,
+                    json.dumps(_probe_options(manifest)),
                 ],
                 capture_output=True,
                 text=True,
@@ -331,11 +411,17 @@ def _check_capabilities(
         report.add("capability probe", True, "skipped (no __init__.py)")
         return None
 
-    recorded, error = _run_capability_probe(plugin_dir)
+    recorded, error = _run_capability_probe(plugin_dir, manifest)
     if recorded is None:
         report.add("capability probe", False, error)
         return None
-    report.add("capability probe", True, "register() ran in isolation")
+    if recorded.get("providers"):
+        report.add(
+            "capability probe", True,
+            "import registered provider(s): " + ", ".join(recorded["providers"]),
+        )
+    else:
+        report.add("capability probe", True, "register() ran in isolation")
 
     for kind, manifest_key in (
         ("tools", "provides_tools"),
