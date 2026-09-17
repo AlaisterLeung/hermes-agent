@@ -12,6 +12,40 @@ import contextlib
 from .method_ctx import bind_module
 
 
+@contextlib.contextmanager
+def _session_turn_admission(session: dict):
+    """Hold process admission until the history-locked running claim is visible to idle probes."""
+    from hermes_cli.backend_retirement import retirement
+
+    with retirement.work() as admitted, session["history_lock"]:
+        yield admitted
+
+
+def _start_session_work(target, *, name: str, session: dict | None = None):
+    """Reserve before spawning; release only after the worker (including cleanup) has unwound."""
+    from agent.memory_provider import spawn_context_thread
+    from hermes_cli.backend_retirement import retirement
+
+    if not retirement.acquire():
+        return None
+
+    def run():
+        try:
+            target()
+        finally:
+            retirement.release()
+
+    try:
+        thread = spawn_context_thread(run, name=name)
+        if session is not None:
+            session["_run_thread"] = thread
+        thread.start()
+        return thread
+    except BaseException:
+        retirement.release()
+        raise
+
+
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     with contextlib.suppress(Exception):

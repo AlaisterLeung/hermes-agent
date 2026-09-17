@@ -233,6 +233,13 @@ def open_requests(sid: str) -> list[dict]:
     return [req.snapshot() for req in reqs]
 
 
+def open_request_count() -> int:
+    """Unanswered server→client requests across every session: the process is waiting on a
+    human (clarify, approval, sudo, secret, ...) and must not be treated as idle."""
+    with _lock:
+        return len(_open)
+
+
 def pending_kind(sid: str) -> str:
     """Method of the oldest open request for *sid* ("" when none) — the session is waiting on a human."""
     with _lock:
