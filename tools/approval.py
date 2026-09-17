@@ -203,6 +203,12 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def pending_gateway_approval_count() -> int:
+    """Unresolved gateway approvals across every session — a backend blocked on one is not idle."""
+    with _lock:
+        return sum(len(queue) for queue in _gateway_queues.values())
+
+
 def get_pending_gateway_approval(session_key: str) -> dict | None:
     """Copy of the oldest unresolved gateway approval, for reconnecting clients
     to restore a prompt. Read-only snapshot — the queue stays authoritative."""

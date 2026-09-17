@@ -32,7 +32,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
   getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
-  touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
+  touchBackend: (profile, options) => ipcRenderer.invoke('hermes:backend:touch', profile, options),
   getPoolLimits: () => ipcRenderer.invoke('hermes:pool-limits:get'),
   setPoolLimits: limits => ipcRenderer.invoke('hermes:pool-limits:set', limits),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
@@ -515,6 +515,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:backend-exit', listener)
 
     return () => ipcRenderer.removeListener('hermes:backend-exit', listener)
+  },
+  // Cooperative pool retirement (main → renderer): the pooled backend under
+  // `poolKey` is being stopped for a foreground open. Park that scope; do not
+  // redial into the slot it vacated.
+  onPoolBackendRetiring: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:pool:retiring', listener)
+
+    return () => ipcRenderer.removeListener('hermes:pool:retiring', listener)
   },
   // Soft gateway-mode apply finished tearing down the primary backend. Renderer
   // should wipe session lists + re-dial without a window reload.
