@@ -1691,7 +1691,7 @@ class CLICommandsMixin:
             _pr(f"  ID: {job['job_id']}", f"  Name: {job['name']}",
                 f"  State: {job.get('state', '?')}",
                 f"  Schedule: {job['schedule']} ({job.get('repeat', '?')})",
-                f"  Next run: {job.get('next_run_at', 'N/A')}")
+                f"  Next run: {job.get('next_run_at') or '—'}")
             if job.get("skills"):
                 print(f"  Skills: {', '.join(job['skills'])}")
             print(f"  Prompt: {job.get('prompt_preview', '')}")
@@ -1708,9 +1708,10 @@ class CLICommandsMixin:
 
     def _cron_add(self, subcommand: str, opts: dict) -> None:
         positionals = opts["positionals"]
-        if not positionals:
-            return print("(._.) Usage: /cron add <schedule> <prompt>")
-        schedule = opts["schedule"] or positionals[0]
+        if not positionals and not (opts["prompt"] or opts["skills"]):
+            return print("(._.) Usage: /cron add <schedule> <prompt>  (empty schedule = trigger-only)")
+        # Empty schedule: trigger-only — fires only via `/cron run <id>` or event routes.
+        schedule = opts["schedule"] or (positionals[0] if positionals else "")
         prompt = opts["prompt"] or " ".join(positionals[1:])
         skills = _normalize_skills(opts["skills"])
         if not prompt and not skills:
@@ -1723,7 +1724,10 @@ class CLICommandsMixin:
         _pr(f"(^_^)b Created job: {result['job_id']}", f"  Schedule: {result['schedule']}")
         if result.get("skills"):
             print(f"  Skills: {', '.join(result['skills'])}")
-        print(f"  Next run: {result['next_run_at']}")
+        if result.get("next_run_at"):
+            print(f"  Next run: {result['next_run_at']}")
+        else:
+            print("  Trigger-only — no automatic runs (`/cron run <id>` to fire).")
 
     def _cron_edit(self, subcommand: str, opts: dict) -> None:
         from cron import get_job

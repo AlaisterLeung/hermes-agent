@@ -159,7 +159,11 @@ function emptyCronJobForm(): CronJobEditorState {
 
 function editorFormFromJob(job: CronJob): CronJobEditorState {
   const form = cronJobFormFromJob(job);
-  return { ...form, scheduleState: parseScheduleString(form.schedule) };
+  // The stored kind disambiguates an empty schedule: "trigger" jobs store "" by design.
+  return {
+    ...form,
+    scheduleState: parseScheduleString(form.schedule, asText(job.schedule?.kind)),
+  };
 }
 
 function buildCronJobPayloadFromEditor(form: CronJobEditorState) {
@@ -709,7 +713,7 @@ export default function CronPage() {
   const handleCreate = async () => {
     const payload = buildCronJobPayloadFromEditor(createForm);
     if (
-      !payload.schedule ||
+      (!payload.schedule && createForm.scheduleState.mode !== "trigger") ||
       (!payload.no_agent && !cronJobHasExecutionContent(payload))
     ) {
       showToast(`${t.cron.prompt} & ${t.cron.schedule} required`, "error");
@@ -738,7 +742,7 @@ export default function CronPage() {
     if (!editJob) return;
     const payload = buildCronJobPayloadFromEditor(editForm);
     if (
-      !payload.schedule ||
+      (!payload.schedule && editForm.scheduleState.mode !== "trigger") ||
       (!payload.no_agent && !cronJobHasExecutionContent(payload))
     ) {
       showToast(`${t.cron.prompt} & ${t.cron.schedule} required`, "error");

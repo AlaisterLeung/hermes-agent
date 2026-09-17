@@ -22,7 +22,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_create = cron_subparsers.add_parser(
         "create", aliases=["add"], help="Create a scheduled job")
-    cron_create.add_argument("schedule", help="Schedule like '30m', 'every 2h', or '0 9 * * *'")
+    cron_create.add_argument(
+        "schedule", nargs="?", default="",
+        help="Schedule like '30m', 'every 2h', or '0 9 * * *'. Omit (or pass '') "
+            "for a trigger-only job: no automatic runs, fired by `hermes cron run` "
+            "or its event routes.")
     cron_create.add_argument(
         "prompt", nargs="?", help="Optional self-contained prompt or task instruction")
     cron_create.add_argument("--name", help="Optional human-friendly job name")
@@ -95,7 +99,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
     cron_edit.add_argument("job_id", help="Job ID to edit")
-    cron_edit.add_argument("--schedule", help="New schedule")
+    cron_edit.add_argument("--schedule", help="New schedule. Pass empty string to make the job "
+        "trigger-only (no automatic runs; fire with `hermes cron run`).")
     cron_edit.add_argument("--prompt", help="New prompt/task instruction")
     cron_edit.add_argument("--name", help="New job name")
     cron_edit.add_argument("--deliver", help="New delivery target")

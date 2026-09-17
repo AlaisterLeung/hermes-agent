@@ -35,6 +35,7 @@ export type ScheduleMode =
   | "weekly"
   | "monthly"
   | "once"
+  | "trigger"
   | "custom";
 
 /** Unit used by interval mode. Backend parses ``m``/``h``/``d`` suffixes. */
@@ -142,15 +143,28 @@ export function buildScheduleString(state: ScheduleBuilderState): string {
       // the seconds component lines up with isoformat() output.
       return v.length === 16 ? `${v}:00` : v;
     }
+    case "trigger":
+      // Trigger-only: the backend reads an EMPTY schedule string as "no automatic
+      // runs" — the job fires only via explicit triggers (Trigger button, events).
+      // Callers must treat "" from THIS mode as complete, not as "incomplete".
+      return "";
     case "custom":
       return state.custom.trim();
   }
 }
 
-/** Parse schedules emitted by buildScheduleString; unknown strings stay custom. */
+/** Parse schedules emitted by buildScheduleString; unknown strings stay custom.
+ *
+ * ``kind`` is the stored ``CronJob.schedule.kind`` when parsing a job being
+ * edited — a ``"trigger"`` job stores an empty string, which would otherwise
+ * fall back to the default mode. */
 export function parseScheduleString(
   schedule: string,
+  kind?: string,
 ): ScheduleBuilderState {
+  if (kind === "trigger") {
+    return { ...DEFAULT_SCHEDULE_STATE, mode: "trigger" };
+  }
   const trimmed = schedule.trim();
   if (!trimmed) return { ...DEFAULT_SCHEDULE_STATE };
 
@@ -311,6 +325,9 @@ export interface ScheduleDescribeStrings {
   monthlyAt: string;
   /** "Once at {time}" */
   onceAt: string;
+  /** "Trigger only" — a job with no automatic runs (fires via explicit triggers).
+   * Optional — English fallback until translated. */
+  triggerOnly?: string;
   /** Weekday short names indexed 0..6 (Sunday-first). */
   weekdaysShort: [string, string, string, string, string, string, string];
   /** Ordinal suffix builder, e.g. "1st", "22nd". For locales that
@@ -341,6 +358,10 @@ export function describeSchedule(
   strings: ScheduleDescribeStrings,
 ): string {
   if (!schedule) return fallbackDisplay || strings.none;
+
+  if (schedule.kind === "trigger") {
+    return strings.triggerOnly ?? fallbackDisplay ?? strings.none;
+  }
 
   if (schedule.kind === "interval" && typeof schedule.minutes === "number") {
     return describeInterval(schedule.minutes, strings);

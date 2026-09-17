@@ -767,10 +767,14 @@ def _interval_schedule(minutes: int) -> Dict[str, Any]:
     return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
-    """Parse a schedule string into ``{"kind": "once"|"interval"|"cron", ...}`` with ``run_at`` /
-    ``minutes`` / ``expr``. "30m" and "every 30m" are recurring intervals; "every monday 9am" and
-    "0 9 * * *" are cron; an ISO timestamp is once."""
+def parse_schedule(schedule: Optional[str]) -> Dict[str, Any]:
+    """Parse a schedule string into ``{"kind": "once"|"interval"|"cron"|"trigger", ...}`` with
+    ``run_at`` / ``minutes`` / ``expr``. "30m" and "every 30m" are recurring intervals; "every
+    monday 9am" and "0 9 * * *" are cron; an ISO timestamp is once; None/blank is a trigger-only
+    job — it never fires on a schedule, only through explicit triggers (``hermes cron run``, the
+    cronjob tool's ``run`` action, or an event like a webhook route)."""
+    if schedule is None or not str(schedule).strip():
+        return {"kind": "trigger", "display": "trigger only"}
     schedule = schedule.strip()
     original = schedule
     schedule_lower = schedule.lower()
@@ -839,7 +843,8 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         f"  - One-shot delay: 'in 30m', 'in 2h' (fires once)\n"
         f"  - Weekly/daily: 'every monday 9am', 'weekdays at 9am' (recurring)\n"
         f"  - Cron: '0 9 * * *' (cron expression)\n"
-        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
+        f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)\n"
+        f"  - Trigger-only: '' (no automatic runs; fires only via `hermes cron run`/events)"
     )
 
 
@@ -1142,6 +1147,9 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
     if not isinstance(schedule, dict):
         return None
     kind = schedule.get("kind")
+    if kind == "trigger":
+        # Trigger-only: no automatic runs by design (`hermes cron run`/events only).
+        return None
     if kind == "once":
         return _recoverable_oneshot_run_at(schedule, now, last_run_at=last_run_at)
     # Recurring kinds anchor on last_run_at so a restart doesn't re-anchor the schedule.
@@ -1820,7 +1828,7 @@ def _next_run_or_reject_past_oneshot(
 
 def create_job(
     prompt: Optional[str],
-    schedule: str,
+    schedule: Optional[str],
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
@@ -1853,7 +1861,9 @@ def create_job(
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
-    max_turns/run_budget_seconds: per-job budget overrides; absent = follow the agent.* globals."""
+    max_turns/run_budget_seconds: per-job budget overrides; absent = follow the agent.* globals.
+    schedule: None/blank creates a trigger-only job — no automatic runs, fires only through
+    explicit triggers (`hermes cron run`, the cronjob tool's ``run`` action, or events)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -2091,6 +2101,8 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
         or updated.get("next_run_at")
     ):
         return
+    if (updated.get("schedule") or {}).get("kind") == "trigger":
+        return  # trigger-only: no next run by design
     next_run = compute_next_run(updated["schedule"])
     if next_run is None and updated["schedule"].get("kind") == "once":
         run_at = updated["schedule"].get("run_at", "unknown")
@@ -2486,6 +2498,11 @@ def _advance_after_run(job: Dict[str, Any], now: str) -> None:
 
     job["next_run_at"] = compute_next_run(job["schedule"], now)
     if job["next_run_at"] is not None:
+        if job.get("state") != "paused":
+            job["state"] = "scheduled"
+    elif kind == "trigger":
+        # Trigger-only job: no next run by design. Keep it enabled (never a terminal
+        # completion) so `cron run` and event routes can fire it again.
         if job.get("state") != "paused":
             job["state"] = "scheduled"
     elif kind in {"cron", "interval"}:

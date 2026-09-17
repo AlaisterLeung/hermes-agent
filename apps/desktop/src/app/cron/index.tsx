@@ -106,6 +106,7 @@ const SCHEDULE_OPTIONS: ReadonlyArray<ScheduleOption> = [
   { expr: '0 9 1 * *', value: 'monthly' },
   { expr: '0 * * * *', value: 'hourly' },
   { expr: '*/15 * * * *', value: 'every-15-minutes' },
+  { value: 'trigger' },
   { value: 'custom' }
 ]
 
@@ -135,6 +136,20 @@ function jobScheduleDisplay(job: CronJob): string {
 
 function jobScheduleExpr(job: CronJob): string {
   return asText(job.schedule?.expr) || asText(job.schedule_display) || ''
+}
+
+/** Preset for an existing job: a trigger-only job stores no expr — its kind is the signal. */
+function scheduleOptionForJob(job: CronJob): ScheduleOption {
+  if (asText(job.schedule?.kind) === 'trigger') {
+    return SCHEDULE_OPTIONS.find(option => option.value === 'trigger') ?? SCHEDULE_OPTIONS[0]
+  }
+
+  return scheduleOptionForExpr(jobScheduleExpr(job))
+}
+
+/** The editor's schedule-string state for an existing job (trigger-only jobs are empty). */
+function jobScheduleValue(job: CronJob): string {
+  return asText(job.schedule?.kind) === 'trigger' ? '' : jobScheduleExpr(job)
 }
 
 function jobDeliver(job: CronJob): string {
@@ -1100,8 +1115,8 @@ function CronEditorDialog({
 
     setName(initial ? jobName(initial) : '')
     setPrompt(initial ? jobPrompt(initial) : '')
-    setSchedule(initial ? jobScheduleExpr(initial) : (SCHEDULE_OPTIONS[0].expr ?? ''))
-    setSchedulePreset(initial ? scheduleOptionForExpr(jobScheduleExpr(initial)).value : 'daily')
+    setSchedule(initial ? jobScheduleValue(initial) : (SCHEDULE_OPTIONS[0].expr ?? ''))
+    setSchedulePreset(initial ? scheduleOptionForJob(initial).value : 'daily')
     setDeliver(initial ? jobDeliver(initial) : DEFAULT_DELIVER)
     setModelChoice(initial && jobModel(initial) ? `${jobProvider(initial)}:${jobModel(initial)}` : MODEL_DEFAULT_VALUE)
     setSlotValues({})
@@ -1128,7 +1143,7 @@ function CronEditorDialog({
 
     if (option?.expr) {
       setSchedule(option.expr)
-    } else if (scheduleOptionForExpr(schedule).value !== 'custom') {
+    } else if (nextPreset === 'trigger' || scheduleOptionForExpr(schedule).value !== 'custom') {
       setSchedule('')
     }
   }
@@ -1154,7 +1169,8 @@ function CronEditorDialog({
     const validationError = validateCronEditor({
       prompt,
       schedule,
-      scriptOnlyJob
+      scriptOnlyJob,
+      triggerOnly: schedulePreset === 'trigger'
     })
 
     if (validationError) {
@@ -1391,7 +1407,7 @@ function CronEditorDialog({
               <div className="rounded-md bg-(--ui-bg-quinary) px-3 py-2">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-medium text-foreground">{scheduleHint}</span>
-                  <span className="font-mono text-muted-foreground">{schedule}</span>
+                  {schedule && <span className="font-mono text-muted-foreground">{schedule}</span>}
                 </div>
               </div>
             )}

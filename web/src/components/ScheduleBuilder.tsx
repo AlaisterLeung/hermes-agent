@@ -76,6 +76,9 @@ export function ScheduleBuilder({ onChange, value }: ScheduleBuilderProps) {
           <SelectOption value="weekly">{modeStrings.weekly}</SelectOption>
           <SelectOption value="monthly">{modeStrings.monthly}</SelectOption>
           <SelectOption value="once">{modeStrings.once}</SelectOption>
+          <SelectOption value="trigger">
+            {modeStrings.trigger ?? "Trigger only"}
+          </SelectOption>
           <SelectOption value="custom">{modeStrings.custom}</SelectOption>
         </Select>
       </div>
@@ -205,6 +208,13 @@ export function ScheduleBuilder({ onChange, value }: ScheduleBuilderProps) {
         </div>
       )}
 
+      {value.mode === "trigger" && (
+        <p className="text-xs text-muted-foreground">
+          {modeStrings.triggerHint ??
+            "No automatic runs — the job fires only when triggered (the Trigger button or an event route such as a webhook)."}
+        </p>
+      )}
+
       {value.mode === "custom" && (
         <div className="grid gap-2">
           <Label htmlFor="cron-custom-expr">{modeStrings.customLabel}</Label>
@@ -227,7 +237,9 @@ export function ScheduleBuilder({ onChange, value }: ScheduleBuilderProps) {
       <p className="text-xs text-muted-foreground">
         <span className="opacity-70">{modeStrings.preview}: </span>
         <span className="font-mono-ui text-foreground">
-          {buildScheduleString(value) || modeStrings.previewEmpty}
+          {value.mode === "trigger"
+            ? (modeStrings.trigger ?? "Trigger only")
+            : buildScheduleString(value) || modeStrings.previewEmpty}
         </span>
       </p>
     </div>

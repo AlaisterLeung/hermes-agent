@@ -13,17 +13,19 @@ export interface CronEditorValidationInput {
   prompt: string
   schedule: string
   scriptOnlyJob: boolean
+  triggerOnly?: boolean
 }
 
 export function validateCronEditor(input: CronEditorValidationInput): CronEditorValidationError | null {
   const trimmedPrompt = input.prompt.trim()
   const trimmedSchedule = input.schedule.trim()
+  const scheduleRequired = !input.triggerOnly
 
-  if (!trimmedSchedule && !trimmedPrompt && !input.scriptOnlyJob) {
+  if (scheduleRequired && !trimmedSchedule && !trimmedPrompt && !input.scriptOnlyJob) {
     return 'prompt_and_schedule'
   }
 
-  if (!trimmedSchedule) {
+  if (scheduleRequired && !trimmedSchedule) {
     return 'schedule'
   }
 

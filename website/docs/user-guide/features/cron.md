@@ -19,6 +19,7 @@ Cron jobs can:
 - run in fresh agent sessions with the normal static tool list
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 - fire on **external events** — a webhook route with `cron_job` set fires the job the moment something happens (a PR gets feedback, a service posts an alert) instead of waiting for the next scheduled tick. See [Event-Triggered Cron Jobs](/user-guide/messaging/webhooks#event-triggered-cron-jobs).
+- be **trigger-only** — created with no schedule at all, so they never fire on their own and run only when explicitly triggered (the dashboard's Trigger button, `hermes cron run`, or an event route). See [Trigger-only jobs](#trigger-only-jobs-no-schedule).
 
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
 
@@ -82,6 +83,32 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 ```
 
 Hermes will use the unified `cronjob` tool internally.
+
+### Trigger-only jobs (no schedule)
+
+Omit the schedule (or pass an empty string) to create a job that never fires on its own — it runs only when something explicitly triggers it:
+
+```bash
+# Standalone CLI — "" is the schedule slot
+hermes cron create "" "Rebuild the fork-sync PR as soon as CI turns green"
+```
+
+```python
+# From a chat, via the cronjob tool
+cronjob(
+    action="create",
+    schedule="",
+    prompt="Rebuild the fork-sync PR as soon as CI turns green",
+)
+```
+
+Semantics:
+
+- Stored as `{"kind": "trigger"}` with **no** `next_run_at`; `hermes cron list` shows the schedule as `trigger only` and no next run.
+- The scheduler tick never picks it up — no automatic runs, no catch-up, no misfire sweep — and the record stays enabled (never "completed"), so it can be triggered any number of times.
+- Fire it explicitly: `hermes cron run <job_id>` (or the `cronjob(action='run')` tool call, or the dashboard's Trigger button). Event routes — a webhook with `cron_job` set — fire it the same way, so a trigger-only job is the natural pairing for [Event-Triggered Cron Jobs](/user-guide/messaging/webhooks#event-triggered-cron-jobs).
+- Convert an existing job with `hermes cron edit <job_id> --schedule ""` (or `schedule=""` via the tool / dashboard); set a real schedule the same way to make it automatic again.
+- `hermes cron doctor` does not flag trigger-only jobs for their missing next run.
 
 ## Pre-dispatch configuration validation
 
