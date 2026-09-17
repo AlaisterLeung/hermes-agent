@@ -1418,14 +1418,17 @@ class MatrixAdapter(BasePlatformAdapter):
         parent_chat_id: str,
         name: str,
     ) -> Optional[str]:
-        """Create a fresh Matrix thread rooted in ``parent_chat_id``.
+        """Create a fresh Matrix thread rooted in ``parent_chat_id``: post a seed message and
+        return its ``event_id`` as the handoff ``thread_id``. Matrix has no create-thread API — a
+        thread is the events whose ``m.relates_to``/``rel_type: m.thread`` point at a root event;
+        ``_apply_relation_metadata`` already threads later sends off a supplied ``thread_id``.
 
-        Implements the base-class handoff hook so continuable cron deliveries
-        open a dedicated thread; the returned root event id is what the brief
-        is sent under and the session is seeded to. Accepts a ``!room:server``
-        id or a ``#alias:server`` alias (resolved via the directory API).
-        Returns the root event id, or ``None`` on any failure — callers fall
-        back to flat delivery and never fail the run.
+        Implements the base-class handoff hook so continuable cron deliveries open a dedicated
+        thread. Accepts a ``!room:server`` id or a ``#alias:server`` alias (resolved via the
+        directory API). In-thread replies keep the ROOM's chat_type (``dm``/``group``) in the
+        session key — the handoff watcher and the cron seeder mirror that shape rather than the
+        shared ``thread`` slot. Returns the root event id, or ``None`` on any failure — callers
+        fall back to flat delivery and never fail the run.
         """
         if not self._client:
             logger.debug("Matrix: create_handoff_thread skipped — client not connected")
@@ -1455,14 +1458,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
                     return None
 
-            msg_content: Dict[str, Any] = {"msgtype": "m.text", "body": name}
-            event_id = await self._send_room_message(room_id, msg_content)
-            root = str(event_id)
+            result = await self.send(room_id, (name or "").strip() or "Hermes session")
+            root = result.message_id if result.success else None
+            if not root:
+                return None
+            self._threads.mark(str(root))  # replies in this thread bypass require_mention, like inbound roots
             logger.info(
                 "Matrix: opened continuable thread root %s in %s (%s)",
                 root, room_id, name,
             )
-            return root
+            return str(root)
         except Exception as exc:
             logger.warning(
                 "Matrix: create_handoff_thread failed for %s (%s) — falling "
