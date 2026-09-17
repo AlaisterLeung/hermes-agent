@@ -273,6 +273,7 @@ export const en: Translations = {
       weekly: "Weekly",
       monthly: "Monthly",
       once: "Once",
+      trigger: "Trigger only",
       custom: "Custom (cron expression)",
       intervalEvery: "Every",
       intervalUnit: "Unit",
@@ -284,6 +285,8 @@ export const en: Translations = {
       weekdaysShort: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
       dayOfMonth: "Day of month",
       onceAt: "Run at",
+      triggerHint:
+        "No automatic runs — the job fires only when triggered (the Trigger button or an event route such as a webhook).",
       customLabel: "Cron expression",
       customPlaceholder: "0 9 * * *",
       customHint:
@@ -300,6 +303,7 @@ export const en: Translations = {
       weeklyAt: "Weekly on {days} at {time}",
       monthlyAt: "Monthly on the {day} at {time}",
       onceAt: "Once at {time}",
+      triggerOnly: "Trigger only",
     },
     deliverTo: "Deliver to",
     scheduledJobs: "Scheduled Jobs",

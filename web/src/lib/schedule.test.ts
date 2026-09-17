@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildScheduleString,
   DEFAULT_SCHEDULE_STATE,
+  describeSchedule,
   parseScheduleString,
+  type ScheduleDescribeStrings,
 } from "./schedule";
 
 describe("parseScheduleString", () => {
@@ -97,6 +99,15 @@ describe("parseScheduleString", () => {
   it("returns the default state for empty input", () => {
     expect(parseScheduleString("")).toEqual(DEFAULT_SCHEDULE_STATE);
   });
+
+  it("parses trigger-only jobs from their stored kind", () => {
+    // Trigger jobs store an empty schedule string; the kind disambiguates them
+    // from a blank/incomplete form.
+    expect(parseScheduleString("", "trigger")).toMatchObject({ mode: "trigger" });
+    expect(
+      buildScheduleString({ ...DEFAULT_SCHEDULE_STATE, mode: "trigger" }),
+    ).toBe("");
+  });
 });
 
 describe("buildScheduleString round-trip", () => {
@@ -119,5 +130,33 @@ describe("buildScheduleString round-trip", () => {
       const state = parseScheduleString(input);
       expect(buildScheduleString(state)).toBe(expected);
     }
+  });
+});
+
+describe("describeSchedule", () => {
+  const strings: ScheduleDescribeStrings = {
+    none: "—",
+    everyMinutes: "Every {n} min",
+    everyHours: "Every {n} h",
+    everyDays: "Every {n} d",
+    dailyAt: "Daily at {time}",
+    weeklyAt: "Weekly on {days} at {time}",
+    monthlyAt: "Monthly on the {day} at {time}",
+    onceAt: "Once at {time}",
+    weekdaysShort: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+    ordinal: (day: number) => String(day),
+  };
+
+  it("renders trigger-only jobs as such instead of a schedule", () => {
+    expect(
+      describeSchedule({ kind: "trigger", display: "trigger only" }, "trigger only", {
+        ...strings,
+        triggerOnly: "Trigger only",
+      }),
+    ).toBe("Trigger only");
+    // Locales without the key still show the backend's truthful display string.
+    expect(
+      describeSchedule({ kind: "trigger", display: "trigger only" }, "trigger only", strings),
+    ).toBe("trigger only");
   });
 });

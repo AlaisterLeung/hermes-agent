@@ -560,8 +560,7 @@ def _with_guidance(result: Dict[str, Any], job: Dict[str, Any], deliver: Optiona
 def _action_create(a: Dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
-    if not a["schedule"]:
-        return tool_error("schedule is required for create", success=False)
+    # Empty/absent schedule == a trigger-only job (no automatic runs; fired via `run` or events).
     canonical_skills = _canonical_skills(a["skill"], a["skills"])
     _no_agent = bool(a["no_agent"])
     # no_agent=True -> the script IS the job (prompt/skills optional); else prompt or skills.
@@ -1023,7 +1022,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run, resnap. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. When action=resnap, pass either job_id (single job) or all=true (every unpinned job)."
+                "description": "One of: create, list, update, pause, resume, remove, run, resnap. When action=create, 'prompt' is REQUIRED; 'schedule' is required unless you intend a trigger-only job (pass '' — the job then never fires on its own and runs only via action='run' or external events). When action=resnap, pass either job_id (single job) or all=true (every unpinned job)."
             },
             "job_id": {
                 "type": "string",
@@ -1039,8 +1038,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "schedule": {
                 "type": "string",
-                "type": "string",
-                "description": "REQUIRED for create. Schedule forms: (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'."
+                "description": "For create: schedule forms — (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'; (6) EMPTY ('') for a trigger-only job — never fires on its own; runs only when explicitly fired via action='run' or an external event (webhook route). On update, '' converts the job to trigger-only."
             },
             "name": {
                 "type": "string",

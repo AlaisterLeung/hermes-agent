@@ -2090,6 +2090,7 @@ export const ja = defineLocale({
       monthly: '毎月',
       hourly: '毎時',
       'every-15-minutes': '15 分ごと',
+      trigger: '手動トリガーのみ',
       custom: 'カスタム'
     },
     scheduleHints: {
@@ -2099,6 +2100,7 @@ export const ja = defineLocale({
       monthly: '毎月 1 日午前 9:00',
       hourly: '毎時 0 分',
       'every-15-minutes': '15 分ごと',
+      trigger: '自動実行なし — トリガー時のみ実行（実行ボタンや webhook などのイベント）',
       custom: 'Cron 構文または自然言語'
     },
     days: {

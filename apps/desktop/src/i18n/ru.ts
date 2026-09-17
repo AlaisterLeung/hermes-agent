@@ -2356,6 +2356,7 @@ export const ru = defineLocale({
       monthly: 'Ежемесячно',
       hourly: 'Каждый час',
       'every-15-minutes': 'Каждые 15 минут',
+      trigger: 'Только по триггеру',
       custom: 'Свой'
     },
     scheduleHints: {
@@ -2365,6 +2366,7 @@ export const ru = defineLocale({
       monthly: 'В первый день каждого месяца в 9:00',
       hourly: 'В начале каждого часа',
       'every-15-minutes': 'Каждые 15 минут',
+      trigger: 'Без автоматических запусков — только по триггеру (кнопка «Запустить» или событие, например webhook)',
       custom: 'Синтаксис cron или естественный язык'
     },
     days: {

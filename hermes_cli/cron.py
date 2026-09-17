@@ -211,7 +211,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Name", job.get("name", "(unnamed)")),
         ("Schedule", job.get("schedule_display", job.get("schedule", {}).get("value", "?"))),
         ("Repeat", f"{repeat_info.get('completed', 0)}/{repeat_times}" if repeat_times else "∞"),
-        ("Next run", job.get("next_run_at", "?")),
+        ("Next run", job.get("next_run_at") or "—"),
         ("Deliver", deliver if isinstance(deliver, str) else ", ".join(deliver)),
     ] + [(label, value) for label, value in optional if value]
 
@@ -533,7 +533,11 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
     if unverified := job.get("last_delivery_unverified"):
         issues.append("last delivery unverified (adapter acked without evidence): "
                       + _unverified_targets(unverified))
-    if job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
+    # Trigger-only jobs intentionally have no next_run_at — never an "active job has no
+    # next_run_at" finding for them.
+    _schedule = job.get("schedule")
+    trigger_only = isinstance(_schedule, dict) and _schedule.get("kind") == "trigger"
+    if job.get("enabled", True) and job.get("state") not in {"paused", "completed"} and not trigger_only:
         next_run = str(job.get("next_run_at") or "").strip()
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
@@ -623,8 +627,10 @@ def cron_create(args):
     _print_job_details(result.get("job", {}))
     if not result.get("job", {}).get("enabled", True):
         print("  Created PAUSED — resume to schedule, or explicitly run now.")
-    else:
+    elif result.get("next_run_at"):
         print(f"  Next run: {result['next_run_at']}")
+    else:
+        print("  Trigger-only — no automatic runs; fire with `hermes cron run`.")
     _warn_if_gateway_not_running()
     return 0
 

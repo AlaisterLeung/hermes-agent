@@ -1799,6 +1799,7 @@ export const ar = defineLocale({
       monthly: 'شهريا',
       hourly: 'كل ساعة',
       'every-15-minutes': 'كل 15 دقيقة',
+      trigger: 'عند الطلب فقط',
       custom: 'مخصص'
     },
     scheduleHints: {
@@ -1808,6 +1809,7 @@ export const ar = defineLocale({
       monthly: 'أول يوم من كل شهر في الساعة 9:00 صباحا',
       hourly: 'في بداية كل ساعة',
       'every-15-minutes': 'كل 15 دقيقة',
+      trigger: 'لا تشغيل تلقائي — يعمل فقط عند التشغيل (زر التشغيل أو حدث مثل webhook)',
       custom: 'صياغة cron أو لغة طبيعية'
     },
     days: {

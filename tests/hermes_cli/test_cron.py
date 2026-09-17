@@ -128,6 +128,32 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_create_without_schedule_is_trigger_only(self, tmp_cron_dir, capsys):
+        rc = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="",
+                prompt="Fire on webhook",
+                name="Webhook follow-up",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+            )
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Schedule: trigger only" in out
+        assert "Trigger-only" in out
+
+        jobs = list_jobs()
+        assert len(jobs) == 1
+        assert jobs[0]["schedule"]["kind"] == "trigger"
+        assert jobs[0]["next_run_at"] is None
+
 
 class TestUnverifiedDeliveryVisibility:
     """An evidence-free live-adapter ack (Slack/Matrix/Mattermost bare
@@ -253,6 +279,16 @@ class TestCronDoctor:
         out = capsys.readouterr().out
         assert rc == 0
         assert "✓ Cron doctor found no issues" in out
+
+    def test_doctor_does_not_flag_trigger_only_jobs(self, tmp_cron_dir, capsys):
+        """Trigger-only jobs carry no next_run_at BY DESIGN — that is not a health issue."""
+        create_job(prompt="Fire on webhook", schedule="")
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "no next_run_at" not in out
 
 
 class TestCronListStatusRendering:

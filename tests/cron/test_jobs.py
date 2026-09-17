@@ -24,6 +24,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    trigger_job,
     _hermes_now,
 )
 
@@ -1971,3 +1972,89 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+
+# =========================================================================
+# Trigger-only jobs (blank schedule)
+# =========================================================================
+
+class TestTriggerOnlyJobs:
+    """A None/blank schedule creates a trigger-only job: no automatic runs, but the record
+    must stay enabled and re-fireable through explicit triggers (`hermes cron run`, events)."""
+
+    def test_parse_blank_schedules_become_trigger(self):
+        for blank in ("", "   ", "\t\n", None):
+            parsed = parse_schedule(blank)
+            assert parsed["kind"] == "trigger", blank
+            assert parsed["display"] == "trigger only"
+
+    def test_compute_next_run_is_none(self):
+        assert compute_next_run(parse_schedule("")) is None
+
+    def test_create_with_blank_schedule_stores_no_next_run(self, tmp_cron_dir):
+        job = create_job(prompt="Fired by hand", schedule="")
+        assert job["schedule"]["kind"] == "trigger"
+        assert job["schedule_display"] == "trigger only"
+        assert job["next_run_at"] is None
+        # Not a one-shot: no implicit repeat budget was pinned.
+        assert job["enabled"] is True
+
+    def test_never_due_without_an_explicit_trigger(self, tmp_cron_dir):
+        job = create_job(prompt="Fired by hand", schedule=None)
+        assert get_due_jobs() == []
+        # Scans must not invent a next_run_at for it (that would make it fire).
+        assert get_due_jobs() == []
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["next_run_at"] is None
+        assert stored["state"] == "scheduled"
+
+    def test_explicit_trigger_fires_once_and_is_repeatable(self, tmp_cron_dir):
+        job = create_job(prompt="Fired by hand", schedule="")
+        trigger_job(job["id"])
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+
+        # Completing the run must keep the job alive (never a terminal completion) and
+        # leave it triggerable again.
+        mark_job_run(job["id"], True)
+        stored = get_job(job["id"])
+        assert stored is not None
+        assert stored["state"] == "scheduled"
+        assert stored["enabled"] is True
+        assert stored["next_run_at"] is None
+        assert stored["last_run_at"] is not None
+
+        trigger_job(job["id"])
+        assert [j["id"] for j in get_due_jobs()] == [job["id"]]
+
+    def test_update_to_blank_clears_the_schedule(self, tmp_cron_dir):
+        job = create_job(prompt="Now hourly", schedule="every 2h")
+        updated = update_job(job["id"], {"schedule": ""})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "trigger"
+        assert updated["schedule_display"] == "trigger only"
+        assert updated["next_run_at"] is None
+        assert updated["state"] == "scheduled"
+        assert updated["enabled"] is True
+        # And the due scan leaves it alone even though it used to be recurring.
+        assert get_due_jobs() == []
+
+    def test_update_from_trigger_to_real_schedule_rearms(self, tmp_cron_dir):
+        job = create_job(prompt="Later hourly", schedule="")
+        updated = update_job(job["id"], {"schedule": "every 1h"})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "interval"
+        assert updated["next_run_at"] is not None
+
+    def test_pause_resume_keeps_trigger_only(self, tmp_cron_dir):
+        job = create_job(prompt="Fired by hand", schedule="")
+        pause_job(job["id"])
+        paused = get_job(job["id"])
+        assert paused is not None
+        assert paused["state"] == "paused"
+        resumed = resume_job(job["id"])
+        assert resumed is not None
+        assert resumed["schedule"]["kind"] == "trigger"
+        assert resumed["next_run_at"] is None
+        assert resumed["state"] == "scheduled"
