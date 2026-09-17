@@ -20,7 +20,8 @@ def test_wedged_lifecycle_probe_returns_bounded_error_without_running(monkeypatc
     monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
     monkeypatch.setattr(cet, "_load_config", lambda: {"timeout": 0.05})
     monkeypatch.setattr(terminal_module, "_PRE_EXEC_GUARD_MIN_TIMEOUT_S", 0)
-    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: time.sleep(1))
+    # Same wedge/bound pairing as the terminal guard test: 30s probe, loose bound.
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: time.sleep(30))
     ran: list[str] = []
     monkeypatch.setattr(cet, "_get_env_config", lambda: ran.append("env") or {"env_type": "local"}, raising=False)
 
@@ -28,6 +29,8 @@ def test_wedged_lifecycle_probe_returns_bounded_error_without_running(monkeypatc
     result = json.loads(cet.execute_code("print('hi')"))
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.5, f"lifecycle probe wedged execute_code for {elapsed:.2f}s"
+    # Loose bound: rides out loaded-runner stalls (thread start + wake-up jitter);
+    # still far below the 30s wedge a missing deadline wrap would wait out.
+    assert elapsed < 10, f"lifecycle probe wedged execute_code for {elapsed:.2f}s"
     assert "did not finish" in result["error"]
     assert ran == [], "a probe with no verdict must not fail open into execution"

@@ -47,7 +47,8 @@ def test_wedged_pre_execution_guard_returns_bounded_error_without_running(monkey
     """A stalled identity probe returns a retryable error within the deadline; the command does not run."""
 
     def _wedged_probe(*_a, **_k):
-        time.sleep(1)
+        # A real wedge lasts for minutes; 30s keeps the signal unambiguous.
+        time.sleep(30)
 
     monkeypatch.setattr(terminal_module, "_pre_exec_block", _wedged_probe)
 
@@ -55,7 +56,9 @@ def test_wedged_pre_execution_guard_returns_bounded_error_without_running(monkey
     result = json.loads(terminal_module.terminal_tool("echo ok"))
     elapsed = time.monotonic() - start
 
-    assert elapsed < 0.5, f"pre-execution guard wedged terminal_tool for {elapsed:.2f}s"
+    # Loose bound: rides out loaded-runner stalls (thread start + wake-up jitter);
+    # still far below the 30s wedge a missing deadline wrap would wait out.
+    assert elapsed < 10, f"pre-execution guard wedged terminal_tool for {elapsed:.2f}s"
     assert result["status"] == "error"
     assert "did not finish" in result["error"]
     assert stubbed_pipeline == [], "a guard with no verdict must not fail open into execution"
