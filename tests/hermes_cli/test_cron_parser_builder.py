@@ -63,3 +63,17 @@ def test_cron_budget_flags_on_create_and_edit():
     ns = parser.parse_args(["cron", "create", "30m", "--max-turns", "unlimited"])
     assert ns.max_turns == "unlimited"
     assert ns.run_budget_seconds is None
+
+
+def test_cron_create_schedule_is_optional_for_trigger_only_jobs():
+    parser = _build()
+    # Omitted schedule → "" (trigger-only); an explicit "" spelling works too.
+    ns = parser.parse_args(["cron", "create"])
+    assert ns.schedule == ""
+    assert ns.prompt is None
+    ns = parser.parse_args(["cron", "create", "", "Fire on webhook"])
+    assert ns.schedule == ""
+    assert ns.prompt == "Fire on webhook"
+    ns = parser.parse_args(["cron", "create", "every 1h", "Check status"])
+    assert ns.schedule == "every 1h"
+    assert ns.prompt == "Check status"

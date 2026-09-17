@@ -75,6 +75,12 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
     """Mode guidance echoed once in the create/update response (not in the schema, which is
     paid for on every API call)."""
     notes: List[str] = []
+    if (job.get("schedule") or {}).get("kind") == "trigger":
+        notes.append(
+            "Trigger-only: the job never fires on its own — start it with an "
+            "explicit trigger (cronjob action='run', `hermes cron run <id>`, the "
+            "dashboard's Trigger button, or an event route such as a webhook "
+            "cron_job). Set a real schedule to make it run automatically.")
     if job.get("monitor_script") or job.get("monitor_url"):
         notes.append(
             "Monitor mode: the source runs first each tick and its output is "

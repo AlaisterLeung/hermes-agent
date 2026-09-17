@@ -2727,6 +2727,7 @@ export const zh = defineLocale({
       monthly: '每月',
       hourly: '每小时',
       'every-15-minutes': '每 15 分钟',
+      trigger: '仅手动触发',
       custom: '自定义'
     },
     scheduleHints: {
@@ -2736,6 +2737,7 @@ export const zh = defineLocale({
       monthly: '每月第一天上午 9:00',
       hourly: '每个整点',
       'every-15-minutes': '每 15 分钟',
+      trigger: '不自动运行 — 仅在触发时执行（触发按钮或事件路由，如 webhook）',
       custom: 'Cron 语法或自然语言'
     },
     days: {

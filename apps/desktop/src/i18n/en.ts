@@ -2583,6 +2583,7 @@ export const en: Translations = {
       monthly: 'Monthly',
       hourly: 'Hourly',
       'every-15-minutes': 'Every 15 minutes',
+      trigger: 'Trigger only',
       custom: 'Custom'
     },
     scheduleHints: {
@@ -2592,6 +2593,7 @@ export const en: Translations = {
       monthly: 'The first day of each month at 9:00 AM',
       hourly: 'At the top of every hour',
       'every-15-minutes': 'Every 15 minutes',
+      trigger: 'No automatic runs — fires only when triggered (the Trigger button or an event route such as a webhook)',
       custom: 'Cron syntax or natural language'
     },
     days: {

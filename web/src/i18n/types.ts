@@ -299,6 +299,9 @@ export interface Translations {
       weekdaysShort: [string, string, string, string, string, string, string];
       dayOfMonth: string;
       onceAt: string;
+      /** Optional — English fallback until translated. */
+      trigger?: string;
+      triggerHint?: string;
       customLabel: string;
       customPlaceholder: string;
       customHint: string;
@@ -314,6 +317,8 @@ export interface Translations {
       weeklyAt: string;
       monthlyAt: string;
       onceAt: string;
+      /** Optional — English fallback until translated. */
+      triggerOnly?: string;
     };
     deliverTo: string;
     scheduledJobs: string;

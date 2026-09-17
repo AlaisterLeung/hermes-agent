@@ -8,7 +8,9 @@ user docs `website/docs/user-guide/features/cron.md`, `kanban.md`.
 `cron/jobs.py` (job store) + `cron/scheduler.py` (tick loop; `scheduler_*.py` siblings). Agents
 schedule via the `cronjob` tool; users via `hermes cron list|add|edit|pause|resume|run|remove` or
 `/cron`. Schedules: duration (`"30m"`, `"2h"`, `"1d"`), "every" phrase (`"every 2h"`, `"every monday
-9am"`), 5-field cron (`"0 9 * * *"`), ISO one-shot (`"2026-06-01T09:00:00Z"`). Per-job fields:
+9am"`), 5-field cron (`"0 9 * * *"`), ISO one-shot (`"2026-06-01T09:00:00Z"`), or **blank/None =
+trigger-only** (`{"kind": "trigger"}`: never due, no `next_run_at`; only `cron run`/event fires —
+`mark_job_run` must never complete it). Per-job fields:
 `skills`, `model`/`provider` overrides, `script` (pre-run data-collection script whose stdout is
 injected into the prompt; `no_agent=True` makes the script the whole job), `context_from` (chain job
 A's last output into job B's prompt), `workdir` (run with that directory's `AGENTS.md`/`CLAUDE.md`

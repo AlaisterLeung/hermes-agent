@@ -20,7 +20,7 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 
 ## Scheduling Model
 
-Four schedule formats are supported:
+Four schedule formats are supported (plus trigger-only jobs with no schedule at all):
 
 | Format | Example | Behavior |
 |--------|---------|----------|
@@ -28,6 +28,7 @@ Four schedule formats are supported:
 | **Interval** | `every 2h`, `every 30m` | Recurring, fires at regular intervals |
 | **Cron expression** | `0 9 * * *` | Standard 5-field cron syntax (minute, hour, day, month, weekday) |
 | **ISO timestamp** | `2025-01-15T09:00:00` | One-shot, fires at the exact time |
+| **Trigger-only** | `""` (empty) | Never fires on its own — only via an explicit trigger (`cron run`, `claim_job_for_fire`, a webhook `cron_job` route). Stored as `{"kind": "trigger"}` with no `next_run_at`. |
 
 The model-facing surface is a single `cronjob` tool with action-style operations: `create`, `list`, `update`, `pause`, `resume`, `run`, `remove`.
 

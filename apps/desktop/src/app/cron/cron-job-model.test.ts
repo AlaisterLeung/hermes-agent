@@ -36,6 +36,15 @@ describe('validateCronEditor', () => {
   it('still requires schedule for script-only jobs', () => {
     expect(validateCronEditor({ prompt: '', schedule: '', scriptOnlyJob: true })).toBe('schedule')
   })
+
+  it('accepts an empty schedule when the editor is set to trigger-only', () => {
+    // Trigger-only: the job fires via the Trigger button / events, so the
+    // missing schedule is the point — but a prompt is still required.
+    expect(validateCronEditor({ prompt: 'go', schedule: '', scriptOnlyJob: false, triggerOnly: true })).toBe(null)
+    expect(validateCronEditor({ prompt: '   ', schedule: '', scriptOnlyJob: false, triggerOnly: true })).toBe('prompt')
+    // Script-only trigger jobs need neither a schedule nor a prompt.
+    expect(validateCronEditor({ prompt: '', schedule: '', scriptOnlyJob: true, triggerOnly: true })).toBe(null)
+  })
 })
 
 describe('cron delivery targets', () => {

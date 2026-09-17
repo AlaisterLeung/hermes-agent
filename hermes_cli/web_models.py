@@ -290,7 +290,8 @@ class CronJobCreate(BaseModel):
     paused: StrictBool = False
     paused_reason: Optional[str] = None
     prompt: str = ""
-    schedule: str
+    # Empty = trigger-only (no automatic runs; fired via the Trigger button or events).
+    schedule: str = ""
     name: str = ""
     deliver: str = "local"
     skills: Optional[List[str]] = None

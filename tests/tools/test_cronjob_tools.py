@@ -293,6 +293,37 @@ class TestUnifiedCronjobTool:
         from cron.jobs import get_job
         assert get_job(job_id)["schedule"]["expr"] == "0 9 * * *"
 
+    def test_create_with_empty_schedule_is_trigger_only(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Fire on webhook", schedule="")
+        )
+        assert created["success"] is True
+        assert created["schedule"] == "trigger only"
+        assert created["next_run_at"] is None
+        # The calling model must learn the job never fires on its own.
+        assert any("Trigger-only" in note for note in created.get("guidance", []))
+
+        from cron.jobs import get_due_jobs, get_job
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["schedule"]["kind"] == "trigger"
+        assert get_due_jobs() == []
+
+    def test_create_without_schedule_field_is_trigger_only(self):
+        created = json.loads(cronjob(action="create", prompt="Fire on webhook"))
+        assert created["success"] is True
+        assert created["schedule"] == "trigger only"
+
+    def test_update_with_empty_schedule_clears_to_trigger_only(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        updated = json.loads(
+            cronjob(action="update", job_id=created["job_id"], schedule="")
+        )
+        assert updated["success"] is True
+        assert updated["job"]["schedule"] == "trigger only"
+        assert updated["job"]["next_run_at"] is None
+        assert updated["job"]["state"] == "scheduled"
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

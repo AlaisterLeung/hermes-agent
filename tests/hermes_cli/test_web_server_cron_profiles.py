@@ -972,6 +972,20 @@ async def test_create_cron_job_rejects_empty_agent_job(isolated_profiles):
 
 
 @pytest.mark.asyncio
+async def test_create_cron_job_with_empty_schedule_is_trigger_only(isolated_profiles):
+    """An empty schedule must be accepted: trigger-only job (no automatic runs)."""
+    from hermes_cli import web_server
+
+    job = await _rt_cron.create_cron_job(
+        _web_models.CronJobCreate(prompt="Fire on webhook", schedule=""),
+        profile="worker_alpha",
+    )
+
+    assert job["schedule"]["kind"] == "trigger"
+    assert not job.get("next_run_at")
+
+
+@pytest.mark.asyncio
 async def test_update_cron_job_no_agent_reuses_existing_script(isolated_profiles):
     from hermes_cli import web_server
 
