@@ -393,23 +393,27 @@ describe('LocalModelsSettings', () => {
       runtime_installed: true,
       runtime_backend: 'cuda'
     })
+
     // A running job already in the app-level store — as after closing and
-    // reopening the pane mid-download.
-    $localRuntimeJobs.set([
-      {
-        job_id: 'j9',
-        kind: 'model-download',
-        target: 'Qwen3.6 27B',
-        model_id: FITTING_MODEL.id,
-        status: 'running',
-        phase: 'downloading',
-        detail: '',
-        total_bytes: 100,
-        done_bytes: 62,
-        percent: 62,
-        error: null
-      }
-    ])
+    // reopening the pane mid-download. The pane kicks the shared job poll
+    // on mount; pin the backend read to the same job so that poll cannot
+    // replace the fixture with the default empty list.
+    const running: LocalRuntimeJob = {
+      job_id: 'j9',
+      kind: 'model-download',
+      target: 'Qwen3.6 27B',
+      model_id: FITTING_MODEL.id,
+      status: 'running',
+      phase: 'downloading',
+      detail: '',
+      total_bytes: 100,
+      done_bytes: 62,
+      percent: 62,
+      error: null
+    }
+
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [running] })
+    $localRuntimeJobs.set([running])
 
     await renderFullPane()
     await screen.findByText('Qwen3.6 27B')
@@ -428,20 +432,24 @@ describe('LocalModelsSettings', () => {
       runtime_installed: true,
       runtime_backend: 'cuda'
     })
-    $localRuntimeJobs.set([
-      {
-        job_id: 'j2',
-        kind: 'model-download',
-        target: 'Qwen3.6 27B',
-        model_id: FITTING_MODEL.id,
-        status: 'error',
-        phase: 'verifying',
-        detail: '',
-        total_bytes: 100,
-        done_bytes: 100,
-        error: 'Downloaded file failed its integrity check and was removed — try again'
-      }
-    ])
+
+    // The pane's mount poll must answer with the same failed job, not the
+    // default empty list — otherwise a kick replaces the fixture after mount.
+    const failed: LocalRuntimeJob = {
+      job_id: 'j2',
+      kind: 'model-download',
+      target: 'Qwen3.6 27B',
+      model_id: FITTING_MODEL.id,
+      status: 'error',
+      phase: 'verifying',
+      detail: '',
+      total_bytes: 100,
+      done_bytes: 100,
+      error: 'Downloaded file failed its integrity check and was removed — try again'
+    }
+
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [failed] })
+    $localRuntimeJobs.set([failed])
 
     await renderFullPane()
     await screen.findByText('Qwen3.6 27B')
@@ -474,21 +482,25 @@ describe('quickstart', () => {
   })
 
   it('pins the quickstart progress view while the job runs', async () => {
-    $localRuntimeJobs.set([
-      {
-        job_id: 'q1',
-        kind: 'quickstart',
-        target: 'Qwen3.6 27B',
-        model_id: 'qwen3.6-27b',
-        status: 'running',
-        phase: 'downloading',
-        detail: 'Qwen3.6 27B — 17.6 GB',
-        total_bytes: 100,
-        done_bytes: 30,
-        percent: 30,
-        error: null
-      }
-    ])
+    // The pane kicks the shared job poll on mount; pin the backend read to
+    // the same job so that poll cannot replace the fixture with the default
+    // empty list.
+    const running: LocalRuntimeJob = {
+      job_id: 'q1',
+      kind: 'quickstart',
+      target: 'Qwen3.6 27B',
+      model_id: 'qwen3.6-27b',
+      status: 'running',
+      phase: 'downloading',
+      detail: 'Qwen3.6 27B — 17.6 GB',
+      total_bytes: 100,
+      done_bytes: 30,
+      percent: 30,
+      error: null
+    }
+
+    mocked.getLocalModelsJobs.mockResolvedValue({ jobs: [running] })
+    $localRuntimeJobs.set([running])
     renderPane()
 
     expect(await screen.findByText('Qwen3.6 27B — 17.6 GB')).toBeTruthy()
