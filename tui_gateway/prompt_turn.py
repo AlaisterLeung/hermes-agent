@@ -426,8 +426,8 @@ def _run_post_turn_followups(
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
-        with session["history_lock"]:
-            if session.get("running"):
+        with _session_turn_admission(session) as admitted:
+            if not admitted or session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
         _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
@@ -945,7 +945,6 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, st.agent)
         _run_post_turn_followups(rid, sid, session, st.result, goal_followup)
-    run_thread = threading.Thread(target=run, daemon=True)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _sessions_lock:
@@ -956,8 +955,7 @@ def _run_prompt_submit(
             # still run its turn, but its stamp stays (#106459).
             if registered is session:
                 _reopen_routed_session_row(routing_db, sid, session)
-            session["_run_thread"] = run_thread
-            run_thread.start()
+            can_start = _start_session_work(run, name=f"prompt-turn-{sid}", session=session) is not None
     if not can_start:
         with session["history_lock"]:
             session["running"] = False
