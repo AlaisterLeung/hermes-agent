@@ -12,8 +12,9 @@ Contract under test, mirroring test_cron_thread_seed_dm_keying.py:
 2. The Matrix ROOM thread seed keys EXACTLY like the inbound in-thread room
    reply (``chat_type="group"``, participant-shared — no user segment).
 3. Matrix DM thread seeds keep keying through the ``dm`` arm.
-4. Non-Matrix platforms keep the historical ``chat_type="thread"`` +
-   ``system:cron`` seed shape byte-for-byte (no cross-platform regression).
+4. Non-Matrix platforms seed the ``chat_type`` slot their adapter's in-thread
+   reply keys on (``_THREAD_REPLY_CHAT_TYPE``), with the historical
+   ``system:cron`` user (no cross-platform regression).
 
 Asserting on build_session_key output — not on SessionSource field shapes —
 pins the end-to-end contract.
@@ -255,22 +256,23 @@ def test_matrix_seed_group_classification_survives_when_adapter_says_room():
 
 
 def test_non_matrix_seed_ignores_adapter_probe():
-    """Only matrix gets the live re-resolution; other platforms keep the
-    historical shape even if an adapter exposes a probe by coincidence."""
-    store = _seed(platform="slack", chat_id="C12345678", is_dm=False)
+    """Only matrix gets the live re-resolution; other platforms keep their
+    adapter's reply-keying slot even if an adapter exposes a probe by coincidence."""
+    store = _seed(platform="discord", chat_id="987654321", is_dm=False)
     seed_key = build_session_key(_seeded_source(store))
     assert ":thread:" in seed_key and "user_id" not in seed_key
 
 
 # ---------------------------------------------------------------------------
-# 4. Non-Matrix platforms keep the historical seed shape
+# 4. Non-Matrix platforms seed the slot their adapter's reply keys on
 # ---------------------------------------------------------------------------
 
 def test_slack_channel_thread_seed_shape_unchanged():
     store = _seed(platform="slack", chat_id="C0AAAA", thread_id="1787.448949")
 
     source = _seeded_source(store)
-    assert source.chat_type == "thread"
+    # Slack channel in-thread replies key the parent channel's ``group`` slot.
+    assert source.chat_type == "group"
     assert source.user_id == "system:cron"
     assert source.chat_id == "C0AAAA"
 
@@ -279,7 +281,8 @@ def test_telegram_thread_seed_shape_unchanged():
     store = _seed(platform="telegram", chat_id="555111", thread_id="42")
 
     source = _seeded_source(store)
-    assert source.chat_type == "thread"
+    # Telegram types every supergroup message ``group`` (forum topics included).
+    assert source.chat_type == "group"
     assert source.user_id == "system:cron"
     assert source.chat_id == "555111"
 
