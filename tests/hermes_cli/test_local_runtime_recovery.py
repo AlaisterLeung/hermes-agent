@@ -22,6 +22,19 @@ def _wait_for(predicate, timeout=10):
     assert predicate(), "process transition did not complete"
 
 
+def _wait_for_json(path, timeout=10):
+    """Parse-wait ``path``. ``exists()`` can win the race against the writer's flush+close on
+    Windows (the directory entry appears at open, the content lands at close), so existence is
+    not a readiness signal — a successful parse is."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    raise AssertionError(f"{path} did not parse as JSON within timeout")
+
+
 @pytest.mark.windows_only
 @pytest.mark.parametrize("case", [
     "modern", "legacy", "live-owner", "pid-reused", "unknown-owner", "wrong-exe",
@@ -73,8 +86,7 @@ def test_startup_preserves_trees_and_explicit_stop_checks_owner(tmp_path, monkey
     owner_identity = json.loads(owner.stdout.readline())
     processes = []
     try:
-        _wait_for(ready.exists)
-        record = json.loads(ready.read_text())
+        record = _wait_for_json(ready)
         processes = [psutil.Process(record[k]) for k in ("router", "child")]
         if case != "live-owner":
             owner.wait(timeout=10)
