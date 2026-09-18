@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agent.file_safety import get_nt_namespace_error, get_read_block_error
-from tools.binary_extensions import has_binary_extension, has_opaque_document_extension, is_pdf_path
+from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_common import DEFAULT_READ_LIMIT
@@ -1529,51 +1529,6 @@ def _mark_verification_stale(
         mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
-
-
-def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
-    """Reject text-tool writes that would corrupt a binary document.
-
-    ``read_file`` auto-extracts .docx/.xlsx/.pptx (and PDF, via anydoc) to
-    readable text, so the model plausibly believes it holds the file's
-    contents and tries to write the edited text back with write_file/patch.
-    A plain-text write can never produce a valid OOXML/OLE/ODF container, so
-    that write silently destroys the document (port of nearai/ironclaw#7109).
-
-    Rules:
-    - Opaque container formats (.doc/.docx/.xls/.xlsx/.ppt/.pptx/.odt/.ods/
-      .odp): always rejected — text bytes are never a valid document, whether
-      creating or overwriting.
-    - .pdf: rejected only when OVERWRITING an existing regular file. Raw PDF
-      syntax is text-authorable, so new-file creation stays allowed.
-    """
-    if has_opaque_document_extension(filepath):
-        ext = filepath[filepath.rfind("."):].lower()
-        return (
-            f"Refusing to write plain text to binary document '{filepath}' ({ext}). "
-            "A text write cannot produce a valid document container and would "
-            "corrupt the file (read_file showed you EXTRACTED text, not the real "
-            "bytes). Use the docx/xlsx/powerpoint skills or a library like "
-            "python-docx/openpyxl/python-pptx via the terminal to create or edit "
-            "this document."
-        )
-    if is_pdf_path(filepath):
-        try:
-            resolved = Path(_resolve_path_for_task(filepath, task_id))
-        except Exception:
-            resolved = Path(_expand_tilde(filepath))
-        try:
-            if resolved.is_file():
-                return (
-                    f"Refusing to overwrite existing PDF '{filepath}' with plain text. "
-                    "read_file showed you EXTRACTED text, not the real bytes — writing "
-                    "text back would destroy the document. Use the pdf skill or a PDF "
-                    "library via the terminal to modify it. (Creating a NEW .pdf file "
-                    "is allowed.)"
-                )
-        except OSError:
-            pass
-    return None
 
 
 # Whole-file rewrite hint: an overwrite of an existing file this large whose new content keeps at least
