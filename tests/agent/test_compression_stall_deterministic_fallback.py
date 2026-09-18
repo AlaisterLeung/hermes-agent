@@ -98,6 +98,15 @@ def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp
         assert calls == ["primary"], "no deterministic rung on the FIRST stall: the LLM route gets its backoff retry"
 
         # The backoff lapses; the still-oversized context re-triggers compression (the reporter's next turn).
+        # The cancelled primary worker persists its stall backoff while unwinding (the poll at the end waits
+        # for the same write): wait for it before clearing, or it can re-arm the row after the clear and the
+        # re-entry gate skips the escalation under load.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            row = compressor._session_db.get_compression_failure_cooldown(compressor._session_id) or {}
+            if cc.STALL_INTERRUPTED_FAILURE_CLASS in str(row.get("error") or ""):
+                break
+            time.sleep(0.01)
         compressor._summary_failure_cooldown_until = 0.0
         compressor._session_db.clear_compression_failure_cooldown(compressor._session_id)
         calls.clear()
