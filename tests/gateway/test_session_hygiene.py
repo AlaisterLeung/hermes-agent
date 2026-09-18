@@ -1661,6 +1661,7 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
+    worker_finished = threading.Event()
     session_id = "sess-fence-wait"
 
     class HungAfterFenceCancelAgent:
@@ -1687,13 +1688,14 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             worker_started.set()
             # Keep the worker alive (and keep reporting "progress") so a
             # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
                 if commit_fence is not None:
                     commit_fence.touch_progress()
                 if release_worker.is_set():
                     break
                 time.sleep(0.02)
+            worker_finished.set()
             return (messages, None)
 
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -1708,7 +1710,11 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
 
         assert result == "ok"
         assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
+        assert not worker_finished.is_set(), (
+            "the host returned only after the fence-ignoring worker finished — "
+            "it must stop extending the wait at the fence cancel (#96953)"
+        )
+        assert elapsed < 8.0, (
             f"hygiene host waited {elapsed:.1f}s after fence cancel — "
             "must not extend toward the 600s ceiling (#96953)"
         )

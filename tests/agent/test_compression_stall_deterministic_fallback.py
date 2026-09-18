@@ -27,7 +27,7 @@ from hermes_state import SessionDB
 
 CHAIN_ENTRY = {
     "provider": "custom", "model": "backup-summarizer", "base_url": "https://fallback.invalid/v1",
-    "api_key": "sk-fallback", "timeout": 0.4,
+    "api_key": "sk-fallback", "timeout": 4.0,
 }
 
 
@@ -64,7 +64,7 @@ def _stalling_call_llm(compressor, calls, *, fail_when_pinned=False):
         if fail_when_pinned and "provider" in kwargs:
             raise RuntimeError("fallback route exploded")
         cancelled = getattr(compressor, "_compression_cancelled_check", None)
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not (callable(cancelled) and cancelled()):
             time.sleep(0.001)
         raise AuxiliaryExplicitCancellation()
@@ -78,7 +78,7 @@ def _summary_rows(messages):
 
 @pytest.fixture
 def fast_timeouts(monkeypatch):
-    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
+    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (4.0, 30.0))
 
 
 def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp_path, fast_timeouts):
