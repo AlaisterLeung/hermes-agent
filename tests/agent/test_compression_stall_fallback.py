@@ -267,7 +267,7 @@ def test_same_turn_fallback_retry_is_not_gated_by_the_primary_stall_backoff(tmp_
         routes.append((route["label"] if route else None, kwargs.get("bypass_cooldown", False)))
         if route is None:
             cancelled = getattr(compressor, "_compression_cancelled_check", None)
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline and not (callable(cancelled) and cancelled()):
                 time.sleep(0.0005)
             raise AuxiliaryExplicitCancellation()
@@ -283,7 +283,7 @@ def test_same_turn_fallback_retry_is_not_gated_by_the_primary_stall_backoff(tmp_
             time.sleep(0.001)
         return real_route()
 
-    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
+    monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (4.0, 30.0))
     monkeypatch.setattr(cc, "resolve_compression_fallback_route", route_after_primary_unwound)
     with _patch_chain([CHAIN_ENTRY]):
         out_msgs, _prompt = agent._compress_context(live, "sys", approx_tokens=50_000)

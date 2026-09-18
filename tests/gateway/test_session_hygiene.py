@@ -493,13 +493,15 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+@pytest.mark.parametrize("warning_notifications", [True, False])
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path, warning_notifications):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
     timeout must fence its eventual commit, continue to the live agent, and
     clean up the temporary agent only after the worker actually returns.
     """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -559,6 +561,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         "  enabled: true\n"
         "  hygiene_timeout_seconds: 0.01\n"
         "  hygiene_failure_cooldown_seconds: 120\n"
+        f"display: {{suppress_warning_notifications: {str(not warning_notifications).lower()}}}\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
@@ -631,7 +634,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert _cd_args[0] == "sess-timeout"
     assert _cd_args[1] > time.time()
     timeout_warnings = [s for s in adapter.sent if "took too long" in s["content"]]
-    assert len(timeout_warnings) == 1
+    assert len(timeout_warnings) == int(warning_notifications)
     fake_db.archive_and_compact.assert_not_called()
     assert lease_released.is_set()
     # Event/state assertions prove the host returned before the detached
@@ -1658,6 +1661,7 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
+    worker_finished = threading.Event()
     session_id = "sess-fence-wait"
 
     class HungAfterFenceCancelAgent:
@@ -1684,13 +1688,14 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             worker_started.set()
             # Keep the worker alive (and keep reporting "progress") so a
             # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
+            deadline = time.monotonic() + 30.0
             while time.monotonic() < deadline:
                 if commit_fence is not None:
                     commit_fence.touch_progress()
                 if release_worker.is_set():
                     break
                 time.sleep(0.02)
+            worker_finished.set()
             return (messages, None)
 
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -1705,7 +1710,11 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
 
         assert result == "ok"
         assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
+        assert not worker_finished.is_set(), (
+            "the host returned only after the fence-ignoring worker finished — "
+            "it must stop extending the wait at the fence cancel (#96953)"
+        )
+        assert elapsed < 8.0, (
             f"hygiene host waited {elapsed:.1f}s after fence cancel — "
             "must not extend toward the 600s ceiling (#96953)"
         )

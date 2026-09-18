@@ -65,6 +65,13 @@ from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 import sys
+from tools.vision_tools_history_budget import (
+    record_embed as _record_embed,
+    release_embed as _release_embed,
+    repeat_refusal as _repeat_refusal,
+    resolve_repeat_cap as _resolve_repeat_cap,
+    resolve_embed_target_bytes as _resolve_embed_target_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -672,15 +679,15 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # Hard ceiling for vision API payloads (20 MB) — no major provider accepts larger.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap for conversation-history reuse: the data-URL is re-sent
-# every turn, and a 4 MB / 7900px embed cost ~400K chars / ~100–260K billed
-# tokens per image (#92699). 256 KB keeps a 1568px screenshot cheap enough to
-# ride the session (PNGs over it get downscaled further); the 20 MB ceiling /
-# Anthropic 5 MB cap are one-shot safety nets, not history-reuse sizes.
-_EMBED_TARGET_BYTES = 256 * 1024
-
-# Embed dimension cap (px, longest side): Anthropic's tokenizer downsamples to
-# a 1568px long edge — pixels past that cost wire bytes, never extra fidelity.
+# Proactive embed caps for history reuse: the native path bakes the data URL into the tool
+# result, re-sent every later turn (a 4 MB embed cost ~100-260K billed tokens). Anthropic
+# downsamples to a 1568px long edge anyway, so pixels past that cost wire bytes for no fidelity.
+# The 20 MB hard ceiling / Anthropic 5 MB reject-cap still apply as safety nets; those are one-shot viewing
+# limits, not history-reuse sizes. A 4 MB / 7900px embed was observed at ~400K chars and ~100–260K billed
+# tokens per image (#92699), so we size for model reading instead: the byte budget is
+# ``vision.embed_target_bytes`` (default 256 KB, see vision_tools_history_budget) — it keeps a 1568px
+# screenshot cheap enough to ride the session (PNGs that exceed it are downscaled further by the
+# byte-budget ladder), well under every provider's per-image limit.
 _EMBED_MAX_DIMENSION = 1568
 
 # Target size when auto-resizing after a provider rejects an image (5 MB); downscale and retry once.
@@ -1191,9 +1198,15 @@ async def _vision_analyze_native(
     """
     if not isinstance(image_url, str) or not image_url.strip():
         return tool_error("image_url is required", success=False)
+    # A cap > 0 RESERVES the slot here (atomic check-and-count); released below if no embed happens.
+    refusal = _repeat_refusal(image_url)
+    if refusal is not None:
+        return refusal
+    reserved = _resolve_repeat_cap() > 0
 
     temp_image_path: Optional[Path] = None
     should_cleanup = False
+    embedded = False
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
@@ -1277,7 +1290,8 @@ async def _vision_analyze_native(
 # Proactive embed cap: this image rides conversation history and re-sends
 # every turn, so resize down to the history-reuse targets whenever either cap
 # is exceeded — not just at the 20 MB hard ceiling (#92699).
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
+        embed_target_bytes = _resolve_embed_target_bytes()
+        _over_bytes = len(image_data_url) > embed_target_bytes
         _over_dims = await _run_encode_on_cpu_executor(
             _image_exceeds_dimension, temp_image_path, _EMBED_MAX_DIMENSION,
         )
@@ -1285,7 +1299,7 @@ async def _vision_analyze_native(
             image_data_url = await _run_encode_on_cpu_executor(
                 _resize_image_for_vision,
                 temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
+                max_base64_bytes=embed_target_bytes,
                 max_dimension=_EMBED_MAX_DIMENSION,
                 scale_out=_scale_info,
                 force_jpeg=True,
@@ -1302,7 +1316,9 @@ async def _vision_analyze_native(
                     f"or compress the image manually.",
                     success=False,
                 )
-
+        embedded = True
+        if not reserved:
+            _record_embed(image_url)
         return _build_native_vision_tool_result(
             image_url=image_url,
             question=question,
@@ -1317,6 +1333,8 @@ async def _vision_analyze_native(
         logger.warning("Native vision fast path failed: %s", exc)
         return tool_error(f"Native vision failed: {exc}", success=False)
     finally:
+        if reserved and not embedded:
+            _release_embed(image_url)
         # Only delete temp files we created — never user-provided paths.
         if should_cleanup and temp_image_path is not None:
             try:
