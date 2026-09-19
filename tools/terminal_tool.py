@@ -2025,9 +2025,11 @@ def _pre_exec_block(
     if _is_supervised_gateway_process():
         from cron.lifecycle_guard import (
             _MAX_REFERENCED_SCRIPT_BYTES,
-            contains_gateway_lifecycle_command_or_referenced_script,
+            HOST_INTERPRETER_KILL_REJECTION,
+            contains_host_interpreter_kill,
             contains_launchctl_submit_command,
             lifecycle_scan_root_within_budget,
+            scan_gateway_lifecycle,
         )
         # Keep the specific launchctl diagnostic when this optional pre-scan
         # fits the budget; the full fail-closed guard below still runs otherwise.
@@ -2121,11 +2123,41 @@ def _pre_exec_block(
                 pass
             return None
 
-        if contains_gateway_lifecycle_command_or_referenced_script(
+        unsafe, refusal = scan_gateway_lifecycle(
             command,
             cwd=guard_cwd,
             read_remote_script=_read_script_in_env,
-        ):
+        )
+        if unsafe and refusal:
+            # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
+            # size, device, live SQLite, cloud placeholder). Say so, or the model rewords and retries
+            # the same command in a loop (#113944).
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    f"Blocked: the lifecycle guard could not scan this command or "
+                    f"referenced script: {refusal}. Nothing in the command is known to "
+                    "contain a gateway lifecycle command, but a script the command "
+                    "executes must be scannable (a regular text file under 1 MiB) "
+                    "before it can run inside the gateway process."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
+        if unsafe:
+            # Name the ownership-scoped route for image-name kills: the intent is almost always
+            # "stop MY background job", and re-rolling the same over-broad spelling is what takes
+            # the gateway down.
+            if (
+                lifecycle_scan_root_within_budget(command)
+                and contains_host_interpreter_kill(command)
+            ):
+                raise _Rejected(json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": HOST_INTERPRETER_KILL_REJECTION,
+                    "status": "error",
+                }, ensure_ascii=False))
             raise _Rejected(json.dumps({
                 "output": "",
                 "exit_code": 1,

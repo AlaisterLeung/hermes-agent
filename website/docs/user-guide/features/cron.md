@@ -106,7 +106,7 @@ Semantics:
 
 - Stored as `{"kind": "trigger"}` with **no** `next_run_at`; `hermes cron list` shows the schedule as `trigger only` and no next run.
 - The scheduler tick never picks it up — no automatic runs, no catch-up, no misfire sweep — and the record stays enabled (never "completed"), so it can be triggered any number of times.
-- Fire it explicitly: `hermes cron run <job_id>` (or the `cronjob(action='run')` tool call, or the dashboard's Trigger button). Event routes — a webhook with `cron_job` set — fire it the same way, so a trigger-only job is the natural pairing for [Event-Triggered Cron Jobs](/user-guide/messaging/webhooks#event-triggered-cron-jobs).
+- Fire it explicitly: `hermes cron run <job_id>` (or the `cronjob(action='run')` tool call, or the dashboard's Trigger button). Event routes — a webhook with `cron_job` set — fire it the same way, so a trigger-only job is the natural pairing for [Event-Triggered Cron Jobs](../messaging/webhooks.md#event-triggered-cron-jobs).
 - Convert an existing job with `hermes cron edit <job_id> --schedule ""` (or `schedule=""` via the tool / dashboard); set a real schedule the same way to make it automatic again.
 - `hermes cron doctor` does not flag trigger-only jobs for their missing next run.
 

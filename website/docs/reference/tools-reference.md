@@ -128,7 +128,7 @@ patch(mode="replace", path="app.py", old_string="old", new_string="new", target=
 search_files(pattern="TODO", target="content", execution_target="devbox")
 ```
 
-Relative paths use the selected target's own session working directory and FileOperations adapter. Results include resolved `target` and `backend` metadata, plus `cwd` when available. See [Named Execution Targets](/user-guide/configuration#named-execution-targets) for configuration, default, and legacy behavior.
+Relative paths use the selected target's own session working directory and FileOperations adapter. Results include resolved `target` and `backend` metadata, plus `cwd` when available. See [Named Execution Targets](../user-guide/configuration.md#named-execution-targets) for configuration, default, and legacy behavior.
 
 ## `homeassistant` toolset
 
@@ -324,7 +324,7 @@ Saved-output hints can include an opaque `runtime_scope`. Pass it back to `read_
 
 Inside `execute_code`, nested target-aware `hermes_tools` calls inherit and are bound to the script's selected target. A nested call that explicitly selects another target is rejected server-side; start a separate top-level `execute_code` call for cross-target orchestration. Python itself runs on the selected environment, and project mode resolves its cwd from that target's session/config state.
 
-See [Named Execution Targets](/user-guide/configuration#named-execution-targets) for the complete config shape and inheritance rules.
+See [Named Execution Targets](../user-guide/configuration.md#named-execution-targets) for the complete config shape and inheritance rules.
 
 ## `todo` toolset
 

@@ -878,6 +878,39 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
+def _dedup_stub_or_block(task_data: dict, dedup_key: tuple, path: str) -> str:
+    """Return the "unchanged" stub for a repeated identical read, escalating to a
+    hard BLOCK after 2 stubs so weak tool-followers don't loop forever."""
+    with _read_tracker_lock:
+        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
+        task_data["dedup_hits"][dedup_key] = hits
+        _cap_read_tracker_data(task_data)
+
+    if hits >= 2:
+        return tool_error(
+            f"BLOCKED: You have called read_file on this "
+            f"exact region {hits + 1} times and the file "
+            "has NOT changed. STOP calling read_file for "
+            "this path — the content from your earlier "
+            "read_file result in this conversation is "
+            "still current. Proceed with your task using "
+            "the information you already have.",
+            path=path,
+            already_read=hits + 1,
+            # A REFUSAL the harness chose, not a failure the tool hit: without the
+            # marker the failure classifiers count the block and a repeated read
+            # escalates to `repeated_exact_failure_block` over calls that never failed.
+            **{GUARDRAIL_REFUSAL_KEY: True})
+
+    return json.dumps({
+        "status": "unchanged",
+        "message": _READ_DEDUP_STATUS_MESSAGE,
+        "path": path,
+        "dedup": True,
+        "content_returned": False,
+    }, ensure_ascii=False)
+
+
 def read_file_tool(
     path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT,
     task_id: str = "default", target: str | None = None,
