@@ -677,21 +677,48 @@ def clear_session_cwd(session_key: str) -> None:
             ):
                 _session_cwd.pop(key, None)
                 _session_cwd_specs.pop(key, None)
-def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
+
+
+def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
+    """Cwd to write into a LIVE cached env, or None to leave it untouched.
+
+    On container backends a raw host path (a desktop/TUI session registering its
+    workspace, e.g. ``C:\\Users\\me`` or ``/Users/me/workspace``) cannot be the
+    in-sandbox workdir: every file-tools ``_exec`` wrapper does
+    ``builtin cd -- <env.cwd> || exit 126``, so a host cwd poisons all later
+    file operations with an unrelated ``cd:`` error. The creation paths already
+    sanitize this (``_is_unusable_container_cwd`` guards); the live-env write
+    here is the one remaining unsanitized site. When the host path is the one
+    mounted at ``/workspace`` (docker cwd passthrough), the session's directory
+    is still reachable — remap instead of discarding, mirroring the env-creation
+    remap in ``terminal_tool()``. Non-container backends apply the override
+    verbatim (ACP project-root switching must keep working).
     """
-    Register environment overrides for a specific task/rollout.
+    env_type = getattr(env, "env_type", None)
+    if not env_type or not _is_container_backend(env_type):
+        return new_cwd
+    if not _is_unusable_container_cwd(new_cwd):
+        return new_cwd
+    host_mount = getattr(env, "host_cwd", None)
+    if isinstance(host_mount, str) and host_mount:
+        candidate = os.path.abspath(os.path.expanduser(new_cwd))
+        mounted = os.path.abspath(os.path.expanduser(host_mount))
+        if candidate == mounted:
+            return "/workspace"
+    return None
 
-    Called by Atropos environments before the agent loop to configure
-    per-task sandbox settings (e.g., a custom Dockerfile for the Modal image).
 
-    Supported override keys:
-        - modal_image: str -- Path to Dockerfile or Docker Hub image name
-        - docker_image: str -- Docker image name
-        - cwd: str -- Working directory inside the sandbox
+def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
+    """Register per-task sandbox overrides (``docker_image``/``modal_image``/
+    ``singularity_image``/``daytona_image``, ``env_type``, ``cwd``) before the
+    agent loop runs.
 
-    Args:
-        task_id: The rollout's unique task identifier
-        overrides: Dict of config keys to override
+    A ``cwd`` override takes effect immediately: it becomes the session's
+    recorded cwd (until a ``cd`` changes it) and any live env's cwd is updated
+    too, so env-side seeding stays consistent (ACP switching project root
+    mid-session via ``session/load``). The session record keeps the RAW path
+    (host workspaces are tracked there on purpose); only the live-env write is
+    sanitized, since a host cwd can never be a container workdir.
     """
     _task_env_overrides[_profile_scoped_task_key(task_id)] = overrides
 
@@ -738,7 +765,11 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
             ]
         for env in envs:
             if getattr(env, "cwd", None) is not None:
-                env.cwd = new_cwd
+                sanitized = _sanitize_cwd_for_live_env(env, new_cwd)
+                if sanitized is not None:
+                    env.cwd = sanitized
+
+
 def clear_task_env_overrides(task_id: str):
     """Drop a task's overrides, cwd record and container alias (rollout cleanup)."""
     _task_env_overrides.pop(task_id, None)
@@ -1994,9 +2025,11 @@ def _pre_exec_block(
     if _is_supervised_gateway_process():
         from cron.lifecycle_guard import (
             _MAX_REFERENCED_SCRIPT_BYTES,
-            contains_gateway_lifecycle_command_or_referenced_script,
+            HOST_INTERPRETER_KILL_REJECTION,
+            contains_host_interpreter_kill,
             contains_launchctl_submit_command,
             lifecycle_scan_root_within_budget,
+            scan_gateway_lifecycle,
         )
         # Keep the specific launchctl diagnostic when this optional pre-scan
         # fits the budget; the full fail-closed guard below still runs otherwise.
@@ -2090,11 +2123,41 @@ def _pre_exec_block(
                 pass
             return None
 
-        if contains_gateway_lifecycle_command_or_referenced_script(
+        unsafe, refusal = scan_gateway_lifecycle(
             command,
             cwd=guard_cwd,
             read_remote_script=_read_script_in_env,
-        ):
+        )
+        if unsafe and refusal:
+            # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
+            # size, device, live SQLite, cloud placeholder). Say so, or the model rewords and retries
+            # the same command in a loop (#113944).
+            raise _Rejected(json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    f"Blocked: the lifecycle guard could not scan this command or "
+                    f"referenced script: {refusal}. Nothing in the command is known to "
+                    "contain a gateway lifecycle command, but a script the command "
+                    "executes must be scannable (a regular text file under 1 MiB) "
+                    "before it can run inside the gateway process."
+                ),
+                "status": "error",
+            }, ensure_ascii=False))
+        if unsafe:
+            # Name the ownership-scoped route for image-name kills: the intent is almost always
+            # "stop MY background job", and re-rolling the same over-broad spelling is what takes
+            # the gateway down.
+            if (
+                lifecycle_scan_root_within_budget(command)
+                and contains_host_interpreter_kill(command)
+            ):
+                raise _Rejected(json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": HOST_INTERPRETER_KILL_REJECTION,
+                    "status": "error",
+                }, ensure_ascii=False))
             raise _Rejected(json.dumps({
                 "output": "",
                 "exit_code": 1,

@@ -250,8 +250,16 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                   ssh_config=ssh_config, host_cwd=host_cwd, probe_only=probe_only,
                   local_config=local_config)
     if builder is not None:
-        return builder(**kwargs)
-    return _build_plugin_env(env_type=env_type, **kwargs)
+        env = builder(**kwargs)
+    else:
+        env = _build_plugin_env(env_type=env_type, **kwargs)
+    # Backend tag for consumers that only hold the instance (cwd sanitizers on
+    # live cached envs); __slots__ plugin providers simply keep going untagged.
+    try:
+        env.env_type = env_type
+    except Exception:
+        pass
+    return env
 
 
 # --- Requirement checkers: one generic path driven by _BACKEND_SPECS; optional fields, checked in order:

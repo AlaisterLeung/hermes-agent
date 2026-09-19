@@ -94,6 +94,10 @@ def _ensure_file_checkpoint(
         return
 
     from agent.file_safety import is_nt_namespace_path
+    from tools.file_tools_paths import container_backend_for_task
+
+    if container_backend_for_task(effective_task_id or "default") is not None:
+        return  # container paths: nothing to checkpoint on the host
 
     # Resolving an NT-namespace path is itself the NTLM-leak trigger; leave the
     # tool's raw-string guard to refuse it without a checkpoint stat.
@@ -1156,7 +1160,9 @@ def _run_sequential_tool_execution_middleware(
 ) -> _ManagedToolResult:
     """Run one sequential call on a worker thread under the concurrent executor's deadline.
     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
-    generic deadline would report ``tool_timeout`` while the prompt is still live."""
+    generic deadline would report ``tool_timeout`` while the prompt is still live. They
+    are ``_NEVER_PARALLEL_TOOLS`` and run inline below, before any deadline is armed, so
+    they need no ``_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS`` entry."""
     timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
@@ -1291,9 +1297,11 @@ def _begin_tool_execution(
         elif function_name == "terminal":
             command = function_args.get("command", "")
             if _is_destructive_command(command):
-                from agent.runtime_cwd import scope_terminal_cwd
-                cwd = function_args.get("workdir") or scope_terminal_cwd() or os.getcwd()
-                agent._checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {command[:60]}")
+                from tools.file_tools_paths import container_backend_for_task
+                if container_backend_for_task(effective_task_id or "default") is None:
+                    from agent.runtime_cwd import scope_terminal_cwd
+                    cwd = function_args.get("workdir") or scope_terminal_cwd() or os.getcwd()
+                    agent._checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {command[:60]}")
 
 
 def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata, blocked: bool) -> None:

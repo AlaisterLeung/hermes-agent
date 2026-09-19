@@ -437,7 +437,7 @@ hermes webhook subscribe antenna-matches \
 
 ## Event-Triggered Cron Jobs {#event-triggered-cron-jobs}
 
-Set `cron_job` on a route to fire an **existing cron job** whenever an event arrives — instead of polling on a fixed cadence or starting a fresh webhook agent session. This turns any scheduled job into an event-driven task: keep the schedule as a fallback sweep, make it a rarely-firing one, or make the job **trigger-only** (no schedule at all — see [Trigger-only jobs](/user-guide/features/cron#trigger-only-jobs-no-schedule)) and let the webhook be the only thing that fires it.
+Set `cron_job` on a route to fire an **existing cron job** whenever an event arrives — instead of polling on a fixed cadence or starting a fresh webhook agent session. This turns any scheduled job into an event-driven task: keep the schedule as a fallback sweep, make it a rarely-firing one, or make the job **trigger-only** (no schedule at all — see [Trigger-only jobs](../features/cron.md#trigger-only-jobs-no-schedule)) and let the webhook be the only thing that fires it.
 
 How it works:
 
