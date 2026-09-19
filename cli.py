@@ -185,7 +185,7 @@ _TOOL_CALL_TAGS = ("tool_call", "tool_calls", "tool_result", "function_call", "f
 def _strip_reasoning_tags(text: str) -> str:
     """Strip reasoning blocks (closed, unterminated, orphan-close) and leaked tool-call XML from display text.
 
-    Keep in sync with ``run_agent._strip_think_blocks`` and the stream consumer's think-tag sets.
+    Keep in sync with ``agent.agent_runtime_helpers.strip_think_blocks`` and the stream consumer's think-tag sets.
 
     Also strips tool-call XML blocks some open models leak into visible content (``<tool_call>``,
     ``<function_calls>``, Gemma-style ``<function name="…">…</function>``). Ported from
@@ -197,20 +197,23 @@ def _strip_reasoning_tags(text: str) -> str:
         cleaned = re.sub(rf"<{tag}>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(rf"</{tag}>\s*", "", cleaned, flags=re.IGNORECASE)
     for tc_tag in _TOOL_CALL_TAGS:
-        cleaned = re.sub(rf"<{tc_tag}\b[^>]*>.*?</{tc_tag}>\s*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(
+            rf"<(?:[\w.-]+:)?{tc_tag}\b[^>]*>.*?</(?:[\w.-]+:)?{tc_tag}>\s*",
+            "", cleaned, flags=re.DOTALL | re.IGNORECASE,
+        )
     # <function name="..."> — boundary + attribute gated to avoid prose false positives.
     cleaned = re.sub(
         r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*<function\b[^>]*\bname\s*=[^>]*>(?:(?:(?!</function>).)*)</function>\s*',
         '', cleaned, flags=re.DOTALL | re.IGNORECASE,
     )
     cleaned = re.sub(
-        r'</(?:tool_call|tool_calls|tool_result|function_call|function_calls|function)>\s*', '', cleaned,
+        r'</(?:(?:[\w.-]+:)?(?:tool_call|tool_calls|tool_result|function_call|function_calls|function))>\s*', '', cleaned,
         flags=re.IGNORECASE,
     )
     # Unterminated opener / stray <arg_key>/<arg_value> markup = stream cut
     # mid tool-call serialization (#101899); strip to end of text.
     cleaned = re.sub(
-        r'(?:^|\n)[ \t]*<(?:tool_call|tool_calls|tool_result|function_call|function_calls)\b[^>]*>.*$'
+        r'(?:^|\n)[ \t]*<(?:[\w.-]+:)?(?:tool_call|tool_calls|tool_result|function_call|function_calls)\b[^>]*>.*$'
         r'|(?:^|\n)[^\n<]*</?arg_(?:key|value)\b.*$',
         '',
         cleaned,
@@ -1058,6 +1061,7 @@ from hermes_cli.worktree_ops import (
     _repo_is_shallow,
     _setup_worktree,
     _worktree_has_unpushed_commits,
+    release_lsp_clients,
 )
 
 # ============================================================================= Git Worktree Isolation
@@ -1087,7 +1091,9 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
         _active_worktree = None
         return
 
-    # Unlock first so `remove` isn't blocked by the lock placed at creation. Fail-soft.
+    # Release the tree's language servers while the path still exists, then unlock so `remove`
+    # isn't blocked by the lock placed at creation. Fail-soft.
+    release_lsp_clients(wt_path)
     _git_quiet(["worktree", "unlock", wt_path], repo_root, log="git worktree unlock failed (non-fatal)")
     _git_quiet(["worktree", "remove", wt_path, "--force"], repo_root, timeout=15, log="Failed to remove worktree")
     _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}")
@@ -3766,7 +3772,14 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             pass
 
     def _tui_startup_background_maintenance(self):
-        """Best-effort startup passes: curator skill maintenance, personal + org skill sync."""
+        """Best-effort startup passes: curator skill maintenance, personal + org skill sync.
+
+        Off the main thread: the curator's deterministic pass snapshots and prunes the whole
+        skills tree (a due weekly pass held the prompt for 6 minutes on a large library), and
+        the sync pulls can hit the network. The REPL must never wait on housekeeping."""
+        threading.Thread(target=self._run_startup_maintenance, name="startup-maintenance", daemon=True).start()
+
+    def _run_startup_maintenance(self):
         with suppress(Exception):
             from agent.curator import maybe_run_curator
             maybe_run_curator(
