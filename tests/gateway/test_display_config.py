@@ -602,7 +602,7 @@ class TestPerChatDisplayTurnWiring:
 
         mixin = GatewayTurnMixin.__new__(GatewayTurnMixin)
         object.__setattr__(mixin, "_RunAgentDisplay", GatewayRunner._RunAgentDisplay)
-        object.__setattr__(mixin, "_adapter_for_source", lambda source: None)
+        object.__setattr__(mixin, "_delivery_adapter_for", lambda source: None)
         object.__setattr__(
             mixin, "_resolve_turn_toolsets",
             lambda user_config, source, platform_key: (None, None),
