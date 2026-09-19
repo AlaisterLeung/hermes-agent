@@ -308,9 +308,15 @@ class FileStateRegistry:
             return reads
 
     def forget_task(self, task_id: str) -> None:
-        """Release read stamps owned by a task after its lifecycle ends."""
+        """Release read stamps and writer claims owned by a task after its lifecycle ends.
+
+        A finished task is not a concurrent sibling: leaving its writer claims behind makes
+        the next run of the same job (a fresh ``cron:<job>:<uuid>`` id) refuse to write the
+        same scratch path as "modified by sibling subagent" hours after the writer exited."""
         with self._state_lock:
             self._reads.pop(task_id, None)
+            for p in [p for p, (writer_tid, _ts) in self._last_writer.items() if writer_tid == task_id]:
+                del self._last_writer[p]
 
     def clear(self) -> None:
         """Reset all state. Intended for tests only."""

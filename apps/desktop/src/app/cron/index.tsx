@@ -83,7 +83,7 @@ import {
   toggleCronDeliveryTarget,
   validateCronEditor
 } from './cron-job-model'
-import { jobState, jobTitle, STATE_DOT } from './job-state'
+import { jobState, jobTitle, nextRunOverdueMs, STATE_DOT } from './job-state'
 
 const DEFAULT_DELIVER = 'local'
 
@@ -833,7 +833,10 @@ function CronJobDetail({ busy, c, job, onEdit, onOpenSession, onPauseResume, onT
           rows={[
             { label: c.frequencyLabel, value: jobScheduleDisplay(job) },
             { label: c.last.replace(/:$/, ''), value: formatTime(job.last_run_at) },
-            { label: c.next.replace(/:$/, ''), value: formatTime(job.next_run_at) },
+            {
+              label: (nextRunOverdueMs(job) === null ? c.next : c.overdueSince).replace(/:$/, ''),
+              value: formatTime(job.next_run_at)
+            },
             { label: c.deliverLabel, value: c.deliveryLabels[deliver] ?? deliver },
             ...(modelOverride ? [{ label: c.modelLabel, value: modelOverride }] : [])
           ]}
