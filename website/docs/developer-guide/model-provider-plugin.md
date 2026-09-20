@@ -17,7 +17,7 @@ Model provider plugins are the third kind of **provider plugin**. The others are
 `providers/__init__.py._discover_providers()` runs lazily the first time any code calls `get_provider_profile()` or `list_providers()`. Discovery order:
 
 1. **Bundled plugins** — `<repo>/plugins/model-providers/<name>/` — ship with Hermes
-2. **User plugins** — `$HERMES_HOME/plugins/model-providers/<name>/` — drop in any directory; no restart required for subsequent sessions
+2. **User plugins** — `$HERMES_HOME/plugins/model-providers/<name>/` — drop in a directory; restart an already-running Hermes process to discover it
 3. **Installed plugins** — `$HERMES_HOME/plugins/<name>/` (where `hermes plugins install owner/repo` clones) — imported only when `plugin.yaml` declares `kind: model-provider`; every other kind there belongs to the general PluginManager
 4. **Legacy single-file** — `<repo>/providers/<name>.py` — back-compat for out-of-tree editable installs
 
@@ -102,13 +102,59 @@ Full definition in `providers/base.py`. The most useful ones:
 | `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
 | `auth_handler` | `Callable \| None` | Provider-owned `hermes auth add/status/logout/refresh <name>` — see [Provider-owned auth](#provider-owned-auth-auth_handler-refresh_credential) |
 | `refresh_credential` | `Callable \| None` | Provider-owned rotation of a pooled OAuth row — same section |
+| `classify_api_error` | `Callable \| None` | Provider-scoped error-classification override — see [Recovery and error classification](#recovery-and-error-classification) |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails — in the `/model` picker AND the first-time `hermes setup` / `hermes model` API-key flow, which resolve the catalog the same way (`fetch_models()` merged curated-first with `fallback_models`; `fallback_models` alone when the fetch returns `None` or raises) |
 | `supports_vision` | bool | Declares the provider's API accepts image content inside **tool-result** messages (a provider-wide wire capability). Per-model user-image routing comes from `model_capabilities` / models.dev, not from this flag |
+| `model_capabilities` | `dict[str, dict[str, Any]]` | Per-model capability declarations in the `model_overrides` schema — see [Declaring model capabilities](#declaring-model-capabilities) |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`); also forwarded by the default `fetch_models()` catalog request |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
 | `default_max_tokens` | `int \| None` | Provider-level max_tokens cap (Nvidia: 16384) |
 | `unsupported_response_formats` | `tuple` | `response_format` types the API rejects outright; auxiliary requests omit them instead of paying a guaranteed 400 (DeepSeek: `("json_schema",)`) |
 | `default_aux_model` | str | Cheap model for auxiliary tasks (compression, vision, summarization) |
+
+## Declaring model capabilities
+
+Hermes resolves per-model capabilities (`supports_reasoning`, `supports_vision`,
+`supports_tools`, `context_window`) from the models.dev catalog, which does not
+know an out-of-tree provider's models. Declare them once on the profile:
+
+```python
+register_provider(ProviderProfile(
+    name="acme",
+    auth_type="api_key",
+    env_vars=("ACME_API_KEY",),
+    base_url="https://api.acme.example/v1",
+    fallback_models=("acme-large-high", "acme-small"),
+    model_capabilities={
+        "acme-large-high": {
+            "supports_reasoning": False,   # reasoning tier is fixed by the model id
+            "supports_vision": True,
+            "supports_tools": True,
+            "context_window": 64000,
+            "model_family": "acme",
+        },
+    },
+))
+```
+
+Keys are exact model IDs. Values use the `model_overrides` schema from
+`config.yaml` — the three capability booleans, a positive `context_window`, an
+optional `model_family` — and omitted fields stay unknown (not `False`), so a
+partial entry patches catalog metadata without erasing it.
+
+One declaration feeds every consumer that reads the catalog through
+`agent.models_dev`: the `/model` picker's `reasoning` badge, image routing
+(`decide_image_input_mode` goes `native` for a `supports_vision: True` model
+even when the profile-wide `supports_vision` is unset), context-window lookup,
+and the dashboard's `/api/model/info`. Precedence: explicit user
+`model_overrides.<provider>.<model>` → plugin declaration → catalog → fill-gap
+`_default`. Models the plugin does not declare keep the catalog/heuristic path.
+
+Not covered: the picker's `fast` badge (a model-name heuristic in
+`hermes_cli/models.py::model_supports_fast_mode`), reasoning-effort vocabulary
+(`agent/reasoning_effort.py`), and transport request fields. Declarations do not
+add models to a picker — use `fallback_models` / `fetch_models` for that. The
+registry is discovered once per process: restart Hermes after editing them.
 
 ## Overridable hooks
 
@@ -174,7 +220,10 @@ overriding `ProviderProfile.fetch_account_usage`. Import and return the shared
 entries); do not format output in the plugin. Returning `None`, or raising an
 exception, leaves `/usage` empty just as it does for providers without usage
 data. Built-in usage fetchers always take precedence, so this hook cannot
-replace the account-usage behavior for a built-in provider.
+replace the account-usage behavior for a built-in provider. The hook runs under a shared
+10 s deadline (`agent.account_usage.PLUGIN_USAGE_HOOK_DEADLINE_S`) on every surface; overrunning it
+renders nothing for that turn rather than stalling `/usage`, so give your own HTTP calls a shorter
+timeout.
 
 The bundled `plugins/model-providers/opencode-zen/` profile implements this hook for the
 OpenCode Go plan windows; every `/usage` surface (CLI `hermes usage` and `/usage`, the messaging
@@ -213,10 +262,12 @@ Every registered profile joins `CANONICAL_PROVIDERS` by slug (a plugin re-declar
 
 | `auth_type` | Row is listed / `authenticated` when | Model list |
 |---|---|---|
-| `external_process` | the binary resolves (`process_command` or one of `process_command_env_vars` is on `PATH`), or `base_url` is `acp+tcp://…` — the same structural gate `hermes auth status` reports | `fetch_models()` (your subprocess probe), else `fallback_models` |
-| `oauth_external` / `oauth_device_code` | `auth.json` or the credential pool holds an entry for the slug | `fallback_models` (declare at least one) |
+| `external_process` | the binary resolves (`process_command` or one of `process_command_env_vars` is on `PATH`), or `base_url` is `acp+tcp://…` — the same structural gate `hermes auth status` reports. A resolving binary is also the sign-in evidence (`auth_verified`) the Desktop model selector's explicit-only filter uses, so the row shows there like the bundled ACP provider does | `fetch_models()` (your subprocess probe), else `fallback_models` |
+| `oauth_external` / `oauth_device_code` | the credential pool holds a row for the slug with a live (non-expired) token — `hermes auth status <name>` and `list_available_providers().authenticated` both read the pool; an expired row with `refresh_token` and a `refresh_credential` hook reports `needs_refresh` | `fetch_models()` with the pooled token, else `fallback_models` (declare at least one) |
 
 The catalog cache is keyed on the profile's `process_command_env_vars` / `process_args_env_var` values, so pointing `HERMES_<X>_COMMAND` at a different binary re-discovers models. Executable discovery is not a login check: an unauthenticated CLI still lists, and the subprocess reports the failure at first use.
+
+Selecting the row in `hermes model` (and the setup wizard) runs one generic flow keyed by the profile's `auth_type`: external-process profiles are launch-checked (`resolve_external_process_provider_credentials`), OAuth profiles need a live pool row (otherwise the flow prints `hermes auth add <name>` and stops), then the merged catalog is offered and `config.model` is persisted with the profile's `base_url`/`api_mode`. No `_model_flow_*` entry in core is needed.
 
 ## Hook reference examples
 
@@ -250,7 +301,7 @@ register_provider(ProviderProfile(
 ))
 ```
 
-Next session, `get_provider_profile("gmi").base_url` returns the staging URL. No repo patch, no rebuild. Because user plugins are discovered after bundled ones, the user `register_provider()` call wins.
+In a fresh Hermes process, `get_provider_profile("gmi").base_url` returns the staging URL. No repo patch, no rebuild. Because user plugins are discovered after bundled ones, the user `register_provider()` call wins.
 
 ## api_mode selection
 
@@ -329,7 +380,7 @@ register_provider(ProviderProfile(
 | Contract | |
 |---|---|
 | `auth_handler(action, args)` | `args` is the parsed `hermes auth` namespace for CLI actions; the interactive setup picker passes a minimal namespace carrying only `provider`, so read options with `getattr(args, name, None)`. Truthy = handled (Hermes prints nothing more, exit 0); falsy = fall back to the built-in path **for that action**. An exception becomes `SystemExit("<provider> auth handler failed for `&lt;action&gt;`: …")`. |
-| `refresh_credential(entry)` | Receives the `PooledCredential`; returns a mapping of rotated values or `None`. Keys that are `PooledCredential` fields (`access_token`, `refresh_token`, `expires_at_ms`, …) replace the row's fields; every other key (`expires_in`, `token_type`, `scope` — the raw token-endpoint shape) lands in `entry.extra` and round-trips through `auth.json`. `None` = no rotation happened, the row is marked ok. Its presence is what makes the provider *refreshable* — `hermes auth refresh <name>` and the main-loop 401 recovery call it through the pool with no core name list involved; the auxiliary client's 401 recovery reaches it only for pooled rows it already treats as recoverable (api-key rows and the built-in OAuth routes). |
+| `refresh_credential(entry)` | Receives the `PooledCredential`; returns a mapping of rotated values or `None`. Keys that are `PooledCredential` fields (`access_token`, `refresh_token`, `expires_at_ms`, …) replace the row's fields; every other key (`expires_in`, `token_type`, `scope` — the raw token-endpoint shape) lands in `entry.extra` and round-trips through `auth.json`. Returning `None`/an empty mapping means the plugin could not rotate: the row is benched exactly like a failed refresh request (never reported as refreshed, so a dead bearer is not replayed). Its presence is what makes the provider *refreshable* — `hermes auth refresh <name>` and the main-loop 401 recovery call it through the pool with no core name list involved; the auxiliary client's 401 recovery reaches it only for pooled rows it already treats as recoverable (api-key rows and the built-in OAuth routes). |
 | Refresh failures | Raise `hermes_cli.auth_constants.AuthError(..., relogin_required=True)` (or with `code` `invalid_grant` / `invalid_token` / `refresh_token_reused`) when the grant is dead: the row goes **DEAD**, leaves rotation and Hermes logs a WARNING naming `hermes auth add <name>`. Any other exception (network, 429, 5xx) is transient — the row is benched for one cooldown and retried. |
 | Concurrency | The hook runs under the shared `auth.json` lock. Before calling it the pool re-reads the row; if another Hermes process (gateway + CLI, two profiles) already rotated the pair, that pair is adopted and your hook is **not** called — safe for single-use refresh tokens. After the hook returns, the rotated row is written through to `auth.json`. |
 | No hooks | `api_key` profiles behave exactly as before. Any other `auth_type` without `auth_handler` fails loud on `hermes auth add`. |
@@ -341,6 +392,73 @@ bundled provider's flow.
 Hermes passes the parsed namespace, not provider-declared flags: ask for provider-specific values
 interactively (or read your own config/env). Rows the plugin stores in the pool are its own — extra keys
 survive `load → save → load`, and Hermes passes no secrets beyond that pooled row to `refresh_credential`.
+
+### Declarative OAuth (PKCE) for plugins
+
+A provider whose IdP speaks standard OAuth 2.0 Authorization Code + PKCE does not need to write the
+hooks above by hand: declare the endpoints in `OAuthPKCEConfig` and let the two factories build them.
+
+```python
+from hermes_cli.auth_oauth_pkce_plugin import OAuthPKCEConfig, pkce_auth_handler, pkce_refresh_credential
+from providers import register_provider
+from providers.base import ProviderProfile
+
+cfg = OAuthPKCEConfig(
+    client_id="hermes-public-client",                       # public client — no secret, PKCE is the proof
+    authorize_url="https://auth.example.com/oauth/authorize",
+    token_url="https://auth.example.com/oauth/token",
+    scopes=("inference", "offline_access"),
+    redirect_port=0,                                        # 0 = OS-assigned; pin it if the IdP allowlists the URI
+)
+
+register_provider(ProviderProfile(
+    name="example-pkce", auth_type="oauth_external", base_url="https://api.example.com/v1",
+    auth_handler=pkce_auth_handler(cfg), refresh_credential=pkce_refresh_credential(cfg)))
+```
+
+Hermes then owns the whole lifecycle: `hermes auth add example-pkce [--no-browser]` opens the browser (or
+prints the URL, with the SSH-tunnel hint on a remote box), listens on `http://127.0.0.1:<port>/callback`,
+checks the CSRF `state`, exchanges the code with S256 PKCE and stores the grant as a pooled `oauth`
+credential (`source: manual:loopback_pkce`, `expires_at_ms`, `refresh_token`); `auth status` reports
+logged in / expired; `auth logout` removes the rows; `auth refresh` and the 401 recovery paths rotate via
+the `refresh_token` grant, re-reading `auth.json` under the auth lock first so a peer's rotation is adopted
+instead of spending a single-use refresh token twice.
+
+Security boundary (enforced before any request, on login and refresh alike): both endpoints must be
+`https://` (plain `http://` is accepted only for a loopback-literal host — a local development IdP);
+the `token_url` host must be the `authorize_url` host or a subdomain of it (or listed in `allowed_hosts`);
+the listener binds the literal `127.0.0.1`; tokens, `state` and the PKCE verifier are never logged.
+Optional fields: `audience`, `extra_authorize_params`, `extra_token_params`, `redirect_path`,
+`timeout_seconds`, `label`.
+
+## Recovery and error classification
+
+A `kind: model-provider` plugin is loaded by provider discovery, **not** by the generic plugin manager, so
+the `transform_api_error_classification` plugin hook is not reachable from it without shipping a second
+plugin component. The profile carries the equivalent seam instead:
+
+```python
+def classify(error, *, status_code, error_code, message, body, model):
+    # A vendor-specific 403 that is a spent plan, not a bad credential.
+    if status_code == 403 and error_code == "quota_exhausted":
+        return {"reason": "billing", "retryable": False, "should_rotate_credential": True, "should_fallback": True}
+    return None  # decline → built-in classification
+
+
+register_provider(ProviderProfile(name="example-oauth", auth_type="oauth_external",
+                                  base_url="https://api.example.com/v1",
+                                  refresh_credential=example_refresh, classify_api_error=classify))
+```
+
+| Contract | |
+|---|---|
+| `classify_api_error(error, *, status_code, error_code, message, body, model)` | Consulted by `agent.error_classifier.classify_api_error` for failures of **this provider only**, after any generic `transform_api_error_classification` hooks and before the built-in pipeline. `message` is the lower-cased error text, `body` the parsed JSON body (may be empty). Return `{"reason": <FailoverReason name>}` plus optional `retryable` / `should_compress` / `should_rotate_credential` / `should_fallback` / `error_context` to override (for terminal reasons — billing, auth, model_not_found … — `should_fallback: True` implies `retryable: False` unless you set it, because the fallback chain only runs for non-retryable verdicts; rate-limit reasons keep the built-in retry-then-fallback shape); `None` (or an unknown reason) leaves the built-in verdict. Exceptions are swallowed and logged at DEBUG. The verdict drives the same recovery as for built-ins — e.g. `billing` benches the credential for the billing TTL instead of the transient 403 cooldown. |
+| 401 on a plugin credential | Handled by the credential pool, no core edit: the failing pooled row is refreshed through `refresh_credential` once per attempt (capped at two refreshes per row per session), the client is rebuilt with the rotated token and the request retried. A `None`/empty return or an exception benches the row — the request then rotates or falls to the generic "sign in again: `hermes auth add <name>`" copy, never to a built-in provider's guidance. |
+| Auxiliary calls | Auxiliary-client 401s take the same pool refresh (`try_refresh_current` → `refresh_credential`). |
+
+Recovery that remains name-keyed in core is behaviour with no safe generic shape (a provider-specific
+token store to re-sync, a plan-tier entitlement wall, a single-use refresh-token quarantine). A plugin
+that needs one of those owns it inside `refresh_credential` / `classify_api_error`.
 
 ## Discovery timing
 
