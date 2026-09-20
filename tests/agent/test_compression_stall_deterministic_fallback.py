@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -59,7 +60,6 @@ def _transcript():
 
 def _stalling_call_llm(compressor, calls, *, fail_when_pinned=False):
     """Summary call that never streams: hangs until the host cancels the fence, like a held-open socket."""
-
     def _call(**kwargs):
         calls.append(kwargs.get("provider") or "primary")
         if fail_when_pinned and "provider" in kwargs:
@@ -67,7 +67,7 @@ def _stalling_call_llm(compressor, calls, *, fail_when_pinned=False):
         cancelled = getattr(compressor, "_compression_cancelled_check", None)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline and not (callable(cancelled) and cancelled()):
-            time.sleep(0.001)
+            time.sleep(0.01)
         raise AuxiliaryExplicitCancellation()
 
     return _call
@@ -170,20 +170,26 @@ def test_fence_level_retry_ladder_is_unchanged_without_a_prior_timeout():
     """No agent-level timeout history (fence-level callers, fresh compressors): a stall with no chain still
     degrades in one attempt — the deterministic rung is escalation, not the default."""
     attempts = []
+    release = threading.Event()
 
     def worker(fence: CompressionCommitFence):
         attempts.append(fence)
-        time.sleep(0.3)
+        # Block until the test releases it. The fence must give up on its idle window while the worker is
+        # demonstrably still running; a fixed sleep instead races the idle timer under load.
+        release.wait(10.0)
         return ([{"role": "assistant", "content": "late"}], "late-prompt")
 
     original = [{"role": "user", "content": "keep-me"}]
-    with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
-        msgs, prompt = run_compress_context_with_progress_timeout(
-            worker=worker, messages=original, system_prompt_fallback="degraded-prompt",
-            idle_timeout_seconds=0.05, total_ceiling_seconds=2.0, on_timeout=lambda *a: None,
-        )
-    assert msgs is original and prompt == "degraded-prompt"
-    assert len(attempts) == 1
+    try:
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=worker, messages=original, system_prompt_fallback="degraded-prompt",
+                idle_timeout_seconds=0.05, total_ceiling_seconds=2.0, on_timeout=lambda *a: None,
+            )
+        assert msgs is original and prompt == "degraded-prompt"
+        assert len(attempts) == 1
+    finally:
+        release.set()
 
 
 def test_over_window_request_commits_the_deterministic_fallback_on_the_first_stall(tmp_path, fast_timeouts):
