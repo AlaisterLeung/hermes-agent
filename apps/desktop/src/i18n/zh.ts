@@ -20,7 +20,6 @@ export const zh = defineLocale({
     notConnected: '未连接',
     timeout: '仍在等待授权。',
     refresh: '刷新状态',
-    statusError: '无法检查连接，请刷新重试。',
     connectError: '无法开始授权，请重试。',
     connectErrorFor: app => `无法为 ${app} 开始授权。`,
     unavailable: '此会话暂时无法使用连接器。',
@@ -28,7 +27,12 @@ export const zh = defineLocale({
     search: '查找应用',
     empty: '没有匹配的应用',
     disclaimer: '连接为可选操作。请仅授权你希望 Hermes 使用的应用。',
-    execution: '连接器工具'
+    execution: '连接器工具',
+    setup: server => `设置 ${server}`,
+    openInBrowser: '在浏览器中打开',
+    setupCancel: '取消',
+    authorizedToolsUnavailable: '已授权。工具不可用。',
+    required: '必填'
   },
 
   sessionImport: {
@@ -870,7 +874,8 @@ export const zh = defineLocale({
     },
     fieldLabels: defineFieldCopy({
       model: '默认模型',
-      modelContextLength: '仅覆盖主聊天模型检测到的上下文窗口（以 token 计）。保持为 0 则使用所选模型检测到的值。不影响辅助模型/MoA 模型。',
+      modelContextLength:
+        '仅覆盖主聊天模型检测到的上下文窗口（以 token 计）。保持为 0 则使用所选模型检测到的值。不影响辅助模型/MoA 模型。',
       fallbackProviders: '备用模型',
       toolsets: '启用的工具集',
       timezone: '时区',
@@ -1894,7 +1899,8 @@ export const zh = defineLocale({
         needsSetupHint: '此后端已选中但尚未完成设置——在设置完成前命令将会失败。',
         needsSetupConfirmTitle: backend => `仍要选择 ${backend} 吗？`,
         needsSetupConfirmDescription: detail => `${detail} 此更改生效后启动的会话在设置完成前将没有终端或文件工具。`,
-        needsSetupConfirmDescriptionGeneric: '此后端尚未完成设置。此更改生效后启动的会话在设置完成前将没有终端或文件工具。',
+        needsSetupConfirmDescriptionGeneric:
+          '此后端尚未完成设置。此更改生效后启动的会话在设置完成前将没有终端或文件工具。',
         needsSetupConfirmAction: '仍然选择'
       },
       browserRealProfile: {
@@ -1996,7 +2002,8 @@ export const zh = defineLocale({
       desktopHalfPending: '复制中…',
       desktopHalfPendingTip: '此包附带的桌面部分尚未复制到应用中。请重新扫描或重启应用。',
       desktopHalfRemote: '不可用（远程后端）',
-      desktopHalfRemoteTip: '此包的桌面部分位于远程后端的磁盘上，本应用无法读取。要在此使用，请通过“从 Git 安装”输入该包的仓库地址并勾选桌面目标，即可将桌面部分克隆到本机。',
+      desktopHalfRemoteTip:
+        '此包的桌面部分位于远程后端的磁盘上，本应用无法读取。要在此使用，请通过“从 Git 安装”输入该包的仓库地址并勾选桌面目标，即可将桌面部分克隆到本机。',
       emptyAll: '还没有插件。',
       empty: '此配置尚未安装任何 agent 插件。',
       emptyHint: '在下方目录中浏览，一键安装经过审核的插件。',
@@ -2018,6 +2025,17 @@ export const zh = defineLocale({
       updateToPin: (sha: string) => `更新到 ${sha}`,
       updateFailed: (name: string) => `无法更新 ${name}`,
       updated: (name: string) => `${name} 已更新到当前目录固定提交。重启网关后生效。`,
+      uninstall: '卸载',
+      uninstallTip: (name: string, profile: string) => `从 ${profile} 卸载 ${name}`,
+      uninstallConfirmTitle: (name: string) => `卸载 ${name}？`,
+      uninstallConfirmBody: (name: string, profile: string) =>
+        `这将从 ${profile} 配置中删除该插件的文件。它附带的桌面部分也会一并移除。之后可随时从目录或 Git 重新安装。`,
+      uninstallFailed: (name: string) => `无法卸载 ${name}`,
+      uninstalled: (name: string) => `${name} 已卸载。重启网关后完全卸载。`,
+      uninstallDesktopTip: (name: string) => `从本应用卸载 ${name}`,
+      uninstallDesktopConfirmBody: (name: string) =>
+        `这将从本机的 desktop-plugins 文件夹中删除 ${name} 并立即卸载。之后可随时从 Git 重新安装或将文件夹放回。`,
+      uninstalledDesktop: (name: string) => `${name} 已卸载。`,
       deepLinkErrorTitle: '插件安装链接已拒绝',
       deepLinkCatalogInvalidName: '链接中的目录名称缺失或无效。',
       deepLinkCatalogUnknown: (name: string) => `“${name}”不在 Hermes 插件目录中。未安装任何内容。`,
@@ -4232,7 +4250,6 @@ export const zh = defineLocale({
       authorized: server => `已授权 ${server}`,
       failed: server => `${server} 设置失败`,
       toolCount: count => `${count} 个工具`,
-      notInCatalog: server => `“${server}”不在 MCP 目录中`,
       envRequired: '请先填写所需凭据',
       sendFailed: '无法发送 MCP 设置响应',
       reloadFailed: '服务器已保存，但重新加载 MCP 工具失败 — 将在下个会话加载',
