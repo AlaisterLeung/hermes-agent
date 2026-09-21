@@ -1071,6 +1071,19 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     return False
 
 
+def _accepts_tool_result_images(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> bool:
+    """One gate for both native lanes — the ``vision_analyze`` fast path and the ``computer_use`` capture route
+    (#115248): the profile's ``supports_vision_tool_messages=False`` veto first, then either the provider's tool
+    results are known to carry media or the capability lookup (config override → catalog → probes → profile)
+    attests the model as vision-capable."""
+    if _profile_rejects_tool_media(provider, model):
+        return False
+    if _supports_media_in_tool_results(provider, model):
+        return True
+    from agent.image_routing import _lookup_supports_vision
+    return _lookup_supports_vision(provider, model, cfg) is True
+
+
 def _should_use_native_vision_fast_path() -> bool:
     """Whether vision tools should attach the image to the main model directly
     instead of routing through the auxiliary vision LLM.
@@ -1084,7 +1097,7 @@ def _should_use_native_vision_fast_path() -> bool:
     """
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
-        from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
+        from agent.image_routing import decide_image_input_mode
         from hermes_cli.config import load_config
 
         provider = _read_main_provider()
@@ -1092,15 +1105,7 @@ def _should_use_native_vision_fast_path() -> bool:
         cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
             return False
-        # The profile veto applies ahead of the capability lookup too: a
-        # model marked vision-capable by models.dev / custom_providers must
-        # not re-open the multimodal-envelope route the profile rejects.
-        if _profile_rejects_tool_media(provider, model):
-            return False
-        return (
-            _supports_media_in_tool_results(provider, model)
-            or _lookup_supports_vision(provider, model, cfg) is True
-        )
+        return _accepts_tool_result_images(provider, model, cfg)
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
         return False
