@@ -2224,6 +2224,7 @@ def terminal_tool(
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
     target: Optional[str] = None,
+    _completion_output_chars: int = 0,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2240,6 +2241,8 @@ def terminal_tool(
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
         target: Named execution target. Omit to use the configured default.
+        _completion_output_chars: Internal; sizes the completion notification's output for a spawner whose output is the payload (a bot DM's reply); 0 keeps the usual tail.
+        _host_local: Internal; forces the local backend for Hermes-owned control-plane children (kept in a separate env cache from the configured backend).
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2948,6 +2951,8 @@ def terminal_tool(
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
                     result_data["notify_on_complete"] = True
+                    if _completion_output_chars:
+                        proc_session.completion_output_chars = int(_completion_output_chars)
 
                     # Gateway mode: auto-register a fast watcher so completion can trigger
                     # a new agent turn; CLI mode uses the completion_queue directly.

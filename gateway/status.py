@@ -423,6 +423,20 @@ def _start_times_agree(current: Any, *recorded: Any) -> bool:
     return cur > 0 and all(r > 0 and abs(r - cur) <= 0.001 for r in map(float, recorded))
 
 
+# Same-host start-time readings can drift by ~1 s between the claim-time and a later liveness read
+# (macOS ``kern.boottime`` adjustment, #117505). Both fingerprint scales are ×100 (Linux /proc ticks,
+# psutil centiseconds), so 200 means 2 s on either platform — a recycled PID is essentially never
+# that close to the original's start time.
+START_TIME_DRIFT_TOLERANCE = 200
+
+
+def start_time_fingerprints_match(recorded: Any, current: Any, tolerance: int = START_TIME_DRIFT_TOLERANCE) -> bool:
+    """Liveness-reconciliation comparator for :func:`get_process_start_time` fingerprints: the
+    recorded owner and the current reading are the same incarnation when they agree within
+    ``tolerance``. Raises on junk; callers decide what an unreadable (``None``) side means."""
+    return abs(int(current) - int(recorded)) <= tolerance
+
+
 def _scope_hash(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
@@ -450,11 +464,22 @@ def get_process_start_time(pid: int) -> Optional[int]:
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
-    """Process command line as one string: /proc, then ``ps``, then psutil (Windows)."""
+    """Process command line as one string: /proc, then psutil, then ``ps``.
+
+    Order is by cost, and this runs per live gateway on every roster/status poll. ``psutil`` reads
+    the process table in-process (a ``sysctl`` on macOS) where ``ps`` costs a fork+exec — measured
+    0.02ms against 4.2ms on macOS for the same string. It cannot always answer: on macOS it raises
+    ``AccessDenied`` for a process owned by another user, which ``ps`` still reports, so ``ps``
+    stays as the fallback rather than being replaced."""
     with contextlib.suppress(OSError):
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         if raw:
             return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore
+        cmdline_parts = psutil.Process(pid).cmdline()
+        if cmdline_parts:
+            return " ".join(cmdline_parts)
     if not _IS_WINDOWS:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             result = subprocess.run(
@@ -463,11 +488,6 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
-    with contextlib.suppress(Exception):
-        import psutil  # type: ignore
-        cmdline_parts = psutil.Process(pid).cmdline()
-        if cmdline_parts:
-            return " ".join(cmdline_parts)
     return None
 
 
@@ -558,6 +578,33 @@ def profile_flag_value(command: str) -> Optional[str]:
     return None
 
 
+_HERMES_HOME_ASSIGNMENT_RE = re.compile(r"(?:^|\s)hermes_home=(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
+
+
+def hermes_home_assignments(command: str) -> list[str]:
+    """Values of every ``HERMES_HOME=<value>`` assignment in ``command`` (the caller lowercases
+    and normalizes separators). Values are token-bounded, quotes stripped: the substring test
+    this replaces let ``HERMES_HOME=/root/profiles/ops`` claim a ``/root/profiles/ops2`` gateway.
+    The name is token-bounded too (``FOO=hermes_home=/x`` is not an assignment), and a trailing
+    separator on the value is stripped -- ``HERMES_HOME=/root/.hermes/`` (systemd ``Environment=``
+    or a shell wrapper spelling) is the same home as ``/root/.hermes``; callers strip the profile
+    home the same way."""
+    return [
+        next(g for g in m.groups() if g is not None).rstrip("/")
+        for m in _HERMES_HOME_ASSIGNMENT_RE.finditer(command)
+    ]
+
+
+def command_line_names_hermes_home(command_lc: str, home_lc: str) -> bool:
+    """True when ``command_lc`` carries ``HERMES_HOME=<home_lc>`` (both lowercased, ``/``-separated,
+    no trailing separator). Argv reaches us space-joined, so an unquoted value with a space in it
+    (``HERMES_HOME=C:/Users/John Doe/.hermes``) is cut at the space by the token parser; a
+    token-bounded literal match of the whole home recovers that spelling."""
+    if home_lc in hermes_home_assignments(command_lc):
+        return True
+    return re.search(rf"(?:^|\s)hermes_home={re.escape(home_lc)}/?(?=\s|$)", command_lc) is not None
+
+
 def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     """True when a gateway command line belongs to ``profile_home`` (mirrors
     ``hermes_cli.gateway._matches_current_profile``): a stale state file can record a PID recycled
@@ -565,16 +612,18 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     ``HERMES_HOME=`` on argv; the default gateway runs bare. Separators normalized."""
     command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower().replace("\\", "/")
+    home_lc = str(profile_home).lower().replace("\\", "/").rstrip("/")
     if profile_name is not None and profile_name != "default":
-        return profile_flag_value(command_lc) == profile_name.lower() or f"hermes_home={home_lc}" in command_lc
+        if profile_flag_value(command_lc) == profile_name.lower():
+            return True
+        return command_line_names_hermes_home(command_lc, home_lc)
     # Default profile: accept unless argv names another profile (any spelling the CLI pre-parser
     # accepts, ``--profile=ops`` included -- a substring test let that gateway pass as the default's)
     # or a conflicting explicit HERMES_HOME= (its absence is not disqualifying -- HERMES_HOME usually
     # arrives via the env).
     if profile_flag_value(command_lc) is not None:
         return False
-    return not ("hermes_home=" in command_lc and f"hermes_home={home_lc}" not in command_lc)
+    return not hermes_home_assignments(command_lc) or command_line_names_hermes_home(command_lc, home_lc)
 
 
 def _record_matches_live_gateway_pid(
@@ -744,6 +793,10 @@ def _pid_exists(pid: int) -> bool:
     try:
         import psutil  # type: ignore
         # Best-effort zombie check: status-read failures fall through to pid_exists().
+        # Windows has no POSIX zombies, and this probe costs ~7 ms per call — once per
+        # registry entry inside the session file lock (#115578). Skip it on Windows and
+        # let pid_exists() below (or the ctypes fallback) decide.
+        probe_zombie = os.name != "nt"
         try:
             # A zombie (defunct) process is still in the process table, so ``psutil.pid_exists()`` returns
             # True for it — but it is already dead: SIGKILL has no effect and it cannot be a running
@@ -753,7 +806,7 @@ def _pid_exists(pid: int) -> bool:
             # #42126). Report zombies as dead so the takeover proceeds. Best-effort: any failure to read
             # status (partial/stub psutil, access denied, transient race) falls through to the authoritative
             # ``pid_exists()`` below rather than raising.
-            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            if probe_zombie and psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 return False
         except getattr(psutil, "NoSuchProcess", ()):
             return False
