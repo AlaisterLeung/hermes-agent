@@ -894,10 +894,11 @@ def _tenv_read(name: str, default: str = "") -> str:
 _BACKEND_IMAGE_KEYS = {b: f"{b}_image" for b in ("docker", "singularity", "modal", "daytona")}
 # (config key, default) pairs forwarded to _create_environment's container_config.
 # Single-line POSIX probe; `2>/dev/null` keeps a missing binary from polluting output.
+# OS/kernel only: the sandbox's user, $HOME and cwd are user-identifying and nothing consumes
+# them — the model can `whoami && pwd` when a task actually needs them.
 _BACKEND_PROBE_CMD = (
-    "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\" "
-    "\"$(uname -r 2>/dev/null || echo unknown)\" "
-    "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
+    "printf 'os=%s\\nkernel=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\" "
+    "\"$(uname -r 2>/dev/null || echo unknown)\""
 )
 
 
@@ -966,8 +967,8 @@ def _probe_remote_backend(
 ) -> str | None:
     """Run a tiny introspection command inside the active terminal backend.
 
-    Returns a pre-formatted multi-line string describing the backend's OS,
-    $HOME, cwd, and user — or None if the probe failed. Result is cached
+    Returns a pre-formatted multi-line string describing the backend's OS —
+    or None if the probe failed. Result is cached
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
@@ -1044,15 +1045,7 @@ def _probe_remote_backend(
             # setup / file sync / snapshot — and its cleanup() is then safe.
             probe_only=True,
         )
-        # Single-line POSIX probe — works on any Unixy backend. Wrapped in
-        # `2>/dev/null` so a missing binary doesn't pollute the output.
-        probe_cmd = (
-            "printf 'os=%s\\nkernel=%s\\nhome=%s\\ncwd=%s\\nuser=%s\\n' "
-            "\"$(uname -s 2>/dev/null || echo unknown)\" "
-            "\"$(uname -r 2>/dev/null || echo unknown)\" "
-            "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
-        )
-        result = env.execute(probe_cmd, timeout=4)
+        result = env.execute(_BACKEND_PROBE_CMD, timeout=4)
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""
@@ -1084,22 +1077,12 @@ def _probe_remote_backend(
             k, _, v = line.partition("=")
             parsed[k.strip()] = v.strip()
 
-    pieces = []
     os_bits = " ".join(x for x in (parsed.get("os"), parsed.get("kernel")) if x and x != "unknown")
-    if os_bits:
-        pieces.append(f"OS: {os_bits}")
-    if parsed.get("user") and parsed["user"] != "unknown":
-        pieces.append(f"User: {parsed['user']}")
-    if parsed.get("home"):
-        pieces.append(f"Home: {parsed['home']}")
-    if parsed.get("cwd"):
-        pieces.append(f"Working directory: {parsed['cwd']}")
-
-    if not pieces:
+    if not os_bits:
         _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
-    formatted = "\n".join(f"  {p}" for p in pieces)
+    formatted = f"  OS: {os_bits}"
     _BACKEND_PROBE_CACHE[cache_key] = formatted
     return formatted
 
@@ -1141,7 +1124,28 @@ def _local_host_hints() -> list[str]:
     return ["\n".join(host_lines), _WINDOWS_BASH_SHELL_HINT]
 
 
-
+def _remote_backend_hint(backend: str) -> str:
+    """Backend-only block for remote/sandbox backends (host info deliberately suppressed)."""
+    lead = (f"Terminal backend: {backend}. Your `terminal`, `read_file`, `write_file`, `patch`, and "
+            f"`search_files` tools all operate inside ")
+    probe = _probe_remote_backend(backend)
+    if probe:
+        return lead + (
+            f"this {backend} environment — NOT on the machine where Hermes itself is running. The host OS, "
+            f"home, and cwd of the Hermes process are irrelevant; only the following backend state matters:\n{probe}\n"
+            f"  The sandbox's current user, $HOME, and working directory are not listed here; if you need them, "
+            f"probe directly with a terminal call like `whoami && pwd`."
+        )
+    description = (
+        _BACKEND_FALLBACK_DESCRIPTIONS.get(backend)
+        or _plugin_backend_attr(backend, "env_description")
+        or f"a {backend} environment (likely Linux)"
+    )
+    return lead + (
+        f"{description} — NOT on the machine where Hermes itself runs. The backend probe didn't respond at "
+        f"prompt-build time, so the sandbox's OS, current user, $HOME, and working directory are unknown from here. "
+        f"If you need them, probe directly with a terminal call like `uname -a && whoami && pwd`."
+    )
 
 
 def _config_readonly(what: str) -> dict:
@@ -1256,7 +1260,10 @@ def build_environment_hints() -> str:
                 f"inside this {backend} environment — NOT on the machine "
                 f"where Hermes itself is running. The host OS, home, and cwd "
                 f"of the Hermes process are irrelevant; only the following "
-                f"backend state matters:\n{probe}"
+                f"backend state matters:\n{probe}\n"
+                f"  The sandbox's current user, $HOME, and working directory "
+                f"are not listed here; if you need them, probe directly with "
+                f"a terminal call like `whoami && pwd`."
             )
         else:
             description = _BACKEND_FALLBACK_DESCRIPTIONS.get(
