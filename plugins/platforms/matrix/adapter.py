@@ -1470,7 +1470,7 @@ class MatrixAdapter(BasePlatformAdapter):
             root = result.message_id if result.success else None
             if not root:
                 return None
-            self._threads.mark(str(root))  # replies in this thread bypass require_mention, like inbound roots
+            await self._threads.mark_async(str(root))  # replies in this thread bypass require_mention, like inbound roots
             logger.info(
                 "Matrix: opened continuable thread root %s in %s (%s)",
                 root, room_id, name,
@@ -2126,7 +2126,7 @@ class MatrixAdapter(BasePlatformAdapter):
             user_name=display_name, thread_id=thread_id, chat_topic=identity.room_topic,
             guild_id=identity.server_name, parent_chat_id=room_id if thread_id else None, message_id=event_id)
         if thread_id:
-            self._threads.mark(thread_id)  # covers real roots and synthetic ones alike
+            await self._threads.mark_async(thread_id)  # covers real roots and synthetic ones alike
         self._background_read_receipt(room_id, event_id)
         return body, is_dm, chat_type, thread_id, display_name, source
 
