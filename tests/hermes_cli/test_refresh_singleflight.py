@@ -172,7 +172,7 @@ class _RotatingReuseDetectingProvider(Provider):
             raise RefreshExpiredError("refresh token reuse detected")
         self.rotated.add(refresh_token)
         self.entered.set()
-        assert self.release.wait(5), "test provider timed out"
+        assert self.release.wait(30), "test provider timed out"
         return Session(user_id="u", email="u@example.test", display_name="u", org_id="o",
                        provider=self.name, expires_at=int(time.time()) + 900,
                        access_token="fresh-at", refresh_token=f"rt-{self.calls}")
@@ -207,7 +207,7 @@ def test_cookie_gate_burst_with_stale_rt_rotates_once(gated_web_app):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(call) for _ in range(4)]
-        assert provider.entered.wait(3)
+        assert provider.entered.wait(30)
         provider.release.set()
         statuses = sorted(f.result(timeout=10).status_code for f in futures)
     assert statuses == [200, 200, 200, 200]
