@@ -536,9 +536,11 @@ def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
 def test_references_run_in_parallel(monkeypatch):
     """References fan out concurrently (delegate-batch semantics), not serially.
 
-    Each reference sleeps; wall-time must approximate the slowest single call,
-    not the sum. Order is preserved and a failing reference is isolated.
+    Each reference sleeps; the two sleeping calls must be in flight at the
+    same instant so wall-time stays near the slowest single call, not the
+    sum. Order is preserved and a failing reference is isolated.
     """
+    import threading
     import time
 
     from agent import moa_loop
@@ -546,13 +548,17 @@ def test_references_run_in_parallel(monkeypatch):
     # Force _extract_text down its fallback path (no transport normalize).
     monkeypatch.setattr(moa_loop, "get_transport", lambda *_a, **_k: None)
 
-    barrier_hits = []
+    # Both sleeping calls must coexist: the barrier only releases once the
+    # second one is already in flight, so a serial fan-out breaks it and the
+    # affected slots come back as "[failed: ...]" instead of their responses.
+    # The timeout is far beyond any thread-start jitter on loaded CI lanes.
+    both_in_flight = threading.Barrier(2, timeout=30)
 
     def slow_call_llm(**kwargs):
-        barrier_hits.append(time.monotonic())
         model = kwargs["model"]
         if model == "boom":
             raise RuntimeError("kaboom")
+        both_in_flight.wait()
         time.sleep(0.5)
         return _response(f"resp-{kwargs['provider']}")
 
@@ -571,11 +577,10 @@ def test_references_run_in_parallel(monkeypatch):
     )
     elapsed = time.monotonic() - start
 
-    # Two 0.5s sleeps run concurrently → well under the 1.0s serial floor.
-    # Threshold sits at 0.95s (not tight against 0.5s) to tolerate CI
-    # thread-pool startup jitter while still failing hard if the two calls
-    # ran serially (which would be ≥1.0s).
-    assert elapsed < 0.95, f"references did not run in parallel (took {elapsed:.2f}s)"
+    # Coexistence is pinned by the barrier; this bound only backstops a
+    # stalled fan-out and tolerates loaded-runner thread-start jitter (a
+    # wall-clock threshold tight against the sleep lengths flaked CI).
+    assert elapsed < 10.0, f"references did not run in parallel (took {elapsed:.2f}s)"
     # Output order matches input order (stable Reference N labelling).
     assert [label for label, _, _ in out] == ["p1:ok", "moa:preset", "p2:boom", "p3:ok"]
     assert "recursively reference MoA" in out[1][1]
