@@ -2225,6 +2225,7 @@ def terminal_tool(
     _host_local: bool = False,
     target: Optional[str] = None,
     _completion_output_chars: int = 0,
+    heartbeat: int = 0,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2240,6 +2241,7 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        heartbeat: With background=True: also notify every N seconds (min 60) with the output since the last notice. For long jobs you must react to mid-run (merge trains, full suites); implies notify_on_complete.
         target: Named execution target. Omit to use the configured default.
         _completion_output_chars: Internal; sizes the completion notification's output for a spawner whose output is the payload (a bot DM's reply); 0 keeps the usual tail.
         _host_local: Internal; forces the local backend for Hermes-owned control-plane children (kept in a separate env cache from the configured backend).
@@ -2971,6 +2973,13 @@ def terminal_tool(
                             "notify_on_complete": True,
                             "parent_session_id": proc_session.parent_session_id,
                         })
+                    if heartbeat:
+                        # Heartbeats ride the completion notice's delivery path.
+                        result_data["heartbeat_seconds"] = process_registry.arm_heartbeat(
+                            proc_session, heartbeat)
+                elif heartbeat:
+                    result_data["heartbeat_ignored"] = (
+                        "heartbeat needs notify=true delivery, which this session cannot receive")
 
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
@@ -3190,6 +3199,11 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "heartbeat": {
+                "type": "integer",
+                "minimum": 60,
+                "description": "With background=true: also notify every N seconds (min 60) with the output since the last notice. For long jobs you must react to mid-run (merge trains, full suites); implies notify=true."
             }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
@@ -3218,11 +3232,14 @@ def _handle_terminal(args, **kw):
     notify = args.get("notify")
     notify_on_complete = args.get("notify_on_complete", False)
     watch_patterns = args.get("watch_patterns")
+    heartbeat = args.get("heartbeat") or 0
+    if not isinstance(heartbeat, int) or isinstance(heartbeat, bool) or heartbeat < 0:
+        return tool_error("heartbeat must be a whole number of seconds (min 60).")
     if not args.get("background", False):
-        if notify or watch_patterns or notify_on_complete:
+        if notify or watch_patterns or notify_on_complete or heartbeat:
             return tool_error(
-                "notify only applies to background commands (foreground "
-                "results return directly). Either drop notify, or run as "
+                "notify/heartbeat only apply to background commands (foreground "
+                "results return directly). Either drop them, or run as "
                 "terminal(command=..., background=true, notify=...)."
             )
         if args.get("pty", False):
@@ -3244,6 +3261,8 @@ def _handle_terminal(args, **kw):
                 "notify must be true/false (notify on exit) or a list of "
                 "strings (notify on output pattern match)."
             )
+    if heartbeat:
+        notify_on_complete = True  # the heartbeat rides the completion delivery path
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -3255,6 +3274,7 @@ def _handle_terminal(args, **kw):
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
         target=args.get("target"),
+        heartbeat=heartbeat,
     )
 
 
