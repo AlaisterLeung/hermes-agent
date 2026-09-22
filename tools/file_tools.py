@@ -38,6 +38,7 @@ from tools.file_tools_write_guards import (
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
+    _file_metadata, _file_version,
     _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
@@ -107,6 +108,7 @@ def _apply_char_budget(result_dict: dict, content: str, offset: int, total_lines
         f"{lines_kept} line(s) (showing lines {offset}-{next_offset - 1} of "
         f"{total_lines}). Use offset={next_offset} to continue.")
     if len(trimmed.split("\n", 1)[0]) >= max_chars:
+        result_dict["truncated_lines"] = True
         result_dict["hint"] += (
             " Note: the first line alone exceeded the budget and was "
             "clamped mid-line; its remainder is not retrievable via offset.")
@@ -1066,6 +1068,9 @@ def read_file_tool(
                 total_lines = len(lines)
                 end_line = offset + limit - 1
                 page_text = "\n".join(lines[offset - 1:end_line])
+                from tools.tool_output_limits import get_max_line_length
+                max_line_length = get_max_line_length()
+                truncated_lines = any(len(line) > max_line_length for line in page_text.split("\n"))
                 result_dict = {
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
@@ -1099,6 +1104,7 @@ def read_file_tool(
                         "to continue."
                     )
                     if len(trimmed.split("\n", 1)[0]) >= max_chars:
+                        result_dict["truncated_lines"] = True
                         result_dict["hint"] += (
                             " Note: the first line alone exceeded the budget and "
                             "was clamped mid-line; its remainder is not "
@@ -1112,7 +1118,8 @@ def read_file_tool(
                     redacted = result_dict["content"] != rendered
                 else:
                     redacted = False
-                if offset == 1 and not result_dict["truncated"] and not redacted:
+                if (offset == 1 and not result_dict["truncated"] and not redacted
+                        and not truncated_lines and not result_dict.get("truncated_lines")):
                     # The whole document was shown, so a text-authorable format (.ipynb)
                     # may later be overwritten by write_file; the binary-container guard
                     # keeps refusing .docx/.xlsx/.pdf regardless of this baseline.
@@ -1167,7 +1174,9 @@ def read_file_tool(
             if "read_timestamps" not in task_data:
                 task_data["read_timestamps"] = {}
             generation_reads = task_data.setdefault("dedup_generation_reads", set())
-            cached_mtime = (
+            # Dedup stores the pre-read metadata: skips unchanged rereads; a new
+            # version (bytes, not just mtime) invalidates the entry.
+            cached_version = (
                 task_data.get("dedup", {}).get(dedup_key)
                 if host_mtime_tracking
                 else None
@@ -1176,49 +1185,46 @@ def read_file_tool(
 
         # Same rule as skill_view: the review fork shares the parent's task_id and its
         # read-before-write guard needs a real read, which the stub path never records (#95976).
-        if cached_mtime is not None and not is_background_review():
-            try:
-                current_mtime = os.path.getmtime(resolved_str)
-                if current_mtime == cached_mtime and content_served_in_generation:
-                    # Count repeated stubs so weak tool-followers ignoring the "refer
-                    # to earlier result" hint don't loop forever; after 2 stubs for
-                    # one key escalate to a hard block (mirrors count>=4 on reads).
-                    with _read_tracker_lock:
-                        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
-                        task_data["dedup_hits"][dedup_key] = hits
-                        _cap_read_tracker_data(task_data)
+        version_before = _file_metadata(resolved_str) if host_mtime_tracking else None
+        if (cached_version is not None and not is_background_review()
+                and version_before == cached_version and content_served_in_generation):
+            # Count repeated stubs so weak tool-followers ignoring the "refer
+            # to earlier result" hint don't loop forever; after 2 stubs for
+            # one key escalate to a hard block (mirrors count>=4 on reads).
+            with _read_tracker_lock:
+                hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
+                task_data["dedup_hits"][dedup_key] = hits
+                _cap_read_tracker_data(task_data)
 
-                    if hits >= 2:
-                        return tool_error(
-                            f"BLOCKED: You have called read_file on this "
-                            f"exact region {hits + 1} times and the file "
-                            "has NOT changed. STOP calling read_file for "
-                            "this path — the content from your earlier "
-                            "read_file result in this conversation is "
-                            "still current. Proceed with your task using "
-                            "the information you already have.",
-                            path=path,
-                            already_read=hits + 1,
-                            # A REFUSAL the harness chose, not a failure the tool hit: without the
-                            # marker the failure classifiers count the block and a repeated read
-                            # escalates to `repeated_exact_failure_block` over calls that never failed.
-                            **{GUARDRAIL_REFUSAL_KEY: True})
+            if hits >= 2:
+                return tool_error(
+                    f"BLOCKED: You have called read_file on this "
+                    f"exact region {hits + 1} times and the file "
+                    "has NOT changed. STOP calling read_file for "
+                    "this path — the content from your earlier "
+                    "read_file result in this conversation is "
+                    "still current. Proceed with your task using "
+                    "the information you already have.",
+                    path=path,
+                    already_read=hits + 1,
+                    # A REFUSAL the harness chose, not a failure the tool hit: without the
+                    # marker the failure classifiers count the block and a repeated read
+                    # escalates to `repeated_exact_failure_block` over calls that never failed.
+                    **{GUARDRAIL_REFUSAL_KEY: True})
 
-                    unchanged = {
-                        "status": "unchanged",
-                        "message": _READ_DEDUP_STATUS_MESSAGE,
-                        "path": path,
-                        "dedup": True,
-                        "content_returned": False,
-                    }
-                    unchanged.update(resolution.metadata(
-                        cwd=_authoritative_workspace_root(
-                            task_id, selected_target, _resolution=resolution,
-                        ),
-                    ))
-                    return json.dumps(unchanged, ensure_ascii=False)
-            except OSError:
-                pass  # stat failed — fall through to full read
+            unchanged = {
+                "status": "unchanged",
+                "message": _READ_DEDUP_STATUS_MESSAGE,
+                "path": path,
+                "dedup": True,
+                "content_returned": False,
+            }
+            unchanged.update(resolution.metadata(
+                cwd=_authoritative_workspace_root(
+                    task_id, selected_target, _resolution=resolution,
+                ),
+            ))
+            return json.dumps(unchanged, ensure_ascii=False)
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = pinned_file_ops or _file_ops_for_resolution(task_id, resolution)
@@ -1230,17 +1236,15 @@ def read_file_tool(
         result_dict = result.to_dict()
         result_dict.setdefault("resolved_path", operation_path)
 
-        # ── Populate negative-result cache on not-found ───────────────
-        # Cache the JSON so a retry skips the parent-dir walk. Deliberately NO
-        # early return — error results must keep flowing through the tracking
-        # block below and the normal exit; short-circuiting changed that behavior
-        # and broke a real test. Serving from cache is the optimization.
+        # Failed reads cannot establish whole-file knowledge.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
             _not_found_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found(
                 "read", resolved_str_for_neg, state_task_id, _not_found_json,
             )
+        if _err or result_dict.get("is_binary"):
+            return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Character-count guard ─────────────────────────────────────
         # Characters proxy for tokens (model-agnostic): check the formatted
@@ -1269,6 +1273,7 @@ def read_file_tool(
                 f"{total_lines}). Use offset={next_offset} to continue."
             )
             if len(trimmed.split("\n", 1)[0]) >= max_chars:
+                result_dict["truncated_lines"] = True
                 result_dict["hint"] += (
                     " Note: the first line alone exceeded the budget and was "
                     "clamped mid-line; its remainder is not retrievable via "
@@ -1315,7 +1320,15 @@ def read_file_tool(
             end_line = offset + limit - 1
             if isinstance(total_lines, int) and total_lines > 0:
                 end_line = min(end_line, total_lines)
-        complete = not ((offset > 1) or bool(result_dict.get("truncated")))
+        # ── Record the read at its version ────────────────────────────
+        version = (
+            (getattr(result, "_snapshot", None) or _file_version(resolved_str))
+            if version_before is not None
+            else None
+        )
+        stable = version is not None and version[:-1] == version_before == _file_metadata(resolved_str)
+        partial = (offset > 1) or bool(result_dict.get("truncated"))
+        redacted = redacted or bool(result_dict.get("truncated_lines"))
 
         # ── Track for consecutive-loop detection ──────────────────────
         read_key = ("read", path, offset, limit)
@@ -1337,21 +1350,35 @@ def read_file_tool(
                 task_data["consecutive"] = 1
             count = task_data["consecutive"]
 
-            # Store mtime at read time: dedup skips unchanged re-reads; staleness warns
-            # on write/patch when the file changed since the last read.
+            # Store mtime at read time: staleness warns on write/patch when
+            # the file changed since the last read.
             if host_mtime_tracking:
                 try:
-                    _mtime_now = os.path.getmtime(resolved_str)
-                    task_data["dedup"][dedup_key] = _mtime_now
-                    task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-                    if not complete and end_line is not None:
-                        complete, redacted = _note_read_coverage(
-                            task_data, resolved_str, _mtime_now, offset, end_line,
-                            total_lines, redacted)
+                    task_data.setdefault("read_timestamps", {})[resolved_str] = os.path.getmtime(resolved_str)
                 except OSError:
                     pass  # Can't stat — skip tracking for this entry
-            if complete and not redacted:
-                task_data.setdefault("full_write_baselines", set()).add(resolved_str)
+
+            baselines = task_data.setdefault("full_write_baselines", {})
+            complete = False
+            if stable and count < 4:
+                task_data["dedup"][dedup_key] = version_before
+                # A narrower view does not undo knowledge of these same bytes. Do
+                # not revive a baseline after a partial read of a different version.
+                complete = baselines.get(resolved_str) == version
+                if not complete:
+                    complete = not partial
+                    if partial and end_line is not None:
+                        complete, redacted = _note_read_coverage(
+                            task_data, resolved_str, version, offset, end_line,
+                            total_lines, redacted)
+                    complete = complete and not redacted
+                if complete:
+                    baselines[resolved_str] = version
+            if not complete:
+                baselines.pop(resolved_str, None)
+            if not stable or count >= 4:
+                task_data["dedup"].pop(dedup_key, None)
+                task_data["dedup_generation_reads"].discard(dedup_key)
 
             # Bound the per-task containers so a long CLI session doesn't
             # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
@@ -1383,7 +1410,6 @@ def read_file_tool(
                 logger.debug(
                     "background-review read-mark failed", exc_info=True
                 )
-
         if count >= 4:
             # Hard block: stop returning content to break the loop
             return tool_error(
@@ -1756,7 +1782,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 result_dict["files_modified"] = [operation_path]
                 # Own write = current whole-file content: consecutive
                 # same-task writes stay unblocked. patch never does this.
-                _mark_full_write_baseline(_resolved, state_task_id)
+                _mark_full_write_baseline(
+                    _resolved, state_task_id,
+                    getattr(result, "_content_sha256", None),
+                )
                 _mark_verification_stale(
                     task_id, [operation_path], session_id=session_id,
                     execution_target=selected_target,
