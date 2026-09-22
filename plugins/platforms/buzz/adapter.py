@@ -1100,6 +1100,11 @@ class BuzzAdapter(BasePlatformAdapter):
         backoff = 1.0
         reconnecting = False
         while True:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # wait_for() can swallow a cancel that races its inner future completing (the auth
+                # handshake's recv), leaving the loop reconnecting after its task was asked to stop.
+                raise asyncio.CancelledError()
             try:
                 async with websockets.connect(
                     self._websocket_url(), open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5,
