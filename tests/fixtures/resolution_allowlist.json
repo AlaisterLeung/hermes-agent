@@ -650,6 +650,11 @@
     "kind": "bare_which"
   },
   {
+    "path": "tools/vision_tools.py",
+    "symbol": "_rasterize_svg_to_png",
+    "kind": "bare_which"
+  },
+  {
     "path": "tools/vision_tools_image_prep.py",
     "symbol": "_rasterize_svg_to_png",
     "kind": "bare_which"
