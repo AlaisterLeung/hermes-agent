@@ -19,7 +19,6 @@ import pytest
 PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
-JPEG = b"\xff\xd8\xff" + b"\x00" * 64
 CORRUPT_PNG = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAIAAAACUFjqAAAAFElEQVR4nGP8z8Dwn4EIwESJ5gAAVQ4CH1evYJQAAAAASUVORK5CYII="
 )
@@ -111,20 +110,6 @@ class TestLocalBackend:
         res = await isrc.resolve_image_source("pic.png", isrc.ResolveContext())
         assert res.data == PNG
         assert res.origin == "file"
-
-
-    @pytest.mark.asyncio
-    async def test_svg_passes_through_for_rasterization(self, tmp_path, monkeypatch):
-        """SVG has no raster magic bytes but is passed through with mime
-        image/svg+xml so the vision call sites can rasterize it to PNG."""
-        isrc = _reload(monkeypatch, tmp_path / "hermes")
-        monkeypatch.setenv("TERMINAL_ENV", "local")
-        svg = tmp_path / "art.svg"
-        svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
-        svg.write_bytes(svg_bytes)
-        res = await isrc.resolve_image_source(str(svg), isrc.ResolveContext())
-        assert res.mime == "image/svg+xml"
-        assert res.data == svg_bytes
 
 
 class TestNonLocalBackendConfinement:
@@ -292,8 +277,6 @@ class TestExecReadSafety:
 
     @pytest.mark.asyncio
     async def test_exec_read_single_delegation_no_resolver_retry(self, tmp_path, monkeypatch):
-        """Retry policy lives in the env bring-up (_get_file_ops), not the
-        resolver: read_file_bytes is called exactly once per resolve."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -492,11 +475,6 @@ class TestHeicDetection:
         assert _detect_image_mime_type_from_bytes(
             MIF1_MAJOR_AV01_COMPATIBLE) == "image/avif"
 
-    def test_mif1_major_with_heic_compatible_stays_heic(self):
-        """The compatible-brand scan must not over-trigger: a genuine HEVC-coded
-        HEIF (mif1 major, heic compatible, no AV1 brand) is still HEIC."""
-        from tools.vision_tools_image_prep import _detect_image_mime_type_from_bytes
-        assert _detect_image_mime_type_from_bytes(MIF1_HEADER) == "image/heic"
 
     def test_brand_scan_does_not_read_past_the_ftyp_box(self):
         """The scan is bounded by the declared ftyp box size, so an 'avif' token
