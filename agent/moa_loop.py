@@ -515,11 +515,6 @@ def _trim_messages_for_reference(
 
 
 _REFERENCE_POLL_INTERVAL_S = 5.0
-# Short re-collect window after an interrupt fires: a reference-call whose own
-# body raised the interrupt keeps finishing on its thread for a moment longer
-# than the flag check, so we give in-flight futures one window to land before
-# stamping them with the interrupted placeholder.
-_INTERRUPT_REAP_WINDOW_S = 1.0
 
 # Sentinel for a reference aborted by user interrupt; the facade must never cache it.
 _INTERRUPTED_REFERENCE_NOTE = "[skipped: interrupted by user]"
@@ -616,22 +611,6 @@ def _run_references_parallel(
                         logger.debug("MoA progress_callback failed: %s", exc)
             if pending and agent is not None and getattr(agent, "_interrupt_requested", False):
                 interrupted = True
-                # A reference that observed the interrupt inside its own call
-                # may be milliseconds from resolving (its flag is set before
-                # the future finishes). Give in-flight futures one short
-                # re-collect window so such a just-finished call keeps its
-                # real output instead of getting the interrupt placeholder.
-                done_racy, pending = _futures_wait(
-                    pending, timeout=_INTERRUPT_REAP_WINDOW_S)
-                for future in done_racy:
-                    idx = futures[future]
-                    results[idx] = future.result()
-                    completed += 1
-                    if progress_callback is not None:
-                        try:
-                            progress_callback(completed, total, _slot_label(reference_models[idx]))
-                        except Exception as exc:  # pragma: no cover - display must never break
-                            logger.debug("MoA progress_callback failed: %s", exc)
                 _settle_interrupted(futures, results, reference_models, late_accounting_sink)
                 break
     finally:
