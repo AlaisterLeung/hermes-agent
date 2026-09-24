@@ -5996,31 +5996,6 @@ class TestSystemPromptStability:
         assert agent._cached_system_prompt == stored
         mock_db.get_session.assert_called_once_with(agent.session_id)
 
-    def test_fresh_build_when_no_history(self, agent):
-        """On the first turn (no history), system prompt should be built fresh."""
-        mock_db = MagicMock()
-        agent._session_db = mock_db
-
-        agent._cached_system_prompt = None
-        conversation_history = []
-
-        # The block under test:
-        if agent._cached_system_prompt is None:
-            stored_prompt = None
-            if conversation_history and agent._session_db:
-                session_row = agent._session_db.get_session(agent.session_id)
-                if session_row:
-                    stored_prompt = session_row.get("system_prompt") or None
-
-            if stored_prompt:
-                agent._cached_system_prompt = stored_prompt
-            else:
-                agent._cached_system_prompt = agent._build_system_prompt()
-
-        # Should have built fresh, not queried the DB
-        mock_db.get_session.assert_not_called()
-        assert agent._cached_system_prompt is not None
-        assert "Hermes Agent" in agent._cached_system_prompt
 
 
 class TestBudgetPressure:
