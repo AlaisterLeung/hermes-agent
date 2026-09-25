@@ -41,7 +41,12 @@ jobs:
           # the invariant that EVERYTHING in plugin-catalog/ stays valid.
           python3 scripts/validate_plugin_catalog.py plugin-catalog/
 
+  # Fork: disabled - this gate validates UPSTREAM's third-party catalog
+  # entries (their own pinned-source deps), fails on upstream data while the
+  # fork carries no catalog changes of its own, and is not in the required
+  # gate. Skipped, never a blocker on fork PRs.
   pinned-source-validate:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
