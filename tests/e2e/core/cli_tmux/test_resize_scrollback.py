@@ -60,7 +60,9 @@ def test_resizes_keep_each_transcript_line_once_in_tmux_scrollback(tmp_path: Pat
     def ask(turn: int) -> None:
         tmux("send-keys", "-t", "p", "-l", f"question zq{turn}q please")
         time.sleep(0.5)  # typed text + Enter in one write is a paste, not a submit
-        tmux("send-keys", "-t", "p", "Enter")
+        # C-m (carriage return) instead of the Enter key name: a pane with bracketed paste enabled treats
+        # the key-name form as text on some tmux builds, so the line was typed but never submitted.
+        tmux("send-keys", "-t", "p", "C-m")
 
     def reply_done(turn: int) -> None:
         wait_for(f"t{turn}w{WORDS[turn] - 1:03d}")
