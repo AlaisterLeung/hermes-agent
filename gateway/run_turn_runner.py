@@ -920,11 +920,10 @@ class TurnRunner:
             from gateway.config import StreamingConfig
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
-        # Per-chat aware: a chats entry for this chat wins over the platform value.
+        # Fork per-chat display overrides (PR #21): a chats entry for this chat
+        # wins over the platform value, then upstream's enabled_for gate decides.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming", chat=ctx.source)
-        want_stream_deltas = not ctx.scheduled_heartbeat and (
-            scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
-        )
+        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:

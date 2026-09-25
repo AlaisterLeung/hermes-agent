@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 
+import pytest
+
 
 
 def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
@@ -26,7 +28,6 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
-
 
 
 
@@ -413,7 +414,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=10)
+                assert release_child.wait(timeout=30), "test did not release the child"
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -454,5 +455,7 @@ class TestDelegationCleanup:
             )
         finally:
             release_child.set()
+            if child_started.is_set():
+                assert child_finished.wait(timeout=10)
             reset_hermes_home_override(profile_token)
             relay_runtime._reset_for_tests()

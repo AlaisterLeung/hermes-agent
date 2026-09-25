@@ -514,11 +514,7 @@ describe('useVirtualHistory offset cache reuse', () => {
     }
   })
 
-  // The compensate fires only when the stale-cache adoption and the window
-  // move land in one commit; a split interleaving is also correct (cache is
-  // corrected without an unmount), so re-roll the setup on a split instead
-  // of only waiting longer.
-  it('corrects and compensates a same-layout row measured at unmount', { retry: 3 }, async () => {
+  it('corrects and compensates a same-layout row measured at unmount', async () => {
     const items = Array.from({ length: 20 }, (_, index) => ({ height: 2, key: `item-${index}` }))
     const expose = { current: null as Exposed | null }
     const streams = makeStreams()
@@ -532,18 +528,21 @@ describe('useVirtualHistory offset cache reuse', () => {
     })
 
     try {
-      await delay(20)
+      // Generous settle windows: the unmount-measurement callback must fire
+      // before the assertion, and under CI load a 20-40ms sleep is not
+      // enough (flaked as "adjustScrollTop called 0 times").
+      await delay(50)
       const scroll = expose.current!.scroll!
 
       scroll.scrollTo(0)
-      await delay(20)
+      await delay(50)
       scroll.scrollTo(5)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
 
       staleHeights.set(items[0]!.key, 1)
       instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalled(), { timeout: 4_000 })
+      await delay(400)
 
       expect(adjustScrollTop).toHaveBeenCalledOnce()
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
