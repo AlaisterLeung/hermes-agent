@@ -141,9 +141,12 @@ jobs:
 
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    # writer processes per test; subprocess-per-file parallelism covers the
+    # concurrency, and standard runners are all a personal account can use
+    # (larger runners are Team/Enterprise only, so *-32-core queues forever).
+    # Fork convention: e2e ran green on ubuntu-latest in every prior cycle.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -257,8 +260,11 @@ jobs:
     # autostash, killed mid-pull / mid-deps, offline), fresh-process import and
     # entrypoint smoke, and the config round-trip property matrix. Its own job:
     # it needs full history + tags, bubblewrap, and one file runs ~5-15 min.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    # Fork convention: standard runner (personal accounts can't use larger
+    # runners; *-32-core queues forever). Lower core count only stretches the
+    # wall clock, so the job timeout gets the headroom instead.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
