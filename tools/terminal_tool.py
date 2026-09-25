@@ -1958,7 +1958,7 @@ def _run_foreground(
     if spill_file_path:
         try:
             _sp = Path(spill_file_path)
-            raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
+            raw_spill = _sp.read_text(encoding="utf-8-sig", errors="replace")
             from tools.spill_safety import write_text_exclusive
 
             # Rewrite in place via lstat-checked unlink + exclusive create so the
