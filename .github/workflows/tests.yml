@@ -246,6 +246,12 @@ jobs:
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
           HERMES_TEST_FILE_TIMEOUT: "900"
+          # Fork convention: standard 4-core runner (upstream uses 32+ core
+          # runners a personal account can't dispatch). Default worker count
+          # (cpu*2 = 8) wedges the timing-sensitive tmux CLI canary at turn
+          # start; halve the worker load so concurrent CLI processes get cpu
+          # time while the race-detector files keep per-file isolation.
+          HERMES_TEST_WORKERS: "4"
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
