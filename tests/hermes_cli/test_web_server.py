@@ -4957,9 +4957,7 @@ class TestValidateProviderCredential:
 
 
 class TestDesktopCronTicker:
-    """Under HERMES_DESKTOP=1 the dashboard starts a cron ticker that FORWARDS
-    due fires to the gateway (execution needs the live adapters there); the
-    standalone in-process tick loop must not run."""
+    """The dashboard backend fires cron jobs itself only when desktop-spawned."""
 
     def _client(self):
         try:
@@ -4971,37 +4969,15 @@ class TestDesktopCronTicker:
         return TestClient(app)
 
     def test_ticker_runs_when_desktop(self, monkeypatch, _isolate_hermes_home):
-        import threading
         import cron.scheduler as sched
 
-        from cron.scheduler_provider import GatewayForwardingCronScheduler
-
-        started = threading.Event()
-        ticked = threading.Event()
-
-        class SpyForwardingScheduler(GatewayForwardingCronScheduler):
-            def start(self, stop_event, **kwargs):
-                started.set()
-                # Block until shutdown instead of sweeping: the spy proves
-                # startup wiring; no real fires are forwarded here.
-                stop_event.wait(timeout=5)
-
-        monkeypatch.setattr(
-            "cron.scheduler_provider.GatewayForwardingCronScheduler",
-            SpyForwardingScheduler,
-        )
-        monkeypatch.setattr(sched, "tick", lambda *a, **k: ticked.set())
+        called = threading.Event()
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
         monkeypatch.setenv("HERMES_DESKTOP", "1")
         monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-spawn-token")
 
         with self._client():
-            assert started.wait(3.0), (
-                "expected the gateway-forwarding cron scheduler under "
-                "HERMES_DESKTOP=1"
-            )
-            assert not ticked.is_set(), (
-                "desktop must not execute cron jobs in-process (sched.tick)"
-            )
+            assert called.wait(3.0), "expected cron tick under a Desktop-owned backend"
 
 
 class TestServeIndexMissingIndex:

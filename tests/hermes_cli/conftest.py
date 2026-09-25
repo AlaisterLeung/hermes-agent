@@ -137,30 +137,6 @@ def isolated_update_runtime(monkeypatch, tmp_path, request):
     monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda *a, **k: [])
 
 
-# _start_desktop_cron_ticker constructs GatewayForwardingCronScheduler
-# directly, so it never consults resolve_cron_scheduler. These tests stub
-# those entry points — the doubles never engage, and the real scheduler's
-# start() blocks on its stop_event. Forwarding behavior is covered by the
-# SpyForwardingScheduler tests in test_web_server.py.
-_TICKER_PROFILES_TEST_FILE = (
-    "tests/hermes_cli/test_desktop_cron_ticker_profiles.py"
-)
-
-
-def pytest_collection_modifyitems(config, items):
-    skip = pytest.mark.skip(
-        reason=(
-            "_start_desktop_cron_ticker runs GatewayForwardingCronScheduler "
-            "directly, so these tests' resolve_cron_scheduler doubles never "
-            "engage and the real scheduler blocks on start(); see the "
-            "SpyForwardingScheduler tests in test_web_server.py"
-        )
-    )
-    for item in items:
-        if _TICKER_PROFILES_TEST_FILE in str(item.nodeid):
-            item.add_marker(skip)
-
-
 # ---- prompt_toolkit / capsys isolation ----
 # ``cli._cprint`` renders through ``prompt_toolkit.print_formatted_text``,
 # which — when called with no explicit ``output=`` — lazily creates an
