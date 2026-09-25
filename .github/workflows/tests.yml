@@ -249,9 +249,10 @@ jobs:
           # Fork convention: standard 4-core runner (upstream uses 32+ core
           # runners a personal account can't dispatch). Default worker count
           # (cpu*2 = 8) wedges the timing-sensitive tmux CLI canary at turn
-          # start; halve the worker load so concurrent CLI processes get cpu
-          # time while the race-detector files keep per-file isolation.
-          HERMES_TEST_WORKERS: "4"
+          # start (a boot-time lazy pip install + toolset probes hang with
+          # neighbor files sharing cores); 2 workers leave the canary breathing
+          # room. Race-detector files keep per-file isolation.
+          HERMES_TEST_WORKERS: "2"
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
